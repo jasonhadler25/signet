@@ -1,6 +1,6 @@
 # Benchmarks: Project 11 SLH-DSA-B reproduction and BLINCS
 
-*Thanks to [Project 11](https://research.projecteleven.com/) and the [PQC Suite B](https://github.com/PQC-Suite-B) authors for publishing the SLH-DSA-B implementation, benchmark harness, and charts reproduced here.*
+*Thanks to [Project 11](https://research.projecteleven.com/) — specifically **Conor Deegan** and **julienif** on [PQC Suite B (`PQC-Suite-B/signatures`)](https://github.com/PQC-Suite-B/signatures) (building on the **RustCrypto** `slh-dsa` crate) — for publishing the SLH-DSA-B implementation, benchmark harness, and charts reproduced here, and to **Servil Software Factory** for [`blake3-servil-core`](https://github.com/servil-software-factory/BLAKE3) and [`bench-hashes`](https://github.com/servil-software-factory/bench-hashes) (`clocks`).*
 
 All local measurements below ran on an **Apple M6** (12 cores, macOS arm64, Rust 1.100.0).
 
