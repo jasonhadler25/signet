@@ -2,7 +2,7 @@
 
 *Status: pre-1.0 design under active development (0.1.0, formats and context strings may still change before 1.0). Written by an AI assistant at the direction of this repository's owner; no independent cryptographic review or security audit has been performed. Builds on BLAKE3 (O'Connor, Aumasson, Neves, Wilcox-O'Hearn) and SPHINCS / SPHINCS+ / FIPS 205 SLH-DSA (Bernstein, Hopwood, Hülsing, Kölbl, Lange, Niederhagen, Papachristodoulou, Rijneveld, Schneider, Schwabe, Wilcox-O'Hearn, and the NIST SLH-DSA team). Thanks to [Project 11](https://research.projecteleven.com/) — especially **Conor Deegan**, **Alessandro Baiocchi**, **Matteo Vena**, and **Matteo Vicari** — for direct review feedback on this specification, benchmarks, and irregular-hypertree/caching ideas (full credits in [`README.md`](README.md#credits-and-thanks)).*
 
-BLINCS is a stateless hash-based signature scheme built on BLAKE3, combining textbook FIPS 205 **WOTS+** (nibbles, `w = 16`) and **FORS** (`16` trees of `1,024` leaves) on a 4-layer hypertree (`15 + 3×6`, total height `33`) with **zero counter grinding** and single-pass salted content hashing. A signature is **5,616 bytes** (`7,488` bytes Base64 — fitting cleanly under default Apache/nginx 8 KiB HTTP headers), a verifying key is **32 bytes**, and a signing key is a **32-byte seed**. Its parameters target **133.2 bits** of classical security at up to **$2^{32}$ signatures** per signing key (4,294,967,296: ten signatures a second for 13.6 years) under the SPHINCS+ / FIPS 205 FORS cover-probability model, degrading gracefully past the budget (`126.8` bits at $2^{33}$, `119.3` bits at $2^{34}$).
+BLINCS is a stateless hash-based signature scheme built on BLAKE3, combining textbook FIPS 205 **WOTS+** (nibbles, `w = 16`) and **FORS** (`16` trees of `1,024` leaves) on a 4-layer hypertree (`12 + 3×7`, total height `33`) with **zero counter grinding** and single-pass salted content hashing. A signature is **5,616 bytes** (`7,488` bytes Base64 — fitting cleanly under default Apache/nginx 8 KiB HTTP headers), a verifying key is **32 bytes**, and a signing key is a **32-byte seed**. Its parameters target **133.2 bits** of classical security at up to **$2^{32}$ signatures** per signing key (4,294,967,296: ten signatures a second for 13.6 years) under the SPHINCS+ / FIPS 205 FORS cover-probability model, degrading gracefully past the budget (`126.8` bits at $2^{33}$, `119.3` bits at $2^{34}$).
 
 Messages are hashed in a single salted keyed-BLAKE3 pass under a fresh per-signature salt `e` derived from the signer's key and per-signature randomness. Signing and verifying take the message itself — as bytes or a stream — with no pre-hash entry point. Pre-hashing a message before signing makes users vulnerable to collision attacks on the pre-hash; feeding the message or stream directly to BLINCS avoids that exposure and runs at full BLAKE3 speed.
 
@@ -21,8 +21,8 @@ BLINCS uses two 32-byte modes of BLAKE3:
 |---|---:|---|
 | `N` | 16 | Byte length of truncated tree, chain, salt, and randomizer values (`h_msg`, `D`, and derived keys are 32 bytes) |
 | `LAYERS` | 4 | Layers of the hypertree (`d`) |
-| `LOWER_HEIGHT` | 6 | Height of lower hypertree layers `0, 1, 2` ($2^6 = 64$ leaves per tree) |
-| `TOP_HEIGHT` | 15 | Height of top hypertree layer `3` ($2^{15} = 32{,}768$ leaves; total `HYPER_BITS = 15 + 3 * 6 = 33`) |
+| `LOWER_HEIGHT` | 7 | Height of lower hypertree layers `0, 1, 2` ($2^7 = 128$ leaves per tree) |
+| `TOP_HEIGHT` | 12 | Height of top hypertree layer `3` ($2^{12} = 4{,}096$ leaves; total `HYPER_BITS = 12 + 3 * 7 = 33`) |
 | `W` | 16 | WOTS+ Winternitz parameter (`CHAIN_STEPS = 15`, 4-bit nibbles in `0..=15`) |
 | `MSG_CHAINS` | 32 | WOTS+ message chains (`128 / 4 = 32` nibbles) |
 | `CSUM_CHAINS` | 3 | WOTS+ checksum chains (`max checksum = 32 * 15 = 480 < 16^3`) |
@@ -33,8 +33,8 @@ BLINCS uses two 32-byte modes of BLAKE3:
 Derived lengths:
 
 - `FORS_LEN = FORS_TREES * (1 + FORS_HEIGHT) * N = 2,816` bytes.
-- `LOWER_LAYER_LEN = (CHAINS + LOWER_HEIGHT) * N = 656` bytes.
-- `TOP_LAYER_LEN = (CHAINS + TOP_HEIGHT) * N = 800` bytes.
+- `LOWER_LAYER_LEN = (CHAINS + LOWER_HEIGHT) * N = 672` bytes.
+- `TOP_LAYER_LEN = (CHAINS + TOP_HEIGHT) * N = 752` bytes.
 - `SIGNATURE_LEN = 2 * N + FORS_LEN + 3 * LOWER_LAYER_LEN + TOP_LAYER_LEN = 5,616` bytes.
 
 ## Key-derivation contexts
@@ -47,7 +47,6 @@ Every derived 32-byte key uses a distinct UTF-8 context string:
 | `CONTENT_SALT` | `"BLINCS 2026-11-23 signing key: content salt"` |
 | `RANDOMIZER` | `"BLINCS 2026-11-23 signing key: randomizer"` |
 | `PUBLIC_SEED` | `"BLINCS 2026-11-23 signing key: public seed"` |
-| `TOP_CACHE` | `"BLINCS 2026-11-23 signing key: top tree cache"` |
 | `PUBLIC_HASH` | `"BLINCS 2026-11-23 public hash"` |
 | `CONTENT` | `"BLINCS 2026-11-23 content"` |
 | `MIX` | `"BLINCS 2026-11-23 randomness: mix"` |
@@ -92,10 +91,9 @@ A signing key is a 32-byte `seed` supplied by the caller. From `seed`:
 K_sec   = Derive(SECRET_VALUES, seed)
 K_salt  = Derive(CONTENT_SALT,  seed)
 K_R     = Derive(RANDOMIZER,    seed)
-K_cache = Derive(TOP_CACHE,     seed)    # local authenticated top-tree cache only
 pk_seed = Derive(PUBLIC_SEED,   seed)[..16]
 K_pub   = Derive(PUBLIC_HASH,   pk_seed)
-root    = top hypertree root at layer = 3, tree = 0 (height 15, 32,768 leaves)
+root    = top hypertree root at layer = 3, tree = 0 (height 12, 4,096 leaves)
 ```
 
 The 32-byte verifying key is `vk = pk_seed || root`. A verifier derives from `vk`:
@@ -153,7 +151,7 @@ For each `t = 0..16`, the signer emits `s_{t, idx[t]}` followed by the 10 siblin
 
 ## One-time signatures (WOTS+)
 
-At hypertree position `(layer, tree, leaf)` (`height = 6` for `layer in 0..3`, `height = 15` for `layer = 3`):
+At hypertree position `(layer, tree, leaf)` (`height = 7` for `layer in 0..3`, `height = 12` for `layer = 3`):
 
 - Chain `c` (`0 <= c < 35`) starts at:
   `start_c = ShortHash(K_sec, tweak(CHAIN_SECRET, layer, tree, leaf, c, 0), "")`.
@@ -182,7 +180,7 @@ The signer advances each chain `c` from `0` to `d[c]` and emits the 35 chain val
 
 Starting from `node = fors_root` and `addr = leaf_addr`, for `layer = 0, 1, 2, 3`:
 
-- Let `height = 15` if `layer == 3`, else `6`.
+- Let `height = 12` if `layer == 3`, else `7`.
 - Let `leaf = addr & ((1 << height) - 1)` and `tree = addr >> height`.
 - The signer produces the WOTS+ signature on `node` at `(layer, tree, leaf)` and the `height`-node authentication path in tree `(layer, tree)`.
 - `node` becomes the root of tree `(layer, tree)`; then `addr = tree`.
@@ -196,26 +194,12 @@ Offset   Length  Field
      0       16  e                  content salt
     16       16  R                  randomizer
     32     2816  fors               16 trees x (16 B secret || 10 x 16 B auth path)
-  2848      656  layer 0 (h=6)      35 x 16 B WOTS+ values ||  6 x 16 B auth path
-  3504      656  layer 1 (h=6)      35 x 16 B WOTS+ values ||  6 x 16 B auth path
-  4160      656  layer 2 (h=6)      35 x 16 B WOTS+ values ||  6 x 16 B auth path
-  4816      800  layer 3 (h=15)     35 x 16 B WOTS+ values || 15 x 16 B auth path
+  2848      672  layer 0 (h=7)      35 x 16 B WOTS+ values ||  7 x 16 B auth path
+  3520      672  layer 1 (h=7)      35 x 16 B WOTS+ values ||  7 x 16 B auth path
+  4192      672  layer 2 (h=7)      35 x 16 B WOTS+ values ||  7 x 16 B auth path
+  4864      752  layer 3 (h=12)     35 x 16 B WOTS+ values || 12 x 16 B auth path
   Total: 5616 bytes
 ```
-
-## Optional stateless top-tree cache file (local optimization)
-
-Because layer 3 (`height = 15`, 32,768 leaves) is fixed for the lifetime of a signing key, signers may optionally persist its 65,535 Merkle nodes (`1,048,560` bytes) on disk so 1-shot signers avoid rebuilding the top tree:
-
-```text
-Offset   Length  Field
-     0       16  magic   ASCII "BLINCS-TOP-V1\0\0\0"
-    16       32  mac     Keyed(K_cache, nodes)
-    48  1048560  nodes   1-indexed heap nodes[1..65536] (root at nodes[1], leaves at nodes[32768..65536])
-  Total: 1,048,608 bytes
-```
-
-Losing the cache file never threatens security; it is purely deterministic from `seed` and can always be regenerated. Verifying `mac` in constant time under `K_cache = Derive(TOP_CACHE, seed)` rejects bitrot, truncation, wrong seeds, and tampered nodes.
 
 ## Signer randomness (local policy)
 

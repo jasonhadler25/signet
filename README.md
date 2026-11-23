@@ -3,10 +3,10 @@
 Stateless hash-based signatures built on [BLAKE3](https://github.com/servil-software-factory/BLAKE3).
 
 - **32-byte verifying key** — short enough to embed directly in a name or URL.
-- **32-byte signing-key seed** — caller-supplied; stateless across machines and backups, with an optional authenticated 1 MiB top-tree cache file (`203 µs` reload vs. `40 ms` cold rebuild).
+- **32-byte signing-key seed** — caller-supplied; stateless across machines and backups, with no key cache file on disk (`5.43 ms` cold key derivation builds the 128 KiB top tree across CPU cores).
 - **5,616-byte fixed-size signature** (`7,488 B` Base64 — clears default Apache `8,190 B` and nginx `8,192 B` HTTP headers with 702 B to spare) for any message length from 0 bytes to multi-gigabyte streams.
-- **Zero counter grinding & textbook FIPS 205 building blocks** — pure nibble `WOTS+` (`w = 16`, 35 chains) + `FORS` (`16` trees of `1,024` leaves) on a `15 + 3×6` hypertree: deterministic signing latency (no grinding tails), ~40% simpler spec and code, and textbook FIPS 205 security proofs.
-- **Salted single-pass multi-core content hash** — messages are hashed directly with keyed BLAKE3 under a fresh per-signature salt with no pre-hash API. Pre-hashing makes users vulnerable to collision attacks; passing the message or stream to BLINCS relies on second-preimage resistance and runs at full multi-core BLAKE3 speed (**27.9 GB/s** slice / **26.9 GB/s** streaming on Apple M6 via `blake3-servil`).
+- **Zero counter grinding & textbook FIPS 205 building blocks** — pure nibble `WOTS+` (`w = 16`, 35 chains) + `FORS` (`16` trees of `1,024` leaves) on a `12 + 3×7` hypertree: deterministic signing latency (no grinding tails), no disk cache API, ~40% simpler spec and code, and textbook FIPS 205 security proofs.
+- **Salted single-pass multi-core content hash** — messages are hashed directly with keyed BLAKE3 under a fresh per-signature salt with no pre-hash API. Pre-hashing makes users vulnerable to collision attacks; passing the message or stream to BLINCS relies on second-preimage resistance and runs at full multi-core BLAKE3 speed (**28.6 GB/s** slice / **27.7 GB/s** streaming on Apple M6 via `blake3-servil`).
 - **Design target:** **133.2 bits** of classical security up to **$2^{32}$ signatures** per signing key (4,294,967,296: 10 signatures a second for 13.6 years; degrading gracefully to `126.8` bits at $2^{33}$ and `119.3` bits at $2^{34}$), pending independent cryptographic review.
 
 ## Credits and thanks
@@ -47,17 +47,16 @@ Measured with `bench/` (`bench-hashes`'s `clocks` crate, quiet machine, `blake3-
 
 | Operation | Wall time | Core cycles (main thread) | Throughput |
 |---|---:|---:|---:|
-| `SigningKey::from_seed` (cold 1 MiB top-tree build, 12 cores) | 40.33 ms | 143.7M cyc | 24.8 / s |
-| `SigningKey::from_seed_with_cache` (authenticated 1 MiB disk cache) | **203.4 µs** | 888k cyc | **4,916 / s** |
-| `SigningKey::sign` (64 B) | **439.8 µs** | 1.48M cyc | **2,274 / s** |
-| `SigningKey::sign_reader` (64 B) | **440.3 µs** | 1.48M cyc | **2,271 / s** |
-| `VerifyingKey::verify` (64 B, 1 core) | **26.2 µs** | 120k cyc | **38,200 / s** |
-| `VerifyingKey::verify_reader` (64 B, 1 core) | **26.4 µs** | 121k cyc | **37,900 / s** |
-| `SigningKey::sign` (16 MiB) | **1.01 ms** | 3.94M cyc | **16,651 MB/s** |
-| `VerifyingKey::verify` (16 MiB) | **637.6 µs** | 2.48M cyc | **26,312 MB/s** *(up to 27.9 GB/s)* |
-| `SigningKey::sign_reader` (100 MiB, zero-copy `Pipeline`) | **4.35 ms** | 16.4M cyc | **24,096 MB/s** |
-| `VerifyingKey::verify_reader` (100 MiB, zero-copy `Pipeline`) | **3.89 ms** | 15.1M cyc | **26,941 MB/s** |
-| `Randomness::initialize` (48 B state update, no `fsync`) | 24.7 µs | 105k cyc | — |
+| `SigningKey::from_seed` (128 KiB top-tree build, 12 cores, no disk cache) | **5.43 ms** | 19.3M cyc | **184 / s** |
+| `SigningKey::sign` (64 B) | **729.7 µs** | 2.57M cyc | **1,370 / s** |
+| `SigningKey::sign_reader` (64 B) | **730.1 µs** | 2.57M cyc | **1,370 / s** |
+| `VerifyingKey::verify` (64 B, 1 core) | **25.3 µs** | 117k cyc | **39,500 / s** |
+| `VerifyingKey::verify_reader` (64 B, 1 core) | **25.7 µs** | 118k cyc | **38,900 / s** |
+| `SigningKey::sign` (16 MiB) | **1.29 ms** | 5.05M cyc | **12,987 MB/s** |
+| `VerifyingKey::verify` (16 MiB) | **595.9 µs** | 2.58M cyc | **28,156 MB/s** |
+| `SigningKey::sign_reader` (100 MiB, zero-copy `Pipeline`) | **4.46 ms** | 18.0M cyc | **23,521 MB/s** |
+| `VerifyingKey::verify_reader` (100 MiB, zero-copy `Pipeline`) | **3.79 ms** | 15.3M cyc | **27,674 MB/s** |
+| `Randomness::initialize` (48 B state update, no `fsync`) | 22.8 µs | 103k cyc | — |
 
 ## Quick start
 

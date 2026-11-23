@@ -17,8 +17,8 @@ import blake3  # noqa: E402
 import blincs  # noqa: E402
 
 REF_SIG = os.path.join(ROOT, "test_vectors", "reference-signature-1.bin")
-REF_SHA256 = "03d4fe3f6646f8b3b986a45333947931497c941f4a225db00d06303ff3ee65dc"
-REF_BLAKE3 = "5c56af6af07a04f769008290dcb5d608bcdd25c1e62765d8309948ab2f5b25ea"
+REF_SHA256 = "7fbc1537b5b516c823542c425f48129fe78d974a1806ae24fe0c8dc382a7436c"
+REF_BLAKE3 = "ab80843efd3f5860ccc87f578b8831a79eaf3bb595ac516954823f2ed6886b23"
 
 
 def run(label, cmd):
@@ -39,7 +39,7 @@ def check_vectors_and_python():
     assert got_blake3 == REF_BLAKE3, f"BLAKE3 mismatch: {got_blake3}"
 
     # Verify reference-signature-1.bin with pure Python reference.
-    vk = blincs.VerifyingKey(bytes.fromhex("0ad9c13b8972b912a211f9fd2ba1eec86ec7ac0e8af7b03012a5cf3a6d9bdbb0"))
+    vk = blincs.VerifyingKey(bytes.fromhex("0ad9c13b8972b912a211f9fd2ba1eec863399e14d2f6c8c3309f9d7e61a53c46"))
     assert vk.verify(b"hello, BLINCS", raw), "Python reference rejected reference-signature-1.bin"
 
     # Verify python3 -O validation (no reliance on assert).
@@ -55,7 +55,7 @@ def check_vectors_and_python():
                 "(blincs.mix,(b'x',0,b'0'*32,b'')),(blincs.draw,(b'x',0))]:\n"
                 "    try:\n        fn(*args)\n        raise SystemExit(1)\n"
                 "    except ValueError:\n        pass\n"
-                "ba = bytearray(bytes.fromhex('0ad9c13b8972b912a211f9fd2ba1eec86ec7ac0e8af7b03012a5cf3a6d9bdbb0'))\n"
+                "ba = bytearray(bytes.fromhex('0ad9c13b8972b912a211f9fd2ba1eec863399e14d2f6c8c3309f9d7e61a53c46'))\n"
                 "vk = blincs.VerifyingKey(ba)\n"
                 "ba[0] ^= 0xff\n"
                 "if vk.bytes[0] != 0x0a: raise SystemExit(1)\n"

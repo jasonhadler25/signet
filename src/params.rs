@@ -5,11 +5,10 @@ pub const VERIFYING_KEY_LEN: usize = 32;
 
 pub(crate) const N: usize = 16;
 pub(crate) const LAYERS: usize = 4;
-pub(crate) const LOWER_HEIGHT: usize = 6;
+pub(crate) const LOWER_HEIGHT: usize = 7;
 pub(crate) const LOWER_LEAVES: usize = 1 << LOWER_HEIGHT;
-pub(crate) const TOP_HEIGHT: usize = 15;
+pub(crate) const TOP_HEIGHT: usize = 12;
 pub(crate) const TOP_LEAVES: usize = 1 << TOP_HEIGHT;
-pub(crate) const TOP_NODES: usize = 2 * TOP_LEAVES;
 
 pub(crate) const W: usize = 16;
 pub(crate) const CHAIN_STEPS: u32 = (W - 1) as u32;
@@ -42,7 +41,6 @@ pub(crate) const CTX_SECRET_VALUES: &str = "BLINCS 2026-11-23 signing key: secre
 pub(crate) const CTX_CONTENT_SALT: &str = "BLINCS 2026-11-23 signing key: content salt";
 pub(crate) const CTX_RANDOMIZER: &str = "BLINCS 2026-11-23 signing key: randomizer";
 pub(crate) const CTX_PUBLIC_SEED: &str = "BLINCS 2026-11-23 signing key: public seed";
-pub(crate) const CTX_TOP_CACHE: &str = "BLINCS 2026-11-23 signing key: top tree cache";
 pub(crate) const CTX_PUBLIC_HASH: &str = "BLINCS 2026-11-23 public hash";
 pub(crate) const CTX_CONTENT: &str = "BLINCS 2026-11-23 content";
 pub(crate) const CTX_MIX: &str = "BLINCS 2026-11-23 randomness: mix";

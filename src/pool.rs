@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 
-/// Number of WOTS+ leaves processed per dynamic task during a signing wave (64 / 8 = 8 tasks per lower layer).
+/// Number of WOTS+ leaves processed per dynamic task during a signing wave (128 / 8 = 16 tasks per lower layer).
 const SIGN_WOTS_CHUNK: usize = 8;
 const LOWER_LAYERS: usize = LAYERS - 1;
 const LOWER_CHUNKS_PER_LAYER: usize = LOWER_LEAVES / SIGN_WOTS_CHUNK;
@@ -176,7 +176,7 @@ fn pool() -> &'static Pool {
     POOL.get_or_init(Pool::new)
 }
 
-/// Build all `TOP_LEAVES` (32,768) WOTS+ leaves of the top hypertree in parallel across all CPU cores.
+/// Build all `TOP_LEAVES` (4,096) WOTS+ leaves of the top hypertree in parallel across all CPU cores.
 pub(crate) fn build_top_leaves_parallel(secret_key: &[u8; 32], public_key: &[u8; 32]) -> Vec<[u8; N]> {
     let chunks = (0..TOP_CHUNKS).map(|_| Mutex::new(Vec::new())).collect();
     let job =
@@ -192,7 +192,7 @@ pub(crate) fn build_top_leaves_parallel(secret_key: &[u8; 32], public_key: &[u8;
     leaves
 }
 
-/// Build all 3 lower-layer WOTS+ leaf sets (192 leaves) and all 16 FORS trees (16,384 leaves) in one parallel wave.
+/// Build all 3 lower-layer WOTS+ leaf sets (384 leaves) and all 16 FORS trees (16,384 leaves) in one parallel wave.
 pub(crate) fn run_sign_wave(
     secret_key: &[u8; 32],
     public_key: &[u8; 32],

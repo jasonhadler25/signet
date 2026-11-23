@@ -63,17 +63,14 @@ pub(crate) fn advance_chains(
             break;
         }
         public.hash_many(&b32.part(0..active), &mut out[..active]);
-        for (slot, &(rem, c)) in order[..active].iter().enumerate() {
-            if step < rem {
-                let m = b32.message_mut(slot);
-                m[12..16].copy_from_slice(&((starts[c] + step) as u32).to_le_bytes());
-                m[16..32].copy_from_slice(&out[slot][..N]);
-            } else {
-                values[c].copy_from_slice(&out[slot][..N]);
-            }
-        }
-        while active > 0 && order[active - 1].0 <= step {
+        while active > 0 && order[active - 1].0 == step {
             active -= 1;
+            values[order[active].1].copy_from_slice(&out[active][..N]);
+        }
+        for (slot, &(_, c)) in order[..active].iter().enumerate() {
+            let m = b32.message_mut(slot);
+            m[12..16].copy_from_slice(&((starts[c] + step) as u32).to_le_bytes());
+            m[16..32].copy_from_slice(&out[slot][..N]);
         }
     }
 }
@@ -85,7 +82,7 @@ pub(crate) struct KeyPair<'a> {
     pub public: &'a [u8; 32],
 }
 
-/// Build `out_leaves.len()` consecutive WOTS+ public-key leaves starting at `start_leaf`.
+/// Build `out_leaves.len()` consecutive WOTS+ verifying-key leaves starting at `pos.leaf`.
 pub(crate) fn build_wots_leaves_chunk(keys: KeyPair<'_>, pos: Pos, use_sme2: bool, ws: &mut WorkerScratch, out_leaves: &mut [[u8; N]]) {
     let count = out_leaves.len();
     assert!(count > 0 && count <= WOTS_CHUNK_LEAVES);
@@ -111,16 +108,15 @@ pub(crate) fn build_wots_leaves_chunk(keys: KeyPair<'_>, pos: Pos, use_sme2: boo
             m[16..32].copy_from_slice(&ws.out[slot][..N]);
         }
     }
-    for step in 0..CHAIN_STEPS {
-        pub_h.hash_many(&ws.b32.part(0..total), &mut ws.out[..total]);
-        if step + 1 < CHAIN_STEPS {
-            let next = (step + 1).to_le_bytes();
-            for slot in 0..total {
-                let m = ws.b32.message_mut(slot);
-                m[12..16].copy_from_slice(&next);
-                m[16..32].copy_from_slice(&ws.out[slot][..N]);
-            }
+    pub_h.hash_many(&ws.b32.part(0..total), &mut ws.out[..total]);
+    for step in 1..CHAIN_STEPS {
+        let next = step.to_le_bytes();
+        for slot in 0..total {
+            let m = ws.b32.message_mut(slot);
+            m[12..16].copy_from_slice(&next);
+            m[16..32].copy_from_slice(&ws.out[slot][..N]);
         }
+        pub_h.hash_many(&ws.b32.part(0..total), &mut ws.out[..total]);
     }
 
     for i in 0..count {
@@ -150,9 +146,10 @@ pub(crate) fn build_merkle_heap(public_key: &[u8; 32], layer: u8, tree: u64, hei
     for level in 1..=height {
         let parents = count / 2;
         let parent_start = level_start / 2;
+        let chunk = parents.min(ws.b48.len());
+        debug_assert_eq!(parents % chunk, 0);
         let mut offset = 0usize;
         while offset < parents {
-            let chunk = (parents - offset).min(ws.b48.len());
             for j in 0..chunk {
                 let idx = offset + j;
                 let m = ws.b48.message_mut(j);
@@ -250,6 +247,6 @@ pub(crate) fn verify_layer(public: &TreeHasher, pos: Pos, height: usize, node: &
 #[cfg(test)]
 pub(crate) fn lower_tree_len_check() -> usize {
     assert_eq!(crate::params::LOWER_LEAVES, 1 << crate::params::LOWER_HEIGHT);
-    assert_eq!(crate::params::TOP_NODES, 2 << TOP_HEIGHT);
-    crate::params::TOP_NODES
+    assert_eq!(crate::params::TOP_LEAVES, 1 << TOP_HEIGHT);
+    2 * crate::params::TOP_LEAVES
 }

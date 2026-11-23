@@ -105,13 +105,6 @@ fn main() {
     });
     report("from_seed (keygen/load)", &b, 0);
 
-    let cache_path = dir.join("top-tree.cache");
-    sk.save_top_tree_cache(&cache_path).unwrap();
-    let bc = clocks::measure(10, 100_000_000, || {
-        black_box(SigningKey::from_seed_with_cache(black_box(&seed), &cache_path).unwrap());
-    });
-    report("from_seed_with_cache", &bc, 0);
-
     for &(label, len) in &[
         ("64 B", 64usize),
         ("1 KiB", 1024),

@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
-const REF_VK_HEX: &str = "0ad9c13b8972b912a211f9fd2ba1eec86ec7ac0e8af7b03012a5cf3a6d9bdbb0";
+const REF_VK_HEX: &str = "0ad9c13b8972b912a211f9fd2ba1eec863399e14d2f6c8c3309f9d7e61a53c46";
 
 fn from_hex(s: &str) -> Vec<u8> {
     assert_eq!(s.len() % 2, 0);
@@ -114,7 +114,7 @@ fn reference_vector_matches_python_byte_for_byte() {
     let sk = SigningKey::from_seed(&seed);
     assert_eq!(sk.seed(), &seed);
     assert_eq!(to_hex(sk.verifying_key().as_bytes()), REF_VK_HEX);
-    assert_eq!(lower_tree_len_check(), 65_536);
+    assert_eq!(lower_tree_len_check(), 8_192);
 
     let expected = fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/test_vectors/reference-signature-1.bin")).unwrap();
     assert_eq!(expected.len(), SIGNATURE_LEN);
@@ -219,6 +219,19 @@ fn advance_chains_handles_zero_partial_and_full_lengths() {
     let mut noop = initial;
     advance_chains(&pub_core, Pos { layer: 0, tree: 0, leaf: 0 }, &mut noop, &[5u8; CHAINS], &[5u8; CHAINS], &mut b32, &mut out);
     assert_eq!(noop, initial);
+
+    // Early-finish case: every chain finishes by step 4 (< CHAIN_STEPS).
+    let mut short = initial;
+    let short_starts = [2u8; CHAINS];
+    let short_ends: [u8; CHAINS] = core::array::from_fn(|i| 2 + (i % 5) as u8);
+    advance_chains(&pub_core, Pos { layer: 1, tree: 3, leaf: 2 }, &mut short, &short_starts, &short_ends, &mut b32, &mut out);
+    for c in 0..CHAINS {
+        let mut expected = initial[c];
+        for step in short_starts[c]..short_ends[c] {
+            expected = crate::params::short_hash(&public, crate::params::tweak(crate::params::KIND_CHAIN, 1, 3, 2, c as u16, step as u32), &expected);
+        }
+        assert_eq!(short[c], expected, "short chain {c}");
+    }
 }
 
 #[test]
@@ -276,66 +289,6 @@ fn every_signature_region_is_checked() {
     let mut too_long = base.as_bytes().to_vec();
     too_long.push(0);
     assert!(Signature::try_from(too_long.as_slice()).is_err());
-}
-
-#[test]
-fn top_tree_cache_save_load_and_tamper_rejection() {
-    let seed: [u8; SEED_LEN] = core::array::from_fn(|i| (i as u8).wrapping_mul(11));
-    let sk = SigningKey::from_seed(&seed);
-    let cache_path = temp_state_path("top-cache");
-
-    // Missing cache returns NotFound.
-    assert_eq!(SigningKey::from_seed_with_cache(&seed, &cache_path).unwrap_err().kind(), ErrorKind::NotFound);
-
-    // Save and reload.
-    sk.save_top_tree_cache(&cache_path).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(fs::metadata(&cache_path).unwrap().permissions().mode() & 0o777, 0o600);
-    }
-    let loaded = SigningKey::from_seed_with_cache(&seed, &cache_path).unwrap();
-    assert_eq!(loaded.verifying_key(), sk.verifying_key());
-    assert_eq!(loaded.sign_with_draw(&[9u8; 32], b"cached-msg"), sk.sign_with_draw(&[9u8; 32], b"cached-msg"));
-
-    // Wrong seed fails MAC check.
-    let mut wrong_seed = seed;
-    wrong_seed[0] ^= 1;
-    assert_eq!(SigningKey::from_seed_with_cache(&wrong_seed, &cache_path).unwrap_err().kind(), ErrorKind::InvalidData);
-
-    // Tampering magic, MAC, node payload, truncating, or appending a byte all fail with InvalidData.
-    let good_bytes = fs::read(&cache_path).unwrap();
-    for (name, mut bad) in [
-        ("bad-magic", {
-            let mut b = good_bytes.clone();
-            b[0] ^= 1;
-            b
-        }),
-        ("bad-mac", {
-            let mut b = good_bytes.clone();
-            b[16] ^= 1;
-            b
-        }),
-        ("bad-node", {
-            let mut b = good_bytes.clone();
-            b[1000] ^= 1;
-            b
-        }),
-        ("truncated", good_bytes[..good_bytes.len() - 1].to_vec()),
-        ("trailing-byte", {
-            let mut b = good_bytes.clone();
-            b.push(0);
-            b
-        }),
-    ] {
-        let p = temp_state_path(name);
-        fs::write(&p, &bad).unwrap();
-        assert_eq!(SigningKey::from_seed_with_cache(&seed, &p).unwrap_err().kind(), ErrorKind::InvalidData, "accepted {name}");
-        bad.clear();
-        let _ = fs::remove_dir_all(p.parent().unwrap());
-    }
-
-    let _ = fs::remove_dir_all(cache_path.parent().unwrap());
 }
 
 #[test]
@@ -524,11 +477,6 @@ fn create_works_with_bare_relative_filename() {
     std::env::set_current_dir(&dir).unwrap();
     Randomness::create("state.bin").unwrap();
     assert_eq!(fs::read("state.bin").unwrap().len(), 48);
-    let seed = [0x99u8; SEED_LEN];
-    let sk = SigningKey::from_seed(&seed);
-    sk.save_top_tree_cache("top.cache").unwrap();
-    let loaded = SigningKey::from_seed_with_cache(&seed, "top.cache").unwrap();
-    assert_eq!(loaded.verifying_key(), sk.verifying_key());
     let _ = fs::remove_dir_all(&dir);
 }
 

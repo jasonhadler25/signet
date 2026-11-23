@@ -28,7 +28,7 @@ reference/
 test_vectors/           Checked-in reference signature (SHA-256 + BLAKE3 recorded)
 tools/
   require_nextest.rs    Sentinel test failing plain `cargo test`
-  controls.py           16 planted-fault controls
+  controls.py           14 planted-fault controls
   optimize.py           Reproducible parameter optimizer (unknown-thresholds model)
   mutants/              cargo-mutants runner and known-survivors list
   land.py               Exact-commit landing gate
@@ -55,4 +55,4 @@ python3 tools/land.py
 python3 tools/mutants/check.py
 ```
 
-`tools/land.py` checks a clean working tree, `cargo fmt -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo nextest run --locked`, `cargo test --doc --locked`, `reference/blake3.py`, `python3 -O` reference input validation, `test_vectors/reference-signature-1.bin` SHA-256 and BLAKE3 digests, and all 16 planted-fault controls in `tools/controls.py`.
+`tools/land.py` checks a clean working tree, `cargo fmt -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo nextest run --locked`, `cargo test --doc --locked`, `reference/blake3.py`, `python3 -O` reference input validation, `test_vectors/reference-signature-1.bin` SHA-256 and BLAKE3 digests, and all 14 planted-fault controls in `tools/controls.py`.

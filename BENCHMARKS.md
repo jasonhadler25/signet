@@ -8,7 +8,7 @@ All local measurements below ran on an **Apple M6** (12 cores, macOS arm64, Rust
 
 Source reproduced: [`PQC-Suite-B/signatures`](https://github.com/PQC-Suite-B/signatures) branch `b3`, commit `b392fe82d2d9770142477a576a758a233888bc0a` (`slh-dsa/benches/sign_verify.rs` and `slh-dsa/benches/sign_large_msg.rs`: Criterion 0.5, `sample_size(10)`, `measurement_time(10s)` for `sign_large` over 64 B, 1 MiB, and 100 MiB, and `verify` over 64 B). BLINCS was measured with the exact same Criterion configuration.
 
-> **Threading note:** `PQC-Suite-B/signatures` enables `blake3 = { version = "1.8.2", features = ["rayon"] }` and uses `update_rayon` on message segments $\ge 256$ KiB, so its `SLH-DSA-BLAKE3` 1 MiB and 100 MiB runs use **all CPU cores** for message hashing while its tree hashing is single-threaded. We measured `SLH-DSA-BLAKE3` both as-shipped (default 12 threads) and single-threaded (`RAYON_NUM_THREADS=1`). **BLINCS (Step 1b, `5,616 B`, `WOTS+` + `FORS`)** enables multithreading by default via `blake3-servil = "=0.10.0"` (single-pass salted content hashing + coarse leaf-parallel tree/FORS wave) while verification of small messages stays single-core.
+> **Threading note:** `PQC-Suite-B/signatures` enables `blake3 = { version = "1.8.2", features = ["rayon"] }` and uses `update_rayon` on message segments $\ge 256$ KiB, so its `SLH-DSA-BLAKE3` 1 MiB and 100 MiB runs use **all CPU cores** for message hashing while its tree hashing is single-threaded. We measured `SLH-DSA-BLAKE3` both as-shipped (default 12 threads) and single-threaded (`RAYON_NUM_THREADS=1`). **BLINCS (`5,616 B`, `12 + 3×7`, `WOTS+` + `FORS`, no disk cache)** enables multithreading by default via `blake3-servil = "=0.10.0"` (single-pass salted content hashing + coarse leaf-parallel tree/FORS wave) while verification of small messages stays single-core.
 
 ### Published Apple M3 (PQC-Suite-B charts) vs. Apple M6 reproduction vs. BLINCS
 
@@ -22,46 +22,46 @@ Source reproduced: [`PQC-Suite-B/signatures`](https://github.com/PQC-Suite-B/sig
 | SLH-DSA-SHA2-128f | 17,088 B | $2^{64}$ | 328 µs | 219.9 µs | 5.54 ms | 3.63 ms | 4.19 ms | 60.6 ms |
 | SLH-DSA-BLAKE3-128f *(as-shipped, rayon)* | 17,088 B | $2^{64}$ | 459 µs | 353.7 µs | 7.42 ms | 5.81 ms | 6.26 ms | 15.8 ms *(12 cores)* |
 | SLH-DSA-BLAKE3-128f *(1 thread)* | 17,088 B | $2^{64}$ | — | 353.7 µs | — | 5.81 ms | — | 89.1 ms *(1 core)* |
-| **BLINCS *(Step 1b, multithreaded default)*** | **5,616 B** | **$2^{32}$** | — | **26.2 µs** | — | **0.44 ms** | **0.50 ms** | **4.06–4.37 ms** *(12 cores)* |
+| **BLINCS *(`12 + 3×7`, multithreaded default)*** | **5,616 B** | **$2^{32}$** | — | **25.3 µs** | — | **0.73 ms** | **0.79 ms** | **4.28–4.46 ms** *(12 cores)* |
 | *BLINCS 0.1.0 draft (1 thread, 3,988 B, WOTS+C + PORS+FP)* | *3,988 B* | *$2^{33}$* | — | *31.8 µs* | — | *16.44 ms* | *16.67 ms* | *31.33 ms (1 core)* |
 
-Additional BLINCS (Step 1b) verification numbers on M6 (`clocks`, single-pass salted, `blake3-servil = "=0.10.0"`):
+Additional BLINCS (`12 + 3×7`) verification numbers on M6 (`clocks`, single-pass salted, `blake3-servil = "=0.10.0"`):
 
-- `verify 64 B` (1 core): **26.2 µs** (38,200 / s)
-- `verify 1 MiB`: **111.9 µs** (9,367 MB/s)
-- `verify 16 MiB`: **601–638 µs** (26.3–27.9 GB/s)
-- `verify_reader 100 MiB` (zero-copy `Pipeline`): **3.89 ms** (26,941 MB/s)
+- `verify 64 B` (1 core): **25.3 µs** (39,500 / s)
+- `verify 1 MiB`: **114.3 µs** (9,171 MB/s)
+- `verify 16 MiB`: **595.9 µs** (28,156 MB/s)
+- `verify 100 MiB`: **3.67 ms** (28,565 MB/s) / `verify_reader 100 MiB` (zero-copy `Pipeline`): **3.79 ms** (27,674 MB/s)
 
 Key takeaways on M6:
 
 - **Size:** BLINCS (`5,616 B`, `7,488 B` Base64) is **29% smaller** than `SLH-DSA-128s` (`7,856 B`), **3.0× smaller** than `SLH-DSA-128f` (`17,088 B`), and clears default Apache (`8,190 B`) and nginx (`8,192 B`) HTTP header limits with 702 B to spare.
-- **Verification (64 B, 1 core):** BLINCS (**26.2 µs**) is **2.8× faster** than hardware-accelerated `SLH-DSA-SHA2-128s` (74.4 µs), **4.8× faster** than `SLH-DSA-BLAKE3-128s` (126.6 µs), **13.5× faster** than `SLH-DSA-BLAKE3-128f` (353.7 µs), and **19.4× faster** than `SLH-DSA-SHAKE-128s` (509.0 µs).
-- **Signing (64 B):** BLINCS (**0.44 ms**) is **276× faster** than `SLH-DSA-BLAKE3-128s` (121.7 ms), **13.2× faster** than `SLH-DSA-BLAKE3-128f` (5.81 ms), and **8.3× faster** than `SLH-DSA-SHA2-128f` (3.63 ms) — with **zero counter grinding** and zero tail-latency spikes.
-- **Signing (100 MiB):** BLINCS (**4.06–4.37 ms**, **4.35 ms** via zero-copy `Pipeline` streaming) is **31× faster** than 12-core `SLH-DSA-BLAKE3-128s` (131.9 ms) and **3.7× faster** than 12-core `SLH-DSA-BLAKE3-128f` (15.8 ms).
+- **Verification (64 B, 1 core):** BLINCS (**25.3 µs**) is **2.9× faster** than hardware-accelerated `SLH-DSA-SHA2-128s` (74.4 µs), **5.0× faster** than `SLH-DSA-BLAKE3-128s` (126.6 µs), **14.0× faster** than `SLH-DSA-BLAKE3-128f` (353.7 µs), and **20.1× faster** than `SLH-DSA-SHAKE-128s` (509.0 µs).
+- **Signing (64 B):** BLINCS (**0.73 ms** warm, **6.16 ms** cold 1-shot with no disk cache) is **167× faster** than `SLH-DSA-BLAKE3-128s` (121.7 ms), **8.0× faster** than `SLH-DSA-BLAKE3-128f` (5.81 ms), and **5.0× faster** than `SLH-DSA-SHA2-128f` (3.63 ms) — with **zero counter grinding** and zero tail-latency spikes.
+- **Signing (100 MiB):** BLINCS (**4.28 ms** slice, **4.46 ms** via zero-copy `Pipeline` streaming) is **31× faster** than 12-core `SLH-DSA-BLAKE3-128s` (131.9 ms) and **3.7× faster** than 12-core `SLH-DSA-BLAKE3-128f` (15.8 ms).
 
 ## 2. Wall time and core cycles (`bench/`, `clocks` crate)
 
-Measured on a quiet machine (`bench/` with `blake3-servil = "=0.10.0"`, Step 1b `5,616 B`, 0% E-cores on all signing/verifying runs):
+Measured on a quiet machine (`bench/` with `blake3-servil = "=0.10.0"`, `12 + 3×7` `5,616 B`, 0% E-cores on every run):
 
 | Operation | Wall time | Main-thread cycles | Instructions | IPC | Clock | Throughput |
 |---|---:|---:|---:|---:|---:|---:|
-| `SigningKey::from_seed` (cold 1 MiB top tree) | 40.33 ms | 143.7M | 313.4M | 2.18 | 4,315 MHz | 24.8 / s |
-| `SigningKey::from_seed_with_cache` (auth 1 MiB cache) | **203.4 µs** | 887.6k | 3.20M | 3.61 | 4,372 MHz | **4,916 / s** |
-| `sign` 64 B | **439.8 µs** | 1.48M | 3.41M | 2.31 | 3,924 MHz | **2,274 / s** |
-| `sign_reader` 64 B | **440.3 µs** | 1.48M | 3.42M | 2.31 | 3,924 MHz | **2,271 / s** |
-| `verify` 64 B (1 core) | **26.2 µs** | 119.8k | 673.5k | 5.62 | 4,583 MHz | **38,200 / s** |
-| `verify_reader` 64 B (1 core) | **26.4 µs** | 121.0k | 677.8k | 5.60 | 4,583 MHz | **37,900 / s** |
-| `verify` 256 KiB | 63.2 µs | 284.3k | 1.12M | 3.95 | 4,499 MHz | 4,147 MB/s |
-| `verify_reader` 256 KiB | 64.6 µs | 278.7k | 1.49M | 5.36 | 4,315 MHz | 4,058 MB/s |
-| `verify` 1 MiB | 111.9 µs | 489.0k | 2.55M | 5.21 | 4,389 MHz | 9,367 MB/s |
-| `verify_reader` 1 MiB | 126.2 µs | 516.6k | 2.95M | 5.71 | 4,231 MHz | 8,309 MB/s |
-| `sign` 16 MiB | **1.01 ms** | 3.94M | 17.21M | 4.37 | 4,177 MHz | **16,651 MB/s** |
-| `verify` 16 MiB | **637.6 µs** | 2.48M | 13.86M | 5.58 | 3,896 MHz | **26,312 MB/s** |
-| `sign` 100 MiB | **4.37 ms** | 15.95M | 79.29M | 4.97 | 3,707 MHz | **23,999 MB/s** |
-| `sign_reader` 100 MiB (`Pipeline`) | **4.35 ms** | 16.42M | 91.60M | 5.58 | 3,831 MHz | **24,096 MB/s** |
-| `verify` 100 MiB | **4.20 ms** | 13.94M | 71.83M | 5.15 | 3,320 MHz | **24,971 MB/s** |
-| `verify_reader` 100 MiB (`Pipeline`) | **3.89 ms** | 15.15M | 89.12M | 5.88 | 3,891 MHz | **26,941 MB/s** |
-| `Randomness::initialize` | 24.7 µs | 104.8k | 454.5k | 4.34 | 4,246 MHz | — |
+| `SigningKey::from_seed` (128 KiB top tree, no disk cache) | **5.43 ms** | 19.25M | 41.59M | 2.16 | 4,312 MHz | **184 / s** |
+| `sign` 64 B | **729.7 µs** | 2.57M | 6.05M | 2.36 | 3,828 MHz | **1,370 / s** |
+| `sign_reader` 64 B | **730.1 µs** | 2.57M | 6.05M | 2.36 | 3,829 MHz | **1,370 / s** |
+| `verify` 64 B (1 core) | **25.3 µs** | 116.7k | 651.8k | 5.58 | 4,611 MHz | **39,500 / s** |
+| `verify_reader` 64 B (1 core) | **25.7 µs** | 118.2k | 656.1k | 5.55 | 4,604 MHz | **38,900 / s** |
+| `verify` 256 KiB | 61.6 µs | 274.3k | 1.06M | 3.88 | 4,454 MHz | 4,255 MB/s |
+| `verify_reader` 256 KiB | 63.4 µs | 273.6k | 1.44M | 5.25 | 4,313 MHz | 4,132 MB/s |
+| `sign` 1 MiB | 789.6 µs | 2.82M | 6.93M | 2.45 | 3,862 MHz | 1,328 MB/s |
+| `verify` 1 MiB | 114.3 µs | 500.1k | 2.61M | 5.21 | 4,395 MHz | 9,171 MB/s |
+| `verify_reader` 1 MiB | 130.6 µs | 532.5k | 3.00M | 5.64 | 4,242 MHz | 8,026 MB/s |
+| `sign` 16 MiB | **1.29 ms** | 5.05M | 19.92M | 3.94 | 4,098 MHz | **12,987 MB/s** |
+| `verify` 16 MiB | **595.9 µs** | 2.58M | 14.44M | 5.59 | 4,342 MHz | **28,156 MB/s** |
+| `sign` 100 MiB | **4.28 ms** | 18.03M | 88.43M | 4.90 | 4,249 MHz | **24,475 MB/s** |
+| `sign_reader` 100 MiB (`Pipeline`) | **4.46 ms** | 17.97M | 96.05M | 5.34 | 4,078 MHz | **23,521 MB/s** |
+| `verify` 100 MiB | **3.67 ms** | 15.18M | 80.70M | 5.32 | 4,134 MHz | **28,565 MB/s** |
+| `verify_reader` 100 MiB (`Pipeline`) | **3.79 ms** | 15.34M | 89.91M | 5.86 | 4,048 MHz | **27,674 MB/s** |
+| `Randomness::initialize` | 22.8 µs | 103.3k | 444.8k | 4.31 | 4,535 MHz | — |
 
 ## 3. Optimized `blake3-servil` `0.10.0` benchmarks (single-threaded & multithreaded)
 

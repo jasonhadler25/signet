@@ -1,9 +1,9 @@
-use crate::params::{CHAINS, FORS_LEAVES, FORS_TREES, LOWER_LEAVES, N};
+use crate::params::{CHAINS, FORS_LEAVES, FORS_TREES, N};
 use blake3_servil::throughput::Batch;
 use std::cell::RefCell;
 
-/// Maximum WOTS+ leaves batched in one worker chunk (used by both top-tree keygen and lower layers).
-pub(crate) const WOTS_CHUNK_LEAVES: usize = LOWER_LEAVES;
+/// Maximum WOTS+ leaves batched in one worker chunk (4,096 / 64 = 64 top-tree chunks).
+pub(crate) const WOTS_CHUNK_LEAVES: usize = 64;
 
 /// Maximum slot count needed in `b16` / `b32` / `out` by one worker: max(64 * 35 = 2240, 1024).
 const MAX_BATCH: usize = WOTS_CHUNK_LEAVES * CHAINS;

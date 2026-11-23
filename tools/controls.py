@@ -41,20 +41,6 @@ CONTROLS = [
         "every_signature_region_is_checked",
     ),
     (
-        "Top-tree cache keyed BLAKE3 MAC check (from_seed_with_cache)",
-        "src/lib.rs",
-        "        if !ct_eq_32(&stored_mac, &expected_mac) {",
-        "        if false {",
-        "top_tree_cache_save_load_and_tamper_rejection",
-    ),
-    (
-        "Top-tree cache magic and exact-length check (from_seed_with_cache)",
-        "src/lib.rs",
-        "        if raw.len() != TOP_CACHE_LEN || &raw[..16] != TOP_CACHE_MAGIC {",
-        "        if raw.len() != TOP_CACHE_LEN {",
-        "top_tree_cache_save_load_and_tamper_rejection",
-    ),
-    (
         "Per-signature salt keyed into content hash (content_from_slice)",
         "src/content.rs",
         "    let msg_key = keyed(content_key, salt);\n    let message_hash = if message.len() >= MT_SLICE_THRESHOLD {",

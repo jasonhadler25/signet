@@ -91,7 +91,7 @@ pub(crate) fn build_fors_tree(
     ForsTreeOut { secret: chosen_secret, auth, root: level_nodes[0] }
 }
 
-/// Compress the 16 FORS tree roots into the 16-byte FORS public key signed by hypertree layer 0.
+/// Compress the 16 FORS tree roots into the 16-byte FORS root signed by hypertree layer 0.
 pub(crate) fn fors_root(public: &TreeHasher, leaf_addr: u64, roots: &[[u8; N]; FORS_TREES]) -> [u8; N] {
     let mut input = [0u8; 16 + N * FORS_TREES];
     input[..16].copy_from_slice(&tweak(KIND_FEW_ROOT, 0, leaf_addr, 0, 0, 0));

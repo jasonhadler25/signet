@@ -12,7 +12,7 @@ Report suspected security vulnerabilities privately through GitHub's private vul
 
 Full mathematical and operational details are in [`SPEC.md`](SPEC.md) and [`DESIGN.md`](DESIGN.md). Key boundaries callers must uphold:
 
-- **Per-key signing budget:** at most $2^{33}$ signatures (8,589,934,592) per signing key. The library does not enforce this limit across copies of a seed or across runs.
+- **Per-key signing budget:** at most $2^{32}$ signatures (4,294,967,296) per signing key. The library does not enforce this limit across copies of a seed or across runs.
 - **Signing-key seed entropy:** `SigningKey::from_seed` accepts a caller-supplied 32-byte seed and performs no entropy test. Generate seeds from a vetted cryptographic source; never pass passwords or low-entropy strings.
 - **State file placement:** keep the 48-byte randomness state file in a private local directory owned by the signer on a filesystem that enforces advisory `flock` locks. Create it once with `Randomness::create` before starting signers.
 - **Process forks and VM snapshots:** after `fork()` or restoring a live VM/process image, call `Randomness::initialize` again so clones do not share the same `(run_key, count)` draw sequence.
@@ -23,6 +23,6 @@ Full mathematical and operational details are in [`SPEC.md`](SPEC.md) and [`DESI
 
 Where this repository records digests, it records both SHA-256 and BLAKE3:
 
-- `test_vectors/reference-signature-1.bin` (3,988 bytes):
-  - SHA-256: `ac0808dbf5a435ab21d7426df178abb707f89f3a26a1b84cd13cda083f6f00e1`
-  - BLAKE3:  `f5de1861fe29352b6f290469517a749cc426cf22c48d246acc494cb75d10a4c8`
+- `test_vectors/reference-signature-1.bin` (5,616 bytes):
+  - SHA-256: `7fbc1537b5b516c823542c425f48129fe78d974a1806ae24fe0c8dc382a7436c`
+  - BLAKE3:  `ab80843efd3f5860ccc87f578b8831a79eaf3bb595ac516954823f2ed6886b23`
