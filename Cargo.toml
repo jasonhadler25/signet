@@ -1,0 +1,26 @@
+[package]
+name = "blincs"
+version = "0.1.0"
+edition = "2024"
+description = "Stateless hash-based signatures on BLAKE3 (WOTS+C + PORS+FP, 3,988-byte signatures, salted streaming content hash)"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+include = ["/src", "/SPEC.md", "/README.md", "/QUALITY.md", "/SECURITY.md", "/CHANGELOG.md", "/LICENSE-*", "/tools/require_nextest.rs"]
+
+[dependencies]
+blake3-servil-core = "=0.10.0"
+
+# Tests run at release speed with debug assertions and overflow checks on.
+[profile.test]
+opt-level = 3
+codegen-units = 16
+incremental = false
+debug = false
+debug-assertions = true
+overflow-checks = true
+
+# Mutation testing builds what users run: a mutant caught only by a debug
+# assertion or overflow check would escape a release build.
+[profile.mutants]
+inherits = "release"
+incremental = true
