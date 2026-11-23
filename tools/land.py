@@ -17,8 +17,8 @@ import blake3  # noqa: E402
 import blincs  # noqa: E402
 
 REF_SIG = os.path.join(ROOT, "test_vectors", "reference-signature-1.bin")
-REF_SHA256 = "ac0808dbf5a435ab21d7426df178abb707f89f3a26a1b84cd13cda083f6f00e1"
-REF_BLAKE3 = "f5de1861fe29352b6f290469517a749cc426cf22c48d246acc494cb75d10a4c8"
+REF_SHA256 = "dbeeb3cf497205fb4f3bf0f18c1861a8d62acdd69febe3e22f31decdd16942b2"
+REF_BLAKE3 = "dc4e894a5640047ce03904bffc6a6384fc03b534cd0343636cad4ad2c048a8b1"
 
 
 def run(label, cmd):

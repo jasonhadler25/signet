@@ -67,10 +67,10 @@ CONTROLS = [
         "every_signature_region_and_unused_padding_is_checked",
     ),
     (
-        "Two-pass chunk content hashing (content_from_slice)",
+        "Per-signature salt keyed into content hash (content_from_slice)",
         "src/content.rs",
-        "    let chunk_salt = *TreeHasher::new(Mode::Keyed(&k)).hash(chunk).as_bytes();\n    *TreeHasher::new(Mode::Keyed(&chunk_salt)).hash(chunk).as_bytes()",
-        "    *TreeHasher::new(Mode::Keyed(&k)).hash(chunk).as_bytes()",
+        "    let msg_key = keyed(content_key, salt);\n    let message_hash = *TreeHasher::new(Mode::Keyed(&msg_key)).hash(message).as_bytes();",
+        "    let message_hash = *TreeHasher::new(Mode::Keyed(content_key)).hash(message).as_bytes();",
         "reference_vector_matches_python_byte_for_byte",
     ),
     (
@@ -123,11 +123,11 @@ CONTROLS = [
         "initialize_alone_initializes_blake3_in_fresh_process",
     ),
     (
-        "ChunkLease zeroes reusable chunk buffer before returning it (Drop)",
-        "src/workspace.rs",
-        "            Block::bytes_mut(&mut buf).fill(0);\n",
-        "",
-        "reader_never_sees_previous_callers_bytes",
+        "Streaming content_from_reader feeds read bytes into keyed hasher",
+        "src/content.rs",
+        "            Ok(n) => {\n                hasher.update(&buf[..n]);\n            }\n",
+        "            Ok(_n) => {}\n",
+        "streaming_boundaries_and_fragmented_readers_match_slices",
     ),
 ]
 

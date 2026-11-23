@@ -1,6 +1,6 @@
 include!("../tools/require_nextest.rs");
 
-use blincs::{CHUNK_LEN, Randomness, SEED_LEN, Signature, SigningKey, VerifyingKey};
+use blincs::{Randomness, SEED_LEN, Signature, SigningKey, VerifyingKey};
 use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -36,7 +36,7 @@ fn public_api_round_trip_and_python_reference_cross_check() {
 
     let py = concat!(env!("CARGO_MANIFEST_DIR"), "/reference/blincs.py");
 
-    for (name, len) in [("empty", 0usize), ("small", 43), ("exact-chunk", CHUNK_LEN), ("multi-chunk", CHUNK_LEN * 2 + 123)] {
+    for (name, len) in [("empty", 0usize), ("small", 43), ("64k", 64 * 1024), ("512k-plus", 512 * 1024 + 123)] {
         let msg: Vec<u8> = (0..len).map(|i| ((i * 73 + 11) & 0xff) as u8).collect();
         let sig = sk.sign(&rng, &msg);
         assert!(vk.verify(&msg, &sig));

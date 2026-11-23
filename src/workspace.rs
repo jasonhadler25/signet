@@ -1,5 +1,5 @@
-use crate::params::{CHAINS, CHUNK_LEN, FEW_LEAVES, N, OPENED, TREE_LEAVES};
-use blake3_servil_core::throughput::{Batch, Block};
+use crate::params::{CHAINS, FEW_LEAVES, N, OPENED, TREE_LEAVES};
+use blake3_servil_core::throughput::Batch;
 use std::cell::RefCell;
 
 pub(crate) const GRIND: usize = 2048;
@@ -43,50 +43,9 @@ impl VerifyWorkspace {
     }
 }
 
-/// An owned, zero-initialized 256 KiB aligned chunk buffer leased for one streaming operation.
-///
-/// Releasing the thread-local borrow immediately allows re-entrant `Read` callbacks to call back into
-/// BLINCS without panicking, and `Drop` zeroes the entire buffer before returning it to the thread-local
-/// slot so a later reader on the same thread never observes bytes from an earlier caller.
-pub(crate) struct ChunkLease {
-    buf: Option<Vec<Block>>,
-}
-
-impl ChunkLease {
-    pub fn take() -> Self {
-        let reused = CHUNK_POOL.with(|cell| cell.borrow_mut().take());
-        let buf = reused.unwrap_or_else(|| vec![Block::ZERO; CHUNK_LEN / 64]);
-        Self { buf: Some(buf) }
-    }
-
-    pub fn blocks_mut(&mut self) -> &mut [Block] {
-        self.buf.as_mut().unwrap()
-    }
-
-    #[cfg(test)]
-    pub fn pool_has_buffer() -> bool {
-        CHUNK_POOL.with(|cell| cell.borrow().is_some())
-    }
-}
-
-impl Drop for ChunkLease {
-    fn drop(&mut self) {
-        if let Some(mut buf) = self.buf.take() {
-            Block::bytes_mut(&mut buf).fill(0);
-            let _ = CHUNK_POOL.try_with(|cell| {
-                let mut slot = cell.borrow_mut();
-                if slot.is_none() {
-                    *slot = Some(buf);
-                }
-            });
-        }
-    }
-}
-
 thread_local! {
     static SIGN_WS: RefCell<SignWorkspace> = RefCell::new(SignWorkspace::new());
     static VERIFY_WS: RefCell<VerifyWorkspace> = RefCell::new(VerifyWorkspace::new());
-    static CHUNK_POOL: RefCell<Option<Vec<Block>>> = const { RefCell::new(None) };
 }
 
 pub(crate) fn with_sign_workspace<R>(f: impl FnOnce(&mut SignWorkspace) -> R) -> R {

@@ -4,7 +4,7 @@
 
 BLINCS is a stateless hash-based signature scheme built on BLAKE3. A signature is 3,988 bytes, a verifying key is 32 bytes, and a signing key is a 32-byte seed. Its parameters are chosen for a **design target** of at least 128 bits of classical security up to $2^{33}$ signatures per signing key (8,589,934,592: ten signatures a second for 27 years) under the SPHINCS+ hypertree and PORS+FP cover-probability model, pending independent cryptographic analysis.
 
-Messages are read once from the source in 256 KiB chunks and hashed in two keyed passes per chunk under a salt the signer picks after reading the first chunk (so the first chunk undergoes three keyed hashes during signing and two during verification). Signing and verifying take the message itself — as bytes or a stream — with no pre-hash entry point. Pre-hashing a message before signing makes users vulnerable to collision attacks on the pre-hash; feeding the message or stream directly to BLINCS avoids that exposure.
+Messages are hashed in a single salted keyed-BLAKE3 pass under a fresh per-signature salt `e` derived from the signer's key and per-signature randomness. Signing and verifying take the message itself — as bytes or a stream — with no pre-hash entry point. Pre-hashing a message before signing makes users vulnerable to collision attacks on the pre-hash; feeding the message or stream directly to BLINCS avoids that exposure and runs at full BLAKE3 speed.
 
 All fixed-width integers are unsigned and encoded in little-endian byte order. Ranges written `a..b` are half-open `[a, b)` and `a..=b` are closed `[a, b]`. Concatenation is written `||`, byte slicing `x[a..b]` takes bytes `a` through `b - 1`, and `x[..n]` takes the first `n` bytes. Maximum message length is $2^{64} - 1$ bytes.
 
@@ -19,7 +19,7 @@ BLINCS uses two 32-byte modes of BLAKE3:
 
 | Symbol | Value | Meaning |
 |---|---:|---|
-| `N` | 16 | Byte length of truncated tree, chain, salt, and randomizer values (`x_i`, `D`, `g`, and derived keys are 32 bytes) |
+| `N` | 16 | Byte length of truncated tree, chain, salt, and randomizer values (`h_msg`, `D`, `g`, and derived keys are 32 bytes) |
 | `LAYERS` | 4 | Layers of the hypertree (`d`) |
 | `TREE_HEIGHT` | 9 | Height of each hypertree tree (`h / d`; total height `HYPER_BITS = 36`, $2^9 = 512$ leaves per tree) |
 | `CHAINS` | 24 | WOTS+C chains per one-time signature (`v`) |
@@ -30,7 +30,6 @@ BLINCS uses two 32-byte modes of BLAKE3:
 | `OPENED` | 11 | Distinct leaves opened in a PORS+FP signature (`k`) |
 | `AUTH_NODES` | 103 | Maximum authentication nodes in a PORS+FP merged set (`m`) |
 | `THRESHOLD_BITS` | 6 | Low bits of a PORS+FP pick digest required to be zero (`g_f`) |
-| `CHUNK` | 262,144 | Content chunk size in bytes (256 KiB) |
 
 Derived lengths:
 
@@ -80,7 +79,7 @@ Unused fields are zero. The ten kinds are:
 | 6 | `FEW_SECRET` | `K_sec` | *(empty)* | 16 |
 | 7 | `FEW_LEAF` | `K_pub` | 16-byte leaf secret | 16 |
 | 8 | `FEW_NODE` | `K_pub` | `left (16) \|\| right (16)` | 16 |
-| 9 | `MESSAGE` | `K_pub` | `R (16) \|\| root (16) \|\| short (56)` | 32 |
+| 9 | `MESSAGE` | `K_pub` | `R (16) \|\| root (16) \|\| short (48)` | 32 |
 | 10 | `PICK` | `K_pub` | `D (32) \|\| counter (u32)` | 32 |
 
 Define `ShortHash(K, T, data) = Keyed(K, T || data)[..16]`.
@@ -108,25 +107,21 @@ K_content = Derive(CONTENT,     vk)
 
 ## Content
 
-A message `M` of byte length `len` is split into chunks `M_0, M_1, ..., M_{c-1}` of `CHUNK` (262,144) bytes, with the final chunk taking the remaining `1..=CHUNK` bytes. An empty message (`len = 0`) has one empty chunk `M_0 = ""`.
-
-Given a 16-byte content salt `e`:
-
-```text
-x_{-1} = 0^32   (32 zero bytes)
-for i in 0..c:
-    chunk_key_i  = Keyed(K_content, e || u64_le(i) || x_{i-1})
-    chunk_salt_i = Keyed(chunk_key_i, M_i)        # first read of chunk i
-    x_i          = Keyed(chunk_salt_i, M_i)       # second read of chunk i
-short = e || x_{c-1} || u64_le(len)               # 56 bytes
-```
-
 When signing with a 32-byte per-signature draw `draw`:
 
 ```text
-K_e = Keyed(K_salt, draw)
-e   = Keyed(K_e, M_0)[..16]
+e = Keyed(K_salt, draw)[..16]                     # 16-byte per-signature content salt
 ```
+
+Given the 16-byte content salt `e` and message `M` (any length in `0..2^64`):
+
+```text
+K_msg = Keyed(K_content, e)                       # 32-byte per-signature message key
+h_msg = Keyed(K_msg, M)                           # 32-byte keyed BLAKE3 hash of M (single pass)
+short = e || h_msg                                # 48 bytes
+```
+
+Because BLAKE3 authenticates exact message length internally, `Keyed(K_msg, M)` is length-authenticated and prefix-free across all message lengths in a single streaming pass with no chunking layer.
 
 ## One-time signatures (WOTS+C)
 
@@ -158,7 +153,7 @@ The verifier checks both conditions for `counter`, advances each signature chain
 
 ## Few-time signatures (PORS+FP)
 
-Given `short` (56 bytes):
+Given `short` (48 bytes):
 
 - The signer computes `R = Keyed(K_R, short)[..16]`.
 - Signer and verifier both compute the 32-byte (256-bit) message digest:
@@ -264,8 +259,7 @@ Offset  Length  Field
 The signing key itself is supplied by the caller and is mixed into `e = Keyed(Keyed(K_salt, draw), M_0)[..16]` on every signature. Even if the state file, `/dev/urandom`, and the monotonic clock are all rolled back together so `draw` repeats:
 
 - The signing key is never exposed, and WOTS+C / PORS+FP leaf selection stays unpredictable (`R` is keyed by `K_R` over `short`).
-- Single-chunk messages ($\le$ 256 KiB) still rely on second-preimage resistance (`e` depends on `M_0` under secret `K_salt`).
-- For multi-chunk messages ($>$ 256 KiB), an attacker who probes a 256 KiB prefix `M_0` and then forces a state reset learns `e` and `chunk_key_1` before submitting a second message with the same `M_0`, reducing chunk 1+ to known-key collision resistance of the two-pass function `Keyed(Keyed(k, m), m)` (still 128 bits generically over its 256-bit output).
+- If `draw` repeats identically across a total triple-entropy reset (state file reset, `/dev/urandom` repeat, and monotonic clock repeat), the signing key is still never leaked and `R = Keyed(K_R, e || h_msg)[..16]` still prevents WOTS+C reuse or PORS+FP leaf steering on distinct messages; only content hashing downgrades from second-preimage resistance to 128-bit known-key collision resistance of single-pass 256-bit keyed BLAKE3 `Keyed(K_msg, M)`.
 
 ## Security target, model, and limits
 
@@ -278,5 +272,5 @@ The signing key itself is supplied by the caller and is mixed into `e = Keyed(Ke
 - **Operational signing budget:** the $2^{33}$ per-signing-key budget is an operational requirement not enforced by the library (the state-file counter counts startups, and `Randomness` counts draws in one instance, not total signatures across copies of a seed).
 - **Counter exhaustion:** searching all $2^{32}$ counters without finding a valid counter causes signing to panic (under the ideal-hash model the probability is $< 2^{-200{,}000}$).
 - **Timing:** signing time varies with the number of counter tries on public digests (`D` and subtree roots), not on secret chain values.
-- **Memory retention:** `SigningKey` retains its 32-byte seed and derived keys, and each signing thread keeps a reusable workspace (`SignWorkspace`) whose buffers retain intermediate few-time leaf secrets for the thread's lifetime. Neither BLINCS nor `blake3-servil-core` wipes secret key memory on drop. Streaming reader chunk buffers (`ChunkLease`) are zeroed on drop before being returned to the thread-local slot so later readers on the same thread never observe earlier callers' message bytes.
+- **Memory retention:** `SigningKey` retains its 32-byte seed and derived keys, and each signing thread keeps a reusable workspace (`SignWorkspace`) whose buffers retain intermediate few-time leaf secrets for the thread's lifetime. Neither BLINCS nor `blake3-servil-core` wipes secret key memory on drop. Streaming readers use a fresh local zero-initialized 64 KiB stack buffer per call with no shared cross-caller pool.
 - **Self-check on signing:** in Rust, `SigningKey::sign` / `sign_reader` runs `VerifyingKey::verify_short` over the assembled signature before returning it, independently recomputing the few-time and hypertree paths against `vk.root` (it does not re-read external streams).

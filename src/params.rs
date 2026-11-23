@@ -2,7 +2,6 @@ use blake3_servil_core::{Mode, convenience};
 
 pub const SEED_LEN: usize = 32;
 pub const VERIFYING_KEY_LEN: usize = 32;
-pub const CHUNK_LEN: usize = 256 * 1024;
 
 pub(crate) const N: usize = 16;
 pub(crate) const LAYERS: usize = 4;
@@ -22,14 +21,13 @@ pub(crate) const AUTH_NODES: usize = 103;
 pub(crate) const THRESHOLD_BITS: usize = 6;
 pub(crate) const HYPER_BITS: usize = LAYERS * TREE_HEIGHT;
 
-pub(crate) const SHORT_LEN: usize = N + 32 + 8;
+pub(crate) const SHORT_LEN: usize = N + 32;
 pub(crate) const FEW_LEN: usize = 4 + N * (OPENED + AUTH_NODES);
 pub(crate) const LAYER_LEN: usize = 4 + N * (CHAINS + TREE_HEIGHT);
 pub const SIGNATURE_LEN: usize = 2 * N + FEW_LEN + LAYERS * LAYER_LEN;
 
 const _: () = {
     assert!(SIGNATURE_LEN == 3988);
-    assert!(CHUNK_LEN.is_multiple_of(64));
     assert!(ZERO_BITS as usize + 5 * CHAINS == 128);
     assert!(THRESHOLD_BITS + HYPER_BITS + OPENED * FEW_HEIGHT <= 256);
 };

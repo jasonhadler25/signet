@@ -4,8 +4,7 @@ use crate::content::{content_from_reader, content_from_slice};
 use crate::few_time::{merged_set, merged_size, parse_pick, pick};
 use crate::one_time::{Pos, advance_chains, digits, parse_digits};
 use crate::params::{
-    AUTH_NODES, CHAIN_STEPS, CHAINS, CHUNK_LEN, DIGIT_SUM, FEW_HEIGHT, FEW_LEN, HYPER_BITS, LAYER_LEN, LAYERS, N, OPENED, SIGNATURE_LEN, THRESHOLD_BITS,
-    TREE_HEIGHT,
+    AUTH_NODES, CHAIN_STEPS, CHAINS, DIGIT_SUM, FEW_HEIGHT, FEW_LEN, HYPER_BITS, LAYER_LEN, LAYERS, N, OPENED, SIGNATURE_LEN, THRESHOLD_BITS, TREE_HEIGHT,
 };
 use crate::randomness::{STATE_LEN, mix, read_exact_or_reject, read_monotonic_clock};
 use crate::{Randomness, SEED_LEN, Signature, SigningKey, VERIFYING_KEY_LEN, VerifyingKey};
@@ -70,9 +69,14 @@ impl<'a> Read for FragmentedReader<'a> {
     }
 }
 
-struct FailingReader;
+#[derive(Default)]
+struct FailingReader {
+    calls: usize,
+}
 impl Read for FailingReader {
     fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+        self.calls += 1;
+        assert_eq!(self.calls, 1, "retried non-Interrupted I/O error");
         Err(io::Error::new(ErrorKind::BrokenPipe, "simulated failure"))
     }
 }
@@ -342,13 +346,13 @@ fn every_signature_region_and_unused_padding_is_checked() {
 }
 
 #[test]
-fn chunk_boundaries_and_fragmented_readers_match_slices() {
+fn streaming_boundaries_and_fragmented_readers_match_slices() {
     let seed = [0x11u8; SEED_LEN];
     let sk = SigningKey::from_seed(&seed);
     let vk = sk.verifying_key();
     let draw = [0x22u8; 32];
 
-    for &len in &[0usize, 1, 63, 64, 65, 1024, CHUNK_LEN - 1, CHUNK_LEN, CHUNK_LEN + 1, 2 * CHUNK_LEN, 2 * CHUNK_LEN + 19] {
+    for &len in &[0usize, 1, 63, 64, 65, 1024, 65_535, 65_536, 65_537, 256 * 1024, 512 * 1024 + 19] {
         let msg: Vec<u8> = (0..len).map(|i| ((i.wrapping_mul(37) ^ (i >> 8)) & 0xff) as u8).collect();
         let sig = sk.sign_with_draw(&draw, &msg);
         assert!(vk.verify(&msg, &sig), "slice verify failed for len {len}");
@@ -372,12 +376,11 @@ fn chunk_boundaries_and_fragmented_readers_match_slices() {
     }
 
     // Content helper propagates real I/O errors.
-    let mut blocks = vec![blake3_servil_core::throughput::Block::ZERO; CHUNK_LEN / 64];
-    let err = content_from_reader(&[0u8; 32], Ok([0u8; N]), FailingReader, &mut blocks).unwrap_err();
+    let err = content_from_reader(&[0u8; 32], &[0u8; N], FailingReader::default()).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::BrokenPipe);
-    assert_eq!(sk.sign_reader_with_draw(&draw, FailingReader).unwrap_err().kind(), ErrorKind::BrokenPipe);
+    assert_eq!(sk.sign_reader_with_draw(&draw, FailingReader::default()).unwrap_err().kind(), ErrorKind::BrokenPipe);
     let sig = sk.sign_with_draw(&draw, b"x");
-    assert_eq!(vk.verify_reader(FailingReader, &sig).unwrap_err().kind(), ErrorKind::BrokenPipe);
+    assert_eq!(vk.verify_reader(FailingReader::default(), &sig).unwrap_err().kind(), ErrorKind::BrokenPipe);
 }
 
 #[test]
@@ -489,7 +492,7 @@ fn randomness_create_and_initialize_lifecycle_and_rejection() {
     let long_raw = [valid_raw.as_slice(), &[0u8]].concat();
     let mut frag_long = FragmentedReader::new(&long_raw, 7, 3);
     assert_eq!(read_exact_or_reject(&mut frag_long).unwrap_err().kind(), ErrorKind::InvalidData);
-    assert_eq!(read_exact_or_reject(&mut FailingReader).unwrap_err().kind(), ErrorKind::BrokenPipe);
+    assert_eq!(read_exact_or_reject(&mut FailingReader::default()).unwrap_err().kind(), ErrorKind::BrokenPipe);
 
     let _ = fs::remove_dir_all(path.parent().unwrap());
 }
@@ -578,9 +581,14 @@ fn reader_never_sees_previous_callers_bytes() {
             Ok(n)
         }
     }
-    struct DirtyThenFail;
+    #[derive(Default)]
+    struct DirtyThenFail {
+        calls: usize,
+    }
     impl Read for DirtyThenFail {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.calls += 1;
+            assert_eq!(self.calls, 1, "retried non-Interrupted I/O error");
             buf.fill(0xBB);
             Err(io::Error::new(ErrorKind::BrokenPipe, "fail after dirtying buffer"))
         }
@@ -588,28 +596,21 @@ fn reader_never_sees_previous_callers_bytes() {
 
     let sk = SigningKey::from_seed(&[0x33u8; SEED_LEN]);
     let vk = sk.verifying_key();
-    let secret_msg = vec![0xAAu8; CHUNK_LEN];
+    let secret_msg = vec![0xAAu8; 128 * 1024];
 
-    // Sign a full 0xAA chunk, then ensure a subsequent signing reader sees all zeros.
+    // Sign a 128 KiB 0xAA message, then ensure a subsequent signing reader sees all zeros.
     let sig = sk.sign_reader_with_draw(&[1u8; 32], Cursor::new(&secret_msg)).unwrap();
     let mut snoop_sign = SnoopingReader { data: b"second", pos: 0, saw_nonzero: false };
     let sig2 = sk.sign_reader_with_draw(&[2u8; 32], &mut snoop_sign).unwrap();
     assert!(!snoop_sign.saw_nonzero, "second sign_reader observed previous caller's bytes");
     assert!(vk.verify(b"second", &sig2));
 
-    // Verify a full 0xAA chunk, then fail a reader that dirtied the buffer, then ensure next reader sees zeros.
+    // Verify a 128 KiB 0xAA message, then fail a reader that dirtied the buffer, then ensure next reader sees zeros.
     assert!(vk.verify_reader(Cursor::new(&secret_msg), &sig).unwrap());
-    assert!(vk.verify_reader(DirtyThenFail, &sig).is_err());
+    assert!(vk.verify_reader(DirtyThenFail::default(), &sig).is_err());
     let mut snoop_ver = SnoopingReader { data: b"second", pos: 0, saw_nonzero: false };
     assert!(vk.verify_reader(&mut snoop_ver, &sig2).unwrap());
     assert!(!snoop_ver.saw_nonzero, "second verify_reader observed previous caller's bytes");
-
-    // Confirm ChunkLease returns the zeroed buffer to the thread-local pool for reuse.
-    {
-        let _lease = crate::workspace::ChunkLease::take();
-        assert!(!crate::workspace::ChunkLease::pool_has_buffer(), "pool should be empty while leased");
-    }
-    assert!(crate::workspace::ChunkLease::pool_has_buffer(), "ChunkLease::drop did not return buffer to pool");
 }
 
 #[test]
@@ -643,18 +644,4 @@ fn reentrant_reader_can_sign_and_verify_without_borrowing_panic() {
     let outer = sk.sign_reader_with_draw(&[7u8; 32], ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, done: false }).unwrap();
     assert!(vk.verify(b"outer", &outer));
     assert!(vk.verify_reader(ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, done: false }, &outer).unwrap());
-}
-
-#[test]
-fn throughput_hash_ignores_dirty_block_tail() {
-    blake3_servil_core::initialize();
-    let key = [0x77u8; 32];
-    let salt = [0x88u8; N];
-    let mut blocks = vec![blake3_servil_core::throughput::Block::ZERO; CHUNK_LEN / 64];
-    // Deliberately fill the entire aligned buffer with 0xFF before reading a short 19-byte message.
-    blake3_servil_core::throughput::Block::bytes_mut(&mut blocks).fill(0xFF);
-    let msg = b"short-with-dirty-tl";
-    let (_, short_dirty) = content_from_reader(&key, Ok(salt), Cursor::new(msg), &mut blocks).unwrap();
-    let short_clean = content_from_slice(&key, &salt, msg);
-    assert_eq!(short_dirty, short_clean);
 }

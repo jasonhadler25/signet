@@ -105,7 +105,15 @@ fn main() {
     });
     report("from_seed (keygen/load)", &b, 0);
 
-    for &(label, len) in &[("64 B", 64usize), ("1 KiB", 1024), ("64 KiB", 65536), ("256 KiB", 262144), ("1 MiB", 1024 * 1024), ("16 MiB", 16 * 1024 * 1024)] {
+    for &(label, len) in &[
+        ("64 B", 64usize),
+        ("1 KiB", 1024),
+        ("64 KiB", 65536),
+        ("256 KiB", 262144),
+        ("1 MiB", 1024 * 1024),
+        ("16 MiB", 16 * 1024 * 1024),
+        ("100 MiB", 100 * 1024 * 1024),
+    ] {
         let msg: Vec<u8> = (0..len).map(|i| (i.wrapping_mul(31) & 0xff) as u8).collect();
         let sig = sk.sign(&rng, &msg);
         assert!(vk.verify(&msg, &sig));

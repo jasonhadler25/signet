@@ -2,7 +2,8 @@
 
 ## 0.1.0 (unreleased draft)
 
-- Specified BLINCS (`SPEC.md`) and recorded all design rationales (`DESIGN.md`): SPHINCS+ hypertree (`h=36, d=4`), WOTS+C (24 chains of 32, 8 zero bits, digit sum 372), PORS+FP ($2^{15}$ leaves, 11 opened, at most 103 merged authentication nodes, 6 threshold bits), 256 KiB two-pass salted content hashing, startup-only 48-byte signer randomness state without `fsync`.
+- Switched content hashing to single-pass salted keyed BLAKE3 (`e = Keyed(K_salt, draw)[..16]`, `K_msg = Keyed(K_content, e)`, `h_msg = Keyed(K_msg, M)`), removing the 256 KiB two-pass chunking layer and `ChunkLease` so the crate is 100% crash-only with zero `Drop` implementations, doubling single-core verification to 7,400 MB/s at 16 MiB / 6,974 MB/s at 100 MiB (and unlocking 30.4–30.6 GB/s multi-core streaming via `blake3-servil`).
+- Specified BLINCS (`SPEC.md`) and recorded all design rationales (`DESIGN.md`): SPHINCS+ hypertree (`h=36, d=4`), WOTS+C (24 chains of 32, 8 zero bits, digit sum 372), PORS+FP ($2^{15}$ leaves, 11 opened, at most 103 merged authentication nodes, 6 threshold bits), startup-only 48-byte signer randomness state without `fsync`, and the simplified Leximin $L_\infty$ minimax parameter optimizer (`tools/optimize.py`).
 - Implemented independent pure-Python reference (`reference/blake3.py` passing all 35 official BLAKE3 vectors, `reference/blincs.py`) and checked in `test_vectors/reference-signature-1.bin`.
 - Implemented `#![forbid(unsafe_code)]` Rust crate on `blake3-servil-core = "=0.10.0"` (10 crates total in `Cargo.lock`, zero dev-dependencies), matching the Python reference byte for byte.
 - Optimized verification with `TreeHasher::on_this_core()` and per-level few-time batching (57.3 µs → 33.3 µs on Apple M6) and signing with cached top tree and `GRIND = 2048` (16.2 ms on Apple M6; 3.5 GB/s two-pass content verification at 16 MiB).

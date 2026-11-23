@@ -5,7 +5,7 @@ Stateless hash-based signatures built on [BLAKE3](https://github.com/servil-soft
 - **32-byte verifying key** — short enough to embed directly in a name or URL.
 - **32-byte signing-key seed** — caller-supplied; stateless across machines and backups.
 - **3,988-byte fixed-size signature** — fits inside a 4 KiB page for any message length (0 bytes to multi-gigabyte streams).
-- **Salted two-pass streaming content hash** — messages are hashed directly in 256 KiB chunks with no pre-hash API. Pre-hashing makes users vulnerable to collision attacks; passing the message or stream to BLINCS relies on second-preimage resistance and hashes at BLAKE3 speed.
+- **Salted single-pass streaming content hash** — messages are hashed directly with keyed BLAKE3 under a fresh per-signature salt with no pre-hash API. Pre-hashing makes users vulnerable to collision attacks; passing the message or stream to BLINCS relies on second-preimage resistance and hashes at full BLAKE3 speed (**7.40 GB/s** on 1 core, up to **30.4–30.6 GB/s** multi-core via `blake3-servil`).
 - **Design target:** at least 128 bits of classical security up to $2^{33}$ signatures per signing key (8,589,934,592: 10 signatures a second for 27 years) under the SPHINCS+ / PORS+FP cover-probability model, pending independent cryptographic review.
 
 ## Credits and thanks
@@ -46,13 +46,14 @@ Measured with `bench/` (`bench-hashes`'s `clocks` crate, single thread, quiet ma
 
 | Operation | Wall time | Core cycles | Throughput |
 |---|---:|---:|---:|
-| `SigningKey::from_seed` (loads & caches 16 KiB top tree) | 4.43 ms | 19.8M cyc | 226 / s |
-| `SigningKey::sign` (64 B) | 16.22 ms | 72.5M cyc | 61.7 / s |
-| `VerifyingKey::verify` (64 B) | 33.3 µs | 152k cyc | 30,000 / s |
-| `VerifyingKey::verify_reader` (64 B) | 34.8 µs | 160k cyc | 28,700 / s |
-| `SigningKey::sign` (16 MiB) | 20.96 ms | 92.7M cyc | 800 MB/s |
-| `VerifyingKey::verify` (16 MiB, two-pass salted) | 4.77 ms | 20.6M cyc | 3,516 MB/s |
-| `Randomness::initialize` (48 B state update, no `fsync`) | 23.1 µs | 105k cyc | — |
+| `SigningKey::from_seed` (loads & caches 16 KiB top tree) | 4.49 ms | 19.9M cyc | 223 / s |
+| `SigningKey::sign` (64 B) | 16.44 ms | 72.2M cyc | 60.8 / s |
+| `VerifyingKey::verify` (64 B) | 31.8 µs | 152k cyc | 31,400 / s |
+| `VerifyingKey::verify_reader` (64 B) | 32.2 µs | 154k cyc | 31,100 / s |
+| `SigningKey::sign` (100 MiB) | 31.33 ms | 137.4M cyc | 3,347 MB/s |
+| `VerifyingKey::verify` (16 MiB, single-pass salted) | 2.27 ms | 9.9M cyc | **7,400 MB/s** |
+| `VerifyingKey::verify` (100 MiB, single-pass salted) | 15.04 ms | 65.9M cyc | **6,974 MB/s** |
+| `Randomness::initialize` (48 B state update, no `fsync`) | 22.9 µs | 104k cyc | — |
 
 ## Quick start
 

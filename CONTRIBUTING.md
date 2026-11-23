@@ -13,11 +13,11 @@ SECURITY.md             Threat model, operational boundaries, and reporting
 src/
   lib.rs                Public API (SigningKey, VerifyingKey, Signature)
   params.rs             Constants, contexts, 16-byte tweaks, key helpers
-  content.rs            256 KiB chunked two-pass content hashing
+  content.rs            Single-pass salted BLAKE3 content hashing (slices & streams)
   few_time.rs           PORS+FP selection, merged authentication sets, sign/verify
   one_time.rs           WOTS+C encoding, batched chains, hypertree trees
   randomness.rs         48-byte state file (create, initialize) and in-memory draws
-  workspace.rs          Crash-only thread-local workspaces and zeroed ChunkLease
+  workspace.rs          Crash-only thread-local signing and verification workspaces
   test.rs               Unit tests, reference vector checks, negative tests
 tests/
   integration.rs        Public API tests and live Python cross-verification

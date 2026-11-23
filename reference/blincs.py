@@ -25,7 +25,6 @@ N = 16  # bytes of every hash value in a key or a signature
 LAYERS, TREE_HEIGHT = 4, 9  # the hypertree: four layers of trees with 2^9 leaves
 CHAINS, CHAIN_STEPS, ZERO_BITS, DIGIT_SUM = 24, 31, 8, 372  # one-time signatures
 FEW_HEIGHT, OPENED, AUTH_NODES, THRESHOLD_BITS = 15, 11, 103, 6  # few-time signatures
-CHUNK = 256 * 1024  # bytes of content hashed at a time
 HYPER_BITS = LAYERS * TREE_HEIGHT
 FEW_LEN = 4 + N * (OPENED + AUTH_NODES)
 LAYER_LEN = 4 + N * (CHAINS + TREE_HEIGHT)
@@ -57,19 +56,10 @@ def short_hash(key, tweak_bytes, data=b""):
 
 
 # --- Content (SPEC.md, "Content") ------------------------------------------------------------------------
-def chunks_of(message):
-    return [message[i : i + CHUNK] for i in range(0, len(message), CHUNK)] or [b""]
-
-
-def content(content_key, salt, chunks):
-    """What the tree part signs for a message: the salt, the last chunk's second hash, the length."""
-    x, length = bytes(32), 0
-    for i, chunk in enumerate(chunks):
-        chunk_key = blake3.keyed_hash(content_key, salt + i.to_bytes(8, "little") + x)
-        chunk_salt = blake3.keyed_hash(chunk_key, chunk)  # the first reading of the chunk
-        x = blake3.keyed_hash(chunk_salt, chunk)  # the second, keyed by the first
-        length += len(chunk)
-    return salt + x + length.to_bytes(8, "little")
+def content(content_key, salt, message):
+    """What the tree part signs for a message: the salt and the keyed BLAKE3 hash of the message."""
+    msg_key = blake3.keyed_hash(content_key, salt)
+    return salt + blake3.keyed_hash(msg_key, message)
 
 
 # --- One-time signatures (SPEC.md, "One-time signatures") ----------------------------------------------
@@ -171,7 +161,7 @@ class VerifyingKey:
             return False
         public = self.public
         salt, randomizer, at = signature[:N], signature[N : 2 * N], 2 * N
-        short = content(self.content_key, salt, chunks_of(message))
+        short = content(self.content_key, salt, message)
         # The few-time signature.
         counter = int.from_bytes(signature[at : at + 4], "little")
         picked = pick(public, self.message_digest(randomizer, short), counter)
@@ -232,9 +222,8 @@ class SigningKey:
         draw = _exact_bytes(draw, 32, "draw")
         message = bytes(message)
         public, vk = self.public, self.verifying_key
-        chunks = chunks_of(message)
-        salt = blake3.keyed_hash(blake3.keyed_hash(self.salt_key, draw), chunks[0])[:N]
-        short = content(vk.content_key, salt, chunks)
+        salt = blake3.keyed_hash(self.salt_key, draw)[:N]
+        short = content(vk.content_key, salt, message)
         randomizer = blake3.keyed_hash(self.randomizer_key, short)[:N]
         digest = vk.message_digest(randomizer, short)
         # The few-time signature: the first counter that passes, then the whole tree of that few-time key.

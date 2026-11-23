@@ -1,9 +1,9 @@
 //! BLINCS: stateless hash-based signatures on BLAKE3.
 //!
 //! A signature is 3,988 bytes, a verifying key is 32 bytes, and a signing key is a 32-byte seed.
-//! Messages are hashed in 256 KiB chunks under a per-signature salt, reading each chunk twice; passing the
-//! message or stream directly to BLINCS relies on second-preimage resistance rather than collision
-//! resistance, and hashes at BLAKE3 speed.
+//! Messages are hashed in a single salted keyed-BLAKE3 pass under a fresh per-signature salt; passing
+//! the message or stream directly to BLINCS relies on second-preimage resistance rather than collision
+//! resistance, and hashes at full BLAKE3 speed.
 //!
 //! ```
 //! use blincs::{Randomness, SigningKey, VerifyingKey};
@@ -36,12 +36,12 @@ mod params;
 mod randomness;
 mod workspace;
 
-pub use params::{CHUNK_LEN, SEED_LEN, SIGNATURE_LEN, VERIFYING_KEY_LEN};
+pub use params::{SEED_LEN, SIGNATURE_LEN, VERIFYING_KEY_LEN};
 pub use randomness::Randomness;
 
 use blake3_servil_core::Mode;
 use blake3_servil_core::throughput::TreeHasher;
-use content::{content_from_reader, content_from_slice, derive_salt_slice};
+use content::{content_from_reader, content_from_slice, derive_salt};
 use few_time::{few_time_sign, few_time_verify};
 use one_time::{Pos, build_tree, sign_layer, sign_top_layer, verify_layer};
 use params::{
@@ -51,7 +51,7 @@ use params::{
 use std::array::TryFromSliceError;
 use std::fmt;
 use std::io::{self, Read};
-use workspace::{ChunkLease, SignWorkspace, with_sign_workspace, with_verify_workspace};
+use workspace::{SignWorkspace, with_sign_workspace, with_verify_workspace};
 
 /// A 3,988-byte BLINCS signature.
 #[derive(Clone, PartialEq, Eq)]
@@ -156,13 +156,10 @@ impl VerifyingKey {
         self.verify_short(&short, signature)
     }
 
-    /// Verify `signature` over a streaming `reader`, hashing in 256 KiB chunks.
+    /// Verify `signature` over a streaming `reader` in one salted pass.
     pub fn verify_reader(&self, reader: impl Read, signature: &Signature) -> io::Result<bool> {
         let salt: [u8; N] = signature.as_bytes()[..N].try_into().unwrap();
-        let (_, short) = {
-            let mut lease = ChunkLease::take();
-            content_from_reader(&self.content_key, Ok(salt), reader, lease.blocks_mut())?
-        };
+        let short = content_from_reader(&self.content_key, &salt, reader)?;
         Ok(self.verify_short(&short, signature))
     }
 }
@@ -252,17 +249,14 @@ impl SigningKey {
     }
 
     pub(crate) fn sign_with_draw(&self, draw: &[u8; 32], message: &[u8]) -> Signature {
-        let first_chunk = &message[..message.len().min(CHUNK_LEN)];
-        let salt = derive_salt_slice(&self.salt_key, draw, first_chunk);
+        let salt = derive_salt(&self.salt_key, draw);
         let short = content_from_slice(&self.verifying_key.content_key, &salt, message);
         with_sign_workspace(|ws| self.finish_signature(&salt, &short, ws))
     }
 
     pub(crate) fn sign_reader_with_draw(&self, draw: &[u8; 32], reader: impl Read) -> io::Result<Signature> {
-        let (salt, short) = {
-            let mut lease = ChunkLease::take();
-            content_from_reader(&self.verifying_key.content_key, Err((&self.salt_key, draw)), reader, lease.blocks_mut())?
-        };
+        let salt = derive_salt(&self.salt_key, draw);
+        let short = content_from_reader(&self.verifying_key.content_key, &salt, reader)?;
         Ok(with_sign_workspace(|ws| self.finish_signature(&salt, &short, ws)))
     }
 
@@ -272,7 +266,7 @@ impl SigningKey {
         self.sign_with_draw(&draw, message)
     }
 
-    /// Sign a streaming `reader` in 256 KiB chunks, drawing fresh per-signature randomness from `randomness`.
+    /// Sign a streaming `reader` in one salted pass, drawing fresh per-signature randomness from `randomness`.
     pub fn sign_reader(&self, randomness: &Randomness, reader: impl Read) -> io::Result<Signature> {
         let draw = randomness.draw();
         self.sign_reader_with_draw(&draw, reader)

@@ -2,7 +2,7 @@
 
 *Thanks to the [Project 11](https://research.projecteleven.com/) research team — **Conor Deegan** (direct review of `SPEC.md`, grinding-vs-signing-time feedback, irregular hypertrees + upper-layer caching, SLH-DSA-B with **julienif**, THINCS, CUTS, and the SHRINCS review with **Alex Pruden**), **Alessandro Baiocchi, Matteo Vena, and Matteo Vicari** ([SPHINCS+ Parameter Explorer](https://research.projecteleven.com/tools/sphincs-parameter), [SPHINCS-G benchmarks](https://research.projecteleven.com/articles/sphincs-g-benchmarks), and [taller cached top-tree / partial-caching work](https://research.projecteleven.com/articles/raising-sphincs-lifetime-budgets)), and **Jamie Judd, Louis Tajan, and Furkan Akal** (CUTS) — as well as the authors of BLAKE3, `blake3-servil`, SPHINCS/SPHINCS+, WOTS+C, PORS+FP, Gravity-SPHINCS, and the randomness/hypertree papers credited in [`README.md`](README.md#credits-and-thanks) and Section 4 below.*
 
-This document records **why** BLINCS is shaped the way it is: the threat model, the quantitative tradeoff ("minimax" and log-regret) models, every candidate optimization we evaluated (both earlier literature and Project 11's latest hash-based signature work) and why each was adopted, kept open, or declined, the salted two-pass streaming content hash, the startup-only signer randomness, and the crash-only engineering choices. For the normative byte-level definition, see [`SPEC.md`](SPEC.md); for the original strategy note that launched the project, see [`docs/history/manifesto.md`](docs/history/manifesto.md).
+This document records **why** BLINCS is shaped the way it is: the threat model, the simplified minimax tradeoff algorithm, every candidate optimization we evaluated (both earlier literature and Project 11's latest hash-based signature work) and why each was adopted, kept open, or declined, the single-pass salted content hash, the startup-only signer randomness, and the crash-only engineering choices. For the normative byte-level definition, see [`SPEC.md`](SPEC.md); for the original strategy note that launched the project, see [`docs/history/manifesto.md`](docs/history/manifesto.md).
 
 ---
 
@@ -151,7 +151,7 @@ This table records every hash-based signature technique we evaluated — both th
 3. **WOTS+C in place of WOTS+** (Mikhail Kudinov, Andreas Hülsing, Eyal Ronen, and Eylon Yogev, IEEE S&P 2023, [ePrint 2022/778](https://eprint.iacr.org/2022/778)): drops the checksum chains by grinding a 32-bit counter until the digits sum to a fixed constant and `g` low digest bits are zero. Every valid digit vector has the same sum, so advancing revealed chain values can never reach another valid vector. Shrinks each layer, halves worst-case verification work, and rests on target-collision resistance.
 4. **PORS+FP in place of FORS** (Mehdi Abri and Jonathan Katz, CRYPTO 2026, [ePrint 2025/2069](https://eprint.iacr.org/2025/2069), building on Jean-Philippe Aumasson and Guillaume Endignoux's PORS & Octopus merging in [ePrint 2017/933](https://eprint.iacr.org/2017/933)): replaces $k$ separate trees with one single tree of $2^b$ leaves, deduplicates overlapping authentication paths ("Octopus"), and filters via a counter until `merged_len <= m` and `gf` threshold bits are zero. Saves ~500–800 B over FORS/FORS+C with a clean security reduction (Theorem 1).
 5. **256-bit internal message digest `D` before `PICK`:** Abri & Katz's writeup truncates the pre-counter message digest to $n = 128$ bits, which loses $\log_2 q = 33$ bits to multi-target queries across $2^{33}$ signatures (dropping to 95 bits). Keeping `D` at BLAKE3's native 256 bits (`>= 128 + 33 = 161` bits) closes that gap at zero wire-byte cost.
-6. **Two-pass salted streaming content hash over 256 KiB chunks:** eliminates pre-hash collision exposure while keeping signatures fixed-size and verification at 3.5 GB/s on one M6 core (§5).
+6. **Single-pass salted content hash (`Keyed(Keyed(K_content, e), M)`):** eliminates pre-hash collision exposure with no chunking layer, keeping signatures fixed-size, streaming memory tiny, single-core verification at **7.40 GB/s** (16 MiB) / **6.97 GB/s** (100 MiB) on Apple M6, and multi-core streaming up to **30.4–30.6 GB/s** via `blake3-servil` `Pipeline::room()` / `hash_multithreaded` (§5).
 7. **Stateless top-tree caching in `SigningKey`:** building the top XMSS tree once at key load and keeping it in memory (16 KiB in `0.1.0`) is purely a signer-side optimization — losing the cache only means recomputing it from the 32-byte seed, with zero change to the wire format or security.
 8. **Single-core SIMD batching + on-core verification dispatch:** `blake3-servil-core` `Batch` + `TreeHasher::on_this_core()` keeps all tree/chain hashing wide across NEON/AVX2/AVX-512 lanes without triggering Apple SME2 downclocking on tiny verification batches (§7).
 
@@ -181,35 +181,33 @@ This table records every hash-based signature technique we evaluated — both th
 
 ---
 
-## 5. Salted two-pass content hashing and 256 KiB chunks
+## 5. Single-pass salted content hashing
 
 ### No pre-hash API
 
-BLINCS exposes `sign` / `sign_reader` and `verify` / `verify_reader`, and no entry point accepting a precomputed digest. Pre-hashing exposes callers to collision attacks on the pre-hash; hashing the stream directly inside BLINCS keeps the signature bound to a freshly chosen salt and runs at multi-GB/s BLAKE3 speed.
+BLINCS exposes `sign` / `sign_reader` and `verify` / `verify_reader`, and no entry point accepting a precomputed digest. Pre-hashing exposes callers to collision attacks on the pre-hash; hashing the stream directly inside BLINCS keeps the signature bound to a freshly chosen salt and runs at full BLAKE3 speed.
 
-### Regenerated per-chunk salts (fixed signature size)
+### Why single-pass salted BLAKE3 instead of two-pass chunking
 
-A message is split into 256 KiB chunks `M_0, M_1, ...`. After reading `M_0`, the signer computes the 16-byte content salt `e = Keyed(Keyed(K_salt, draw), M_0)[..16]`, carried once in the signature. For each chunk `i`, both signer and verifier compute:
+When signing with a 32-byte per-signature draw `draw`, the signer computes:
 
 ```text
-chunk_key_i  = Keyed(K_content, e || u64_le(i) || x_{i-1})
-chunk_salt_i = Keyed(chunk_key_i, M_i)
-x_i          = Keyed(chunk_salt_i, M_i)
+e     = Keyed(K_salt, draw)[..16]       # 16-byte per-signature salt, carried in the signature
+K_msg = Keyed(K_content, e)             # 32-byte per-signature message key
+h_msg = Keyed(K_msg, M)                 # 32-byte single-pass keyed BLAKE3 hash of M
+short = e || h_msg                      # 48 bytes
 ```
 
-Why two passes with a regenerated per-chunk salt instead of the alternatives:
+Earlier drafts hashed 256 KiB chunks in two sequential keyed passes (`Keyed(Keyed(chunk_key_i, M_i), M_i)`). Benchmarking all four content-hashing options on Apple M6 (`100 MiB`, `blake3-servil = "=0.10.0"`, [`BENCHMARKS.md`](BENCHMARKS.md) §3.4) showed why single-pass salted BLAKE3 won decisively:
 
-- **Carrying a 16-byte salt per chunk in the signature** makes signature length grow with message size, breaking fixed-size ergonomics.
-- **One pass keyed only by `e` and earlier chunks** collapses to a cheap single-pass collision attack on chunk `i >= 1` whenever `e` is known in advance (for example, after a state reset on a shared prefix `M_0`).
-- **Two passes per chunk (`Keyed(Keyed(k, m), m)`)** keeps signatures fixed at 3,988 bytes, requires only a single 256 KiB buffer for streaming, reads the external source only once, keeps generic collision resistance at 128 bits over the 256-bit `x_i`, and blocks single-pass structural collision attacks even when `k` is known.
+| Content-hashing design (100 MiB, Apple M6) | 1 core | 12 cores (`blake3-servil`) | Complexity & trade-off |
+|---|---:|---:|---|
+| Chained 2-pass 256 KiB chunks *(earlier draft)* | 3,322 MB/s | 3,324 MB/s *(3,990 MB/s via `Pipeline`)* | Sequential chaining blocks parallelism; `< 512 KiB` stays 1T in `hash_multithreaded`; requires 256 KiB buffer & `Drop` zeroing |
+| Chained 2-pass 1 MiB chunks | 3,701 MB/s | 8,843 MB/s (`hash_multithreaded`) | Still hashes every byte twice; 1 MiB buffer |
+| Unchained parallel 2-pass 256 KiB chunks | ~3,320 MB/s | 16,592 MB/s *(custom 12-core split)* | Needs chunk Merkle tree & custom worker split; still hashes every byte twice |
+| **Single-pass salted BLAKE3 *(adopted)*** | **7,400 MB/s** | **30,409–30,629 MB/s** (`Pipeline::room()` / `hash_multithreaded`) | Zero chunking layer in `SPEC.md`, zero chunk pool / zero `Drop` impls, >2× faster on 1 core and **9.2× faster** on 12 cores |
 
-### Why 256 KiB chunks
-
-Published single-threaded `blake3-servil` benchmarks across Intel (Haswell through Alder Lake and Ice Lake Xeon), AMD (Zen 3, Zen 5 EPYC and Ryzen), and Apple Silicon (M4 Max, M6) showed two competing optima:
-
-- **x86-64** peaks near **64 KiB** (16 KiB loses ~30% throughput on AMD Zen 5).
-- **Apple Silicon** keeps speeding up past 64 KiB toward **1 MiB** as SME2 per-call setup amortizes.
-- **256 KiB** lands within ~12% of peak throughput on every published CPU (measured 3.2–3.5 GB/s end-to-end for two-pass verification on one M6 core), keeps streaming memory at one 256 KiB buffer, and has zero effect on signature size.
+Whenever `draw` is fresh (every normal signature), `e` is unpredictable to the submitter until after the signature is published, so `Keyed(K_msg, M)` rests purely on **second-preimage / target-collision resistance** of keyed BLAKE3 (zero collision-resistance assumption). Only in the extreme triple-reset failure mode where state file, `/dev/urandom`, and monotonic clock *all* repeat identically does content hashing fall back to 128-bit known-key collision resistance of 256-bit keyed BLAKE3 — while signing-key secrecy, WOTS+C, and PORS+FP remain unaffected because `R = Keyed(K_R, e || h_msg)[..16]` still varies with `M`.
 
 ---
 
@@ -225,7 +223,7 @@ We reviewed the classic PRNG-with-input and seed-file literature (Boaz Barak & S
 - **Why `initialize` skips `fsync` (while `create` syncs once):**
   - On one-shot signers invoked per commit (such as `git commit`), blocking on `F_FULLFSYNC` adds milliseconds on SSDs and far more on busy or networked storage — and modern disks and VM snapshots can roll back state regardless of `fsync`.
   - Without `fsync`, `write()` still updates the kernel page cache immediately, so back-to-back processes always see the incremented counter and rotated seed; only a crash/power loss before dirty-page flush reverts the file, and on reboot `/dev/urandom` and the monotonic clock still vary `draw`.
-  - Even in the worst case — an attacker resets disk, OS RNG, and clock together so `draw` repeats identically — BLINCS never leaks the signing key, never allows WOTS+C reuse or PORS+FP leaf steering (`R = Keyed(K_R, short)`), and keeps messages $\le 256$ KiB at second-preimage resistance. Only multi-chunk messages ($> 256$ KiB) with a probed shared 256 KiB prefix `M_0` downgrade on chunks $\ge 1$, and even then only to known-key collision resistance of the two-pass `Keyed(Keyed(k, m), m)` (still 128 bits generically).
+  - Even in the worst case — an attacker resets disk, OS RNG, and clock together so `draw` repeats identically — BLINCS never leaks the signing key and never allows WOTS+C reuse or PORS+FP leaf steering (`R = Keyed(K_R, e || h_msg)[..16]` still depends on `M`). Only content hashing downgrades from second-preimage resistance to 128-bit known-key collision resistance of 256-bit keyed BLAKE3 `Keyed(K_msg, M)`.
 
 ---
 
@@ -233,8 +231,7 @@ We reviewed the classic PRNG-with-input and seed-file literature (Boaz Barak & S
 
 BLINCS adopts Servil Software Factory's engineering discipline:
 
-- **Crash-only lifecycle:** `Randomness` has no shutdown hook; a sudden crash loses no teardown invariant. Signing and verification workspaces (`SignWorkspace`, `VerifyWorkspace`, `CHUNK_POOL`) are allocated once per thread and kept until process exit, avoiding per-call allocation, page-fault zeroing, and TLB shootdowns.
-- **One bounded `Drop` exception (`ChunkLease`):** an independent contract review caught that handing a dirty reused 256 KiB buffer to a later `Read` implementation exposes the previous caller's message bytes, and holding a `RefCell` borrow across `reader.read()` panics if a custom reader calls back into BLINCS. `ChunkLease` leases the buffer out of `CHUNK_POOL` before `read()` (releasing the `RefCell` borrow immediately) and zeroes all 256 KiB on `Drop` before returning it to the single-slot pool.
+- **Pure crash-only lifecycle (zero `Drop` implementations):** `Randomness` has no shutdown hook; a sudden crash loses no teardown invariant. Signing and verification workspaces (`SignWorkspace`, `VerifyWorkspace`) are allocated once per thread and kept until process exit, avoiding per-call allocation, page-fault zeroing, and TLB shootdowns. Streaming readers (`sign_reader` / `verify_reader`) use a fresh zero-initialized 64 KiB local stack buffer per call with no shared cross-caller pool and no held `RefCell` borrow across `Read` callbacks.
 - **Unrepresentable invalid states & fail-stop contracts:** `SigningKey` holds only one 32-byte seed and derives its verifying key and cached 16 KiB top tree on construction (so an inconsistent `(seed, vk)` pair cannot exist). `SigningKey::sign` and `sign_reader` run `VerifyingKey::verify_short` (~33 µs, 0.2% of signing time) before returning any signature and panic if self-verification fails. Counter exhaustion panics rather than wrapping.
 - **Wall time and cycles together (`clocks`):** measuring BLINCS with `bench-hashes`'s `clocks` crate revealed that calling Apple M6's SME2 kernels for verification's tiny 11–24-element batches downclocked the P-core from ~4,787 MHz to ~4,066 MHz and spent ~47k extra cycles entering/exiting streaming mode. Routing verification's tree/chain hashes through `TreeHasher::on_this_core()` (a no-op on non-Apple CPUs) and batching each level of `few_time_verify` cut 64-byte verification from **57.3 µs** to **33.3 µs** (~1.7× faster, ~5.9–6.0 IPC) while keeping large-message content hashing on SME2 at **3.5 GB/s** on one core.
 - **Tiny trusted base:** `#![forbid(unsafe_code)]`, one runtime dependency (`blake3-servil-core = "=0.10.0"`), 10 crates total in `Cargo.lock` all verified by SHA-256 checksum, zero dev-dependencies.
