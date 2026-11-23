@@ -32,14 +32,14 @@ def run(label, cmd):
 def check_vectors_and_python():
     print("==> Checking reference-signature-1.bin digests (SHA-256 + BLAKE3)")
     raw = open(REF_SIG, "rb").read()
-    assert len(raw) == 3988, f"unexpected length {len(raw)}"
+    assert len(raw) == 5616, f"unexpected length {len(raw)}"
     got_sha256 = hashlib.sha256(raw).hexdigest()
     got_blake3 = blake3.hash(raw).hex()
     assert got_sha256 == REF_SHA256, f"SHA-256 mismatch: {got_sha256}"
     assert got_blake3 == REF_BLAKE3, f"BLAKE3 mismatch: {got_blake3}"
 
     # Verify reference-signature-1.bin with pure Python reference.
-    vk = blincs.VerifyingKey(bytes.fromhex("0ad9c13b8972b912a211f9fd2ba1eec80f172d89ea2869ab004a78588619f97c"))
+    vk = blincs.VerifyingKey(bytes.fromhex("0ad9c13b8972b912a211f9fd2ba1eec86ec7ac0e8af7b03012a5cf3a6d9bdbb0"))
     assert vk.verify(b"hello, BLINCS", raw), "Python reference rejected reference-signature-1.bin"
 
     # Verify python3 -O validation (no reliance on assert).
