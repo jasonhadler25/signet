@@ -123,6 +123,53 @@ We re-ran the full $2^{33}$ search across all three directly measured Apple M6 `
 2. **Versus SLH-DSA-B:** **`6,088 B`** (`15 + 4×5`) is **23% smaller** than `SLH-DSA-BLAKE3-128s`, **145× faster to sign** on 1 core (**390×** on 12 cores), and **6.1× faster to verify** — while also being **2.8× smaller**, **6.9× faster to sign on 1 core** (**18.7×** on 12 cores), and **17× faster to verify** than `SLH-DSA-BLAKE3-128f`.
 3. **Why `4,868 B` (`15 + 3×6`, `w = 16`) sits just below Leximin $L_\infty$:** spending `-1,220 B` (-20% bytes, `1.56×` floor) roughly doubles signing time (`0.31 → 0.59 ms` on 12 cores, `3.86×` floor; `0.84 → 1.78 ms` on 1 core, `6.70×` floor) while keeping verification at **`19.6 µs`** (`2.04×` floor). Under strict equal-ratio minimax (`Leximin L_inf`), `6,088 B` wins (`max ratio = 2.16×` vs. `3.86×`); if bytes carry a mild extra preference (because signatures are stored and replicated forever while signing happens once), `4,868 B` (`w = 16, v = 32, g = 0`) is the cleanest compact step down. BLINCS stays at `0.1.0` (`3,988 B`) until the final 1.0 parameter choice is locked.
 
+### Empirical evidence on byte costs, protocol thresholds, and hardware trends
+
+Both pure Leximin $L_\infty$ (equal ratios) and smooth exchange-rate models need to be checked against **real-world byte costs and hard/firm protocol cliffs**. Being 1 byte past a fixed-capacity slot or default server limit can be as bad as being 2× too large.
+
+#### 1. Real-world byte thresholds vs. BLINCS's physical range (`~2.9–6.2 KiB` at $2^{32}$)
+
+At $q = 2^{32}$ signatures ($\approx 4.29$ billion, one full `u32`, 10/s nonstop for 13.6 years), the physical minimum size for a 128-bit stateless hash-based signature is **`~2,928 B`**, and practical fast parameter sets span **`~3,900–6,200 B`**. Checking primary specifications and live-Internet measurements shows which cliffs are unreachable for *any* stateless hash-based signature and which cliffs actually sit right inside BLINCS's range:
+
+| Protocol / storage threshold | Primary-source limit | What breaks when exceeded | Impact on BLINCS (`3.9–6.2 KiB`) |
+|---|---|---|---|
+| **DNSSEC over UDP** | **`1,232 B`** (RFC 9715 / IPv6 1,280 B min MTU) or **`1,400 B`** IPv4; `draft-hoffman-pq-dnssec-considerations-02` classifies `> 1,400 B` as "forces TCP" and `> 3,000 B` as "Jumbo" | IP fragmentation or mandatory TCP fallback | Unreachable for all stateless HBS (`>= 2,928 B`; even ML-DSA-44 at 2,420 B misses 1,232 B). Does not distinguish 3.9 vs. 6.1 KiB. |
+| **PostgreSQL inline row (`TOAST`)** | **`2,000 B`** (`TOAST_TUPLE_THRESHOLD`, 1/4 of 8 KiB page, PostgreSQL docs) | Column moved out-of-line to TOAST table | Unreachable for all stateless HBS (`>= 2,928 B`). |
+| **QUIC anti-amplification (unvalidated client)** | **`3,600 B`** (`3 × 1,200 B` min Client Initial, RFC 9000 §8.1), minus ~1,100 B ML-KEM + framing $\approx$ **`~2,300 B`** left | Extra RTT for address validation unless client pads Initial or uses Retry | Unreachable for all stateless HBS even for 1 signature. |
+| **HTTP Cookie** | **`4,096 B`** total per cookie (RFC 6265 §6.1); after Base64 `4/3` expansion + name/attributes, raw binary limit is **`~3,000 B`** | Cookie rejected or truncated by browsers | Unreachable for all stateless HBS after Base64. |
+| **Single 4 KiB OS / filesystem / DB page (binary storage)** | **`4,096 B`** (SQLite default `page_size = 4096`; Linux/ext4/NVMe/x86-64 page `4 KiB`; Apple Silicon macOS uses `16 KiB`) | Binary record spills to a 2nd 4 KiB page / SQLite overflow page | **Live cliff near `3,900–4,096 B`:** `3,984 B` fits in one 4 KiB binary page with `112 B` left for header/verifying key; `4,336 B` and `4,816 B` spill to 2 pages. |
+| **TCP segment count (`MSS = 1,448–1,460 B`)** | **`4,344 B`** (3 MSS), **`5,792 B`** (4 MSS), **`7,240 B`** (5 MSS) | +1 TCP packet per crossing (smooth-ish latency/loss step) | `3,984 B` and `4,336 B` fit in **3 TCP segments**; `4,816 B` and `5,284 B` take **4**; `6,152 B` takes **5**. |
+| **HTTP single header limit (Base64-encoded signature — RFC 9421, proxies, APIs)** | **Apache `LimitRequestFieldSize = 8,190 B`**; **nginx `large_client_header_buffers = 4 × 8k` (`8,192 B`)** | **Hard HTTP `400`/`431` request failure**! Allowing Base64 `4/3` expansion + ~200 B header name/params puts the raw binary ceiling at **`~5,950 B`** | **Hard real-world ceiling at `~5,950 B`:** **`6,152 B` Base64-encoded is `8,204 B` and fails default Apache & nginx!** `3,984 B` (`5,312 B` b64), `4,336 B` (`5,784 B` b64), `4,816 B` (`6,424 B` b64), and `5,284 B` (`7,048 B` b64) all pass with wide margin. |
+| **TLS 1.3 `IW10` & middlebox breakage (Cloudflare live-Internet measurements)** | **RFC 6928 `IW10 = 14,600 B`** (~**`10 kB`** extra cert/sig budget above ~4 kB base handshake); Bas Westerbaan (Cloudflare, *Sizing Up Post-Quantum Signatures* & *Another Look at PQ Signatures*) measured **steep middlebox/client failure jumps at `10 kB` and `30 kB`**, a **+60–80%** handshake slowdown (+1 RTT) past `IW10`, and **~15–20%** slowdown even *within* the congestion window | Hard middlebox failure + full extra RTT | • Legacy 5–6 sig TLS chains: no HBS fits.<br>• **2-sig chain** (leaf + handshake, minus ~1.1 kB ML-KEM $\approx$ `8.9 kB` for 2 sigs): **`<= 4,450 B/sig`** stays under `10 kB` (`3,984 B` and `4,336 B` fit; `4,816 B` crosses).<br>• **1-sig Merkle Tree Certificates** (`draft-ietf-plants-merkle-tree-certs`, ~500 B Merkle proof + 1.1 kB ML-KEM): all BLINCS candidates `3.9–6.1 KiB` fit comfortably under `10 kB`. |
+| **Git `pkt-line`, TLS struct, OpenSSH packet** | `65,520 B` (Git `pkt-line`), `65,535 B` (TLS `2^16-1`), `256 KiB` (OpenSSH) | Protocol limit | Far above BLINCS; no cliff. |
+
+#### 2. Smooth economic costs and opposing hardware trends
+
+Beyond hard cliffs, three smooth forces push bytes and CPU time in opposite directions:
+
+- **Replication asymmetry (bytes & verification vs. signing):** a signature is created **once**, stored and replicated **forever** (Git clones, logs, packages, backups), and verified **$N_{\text{ver}}$ times** (often `100` to `1,000,000`×). Even inside Cloudflare's generous 30-packet congestion window, adding bytes still slowed median handshakes smoothly (+20% at 17 kB, +40% at 35 kB). In cloud pricing, egressing 1 KiB to 100–1,000 readers costs ~800×–8,000× more than 1 ms of signing CPU; over a 10 Mbps WAN link, 1 ms of wire transfer equals **1,250 B** (1 Mbps = 125 B/ms).
+- **Hardware trend favoring smaller bytes over time:** SIMD/matrix width (AVX-512, SME2) and core counts keep speeding up parallelizable hash-based signing and verification, whereas network MTUs, `IW10`, HTTP header defaults, and 4 KiB storage pages stay frozen for decades.
+- **Countervailing hardware trend favoring lower CPU time & small cache:** cheap, ultra-low-power, single-core, small-RAM CPUs (Cortex-M, RISC-V microcontrollers, IoT, smartcards — ~50×–200× slower than one Apple M6 core and limited to `2–32 KiB` RAM) are becoming *more* common, not less. On a ~100× slower scalar MCU with a `2 KiB` top-tree cache, `16.4 ms` (`0.1.0`) stretches to `~1.6 s`, whereas `3.5–5.2 ms` (`4,816–5,284 B`) stays ~0.35–0.5 s and verification (`12.6–17.3 µs` on M6) stays `~1–2 ms`.
+
+#### 3. Encoding bytes-vs.-time taste explicitly (`P` and `N_ver`) at $q = 2^{32}$
+
+To keep taste explicit and reproducible instead of eyeballing tables, we can pair Leximin $L_\infty$ with an explicit marginal price model:
+
+$$\min \; B + P \cdot \big(S_{\text{ms}} + N_{\text{ver}} \cdot V_{\text{ms}}\big)$$
+
+- **$P$ (`B/ms`):** how many permanent signature bytes we are willing to pay to save 1 ms of CPU time on the reference machine (e.g., `250 B/ms` for tight 4 KiB/WAN bias, `1,000 B/ms` for ~10 Mbps wire parity).
+- **$N_{\text{ver}}$ (verify-to-sign ratio):** how many times a typical signature is verified per signing (e.g., `N_ver = 100`). Including $N_{\text{ver}}$ stops the optimizer from choosing very slow `w = 128`/`256` verification (`90–156 µs`) to save a couple hundred bytes.
+
+Evaluating at **$q = 2^{32}$** with multithreading on by default (`12T` on M6) and **`h_top <= 15`** (1 MiB optional stateless cache — the saturation knee where `h_top = 16` doubles cache/keygen for near-zero gain):
+
+| Explicit rule (`q = 2^32`, `h_top <= 15`) | Size | Base64 size | Sign `12T` | Sign `1T` | Sign @ `2 KiB` (`1T`) | Verify (1c) | Keygen (`12T`) | Thresholds cleared | Shape & security |
+|---|---:|---:|---:|---:|---:|---:|---:|---|---|
+| **`P = 250 B/ms`, `N_ver = 100`** | **3,984 B** | 5,312 B | 2.10 ms | 7.97 ms | 10.78 ms | **16.1 µs** | 39.5 ms | **4 KiB binary page**, **3 MSS**, **2-sig TLS `IW10`**, **8 KiB HTTP hdr** | `33 (15+2×9) w=16 v=31 g=4` (128.0 b) |
+| **`P = 500 B/ms`, `N_ver = 100`** | **4,336 B** | 5,784 B | 1.17 ms | 4.25 ms | 7.15 ms | **15.8 µs** | 40.8 ms | **3 MSS (`4,344 B`)**, **2-sig TLS `IW10`**, **8 KiB HTTP hdr** | `31 (15+2×8) w=16 v=32 g=0` (128.5 b) |
+| **`P = 1,000 B/ms`, `N_ver = 100`** | **4,816 B** | 6,424 B | **0.92 ms** | 3.27 ms | 5.18 ms | **12.6 µs** | **27.2 ms** | 4 MSS, 1-sig MTC TLS, **8 KiB HTTP hdr** (+1.7 KiB margin) | `31 (15+2×8) w=8 v=42 g=2` (128.5 b) |
+| **Leximin $L_\infty$, `p = 2`** *(2×B = 4×S)* | **5,284 B** | 7,048 B | **0.52 ms** | 1.64 ms | 3.51 ms | 17.3 µs | 26.6 ms | 4 MSS, 1-sig MTC TLS, **8 KiB HTTP hdr** (+1.1 KiB margin) | `36 (15+3×7) w=8 v=41 g=5` (128.4 b) |
+| **Leximin $L_\infty$, `p = 1`** *(equal)* | 6,152 B | **8,204 B** | 0.33 ms | 0.76 ms | 2.67 ms | 18.2 µs | 27.2 ms | **Exceeds Apache `8,190 B` / nginx `8,192 B` HTTP header!** | `35 (15+4×5) w=8 v=42 g=2` (128.3 b) |
+
 ### Why `m = 103` is not signing-time-bottlenecked in BLINCS `0.1.0` (`tools/optimize.py --grinding-sweep`)
 
 In isolation, a PORS+FP merged-set cap of `m = 103` looks aggressive compared to `m = 112` (+144 bytes, 34.6× fewer `PICK` tries). With batched BLAKE3-Servil (`12.6 ns/try` at `GRIND = 2048`), however, `PICK` grinding is only **1.7%** of BLINCS `0.1.0`'s signing time (80% is in the three XMSS hypertree builds and ~9% in the four WOTS+C counter searches):
