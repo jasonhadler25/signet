@@ -1,5 +1,7 @@
 # Benchmarks: Project 11 SLH-DSA-B reproduction and BLINCS
 
+*Thanks to [Project 11](https://research.projecteleven.com/) and the [PQC Suite B](https://github.com/PQC-Suite-B) authors for publishing the SLH-DSA-B implementation, benchmark harness, and charts reproduced here.*
+
 All local measurements below ran on an **Apple M6** (12 cores, macOS arm64, Rust 1.100.0).
 
 ## 1. Project 11 SLH-DSA-B reproduction vs. BLINCS (Criterion methodology)

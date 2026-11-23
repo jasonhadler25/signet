@@ -1,6 +1,6 @@
 # BLINCS specification (draft)
 
-*Status: provisional design under active development (0.1.0, pre-1.0 formats and context strings may still change). Written by an AI assistant at the direction of this repository's owner; no independent cryptographic review or security audit has been performed.*
+*Status: provisional design under active development (0.1.0, pre-1.0 formats and context strings may still change). Written by an AI assistant at the direction of this repository's owner; no independent cryptographic review or security audit has been performed. Thanks to [Project 11](https://research.projecteleven.com/) and Conor Deegan for open hash-based signature research, benchmarks, and review feedback on this specification.*
 
 BLINCS is a stateless hash-based signature scheme built on BLAKE3. A signature is 3,988 bytes, a verifying key is 32 bytes, and a signing key is a 32-byte seed. Its parameters are chosen for a **design target** of at least 128 bits of classical security up to $2^{33}$ signatures per signing key (8,589,934,592: ten signatures a second for 27 years) under the SPHINCS+ hypertree and PORS+FP cover-probability model, pending independent cryptographic analysis.
 

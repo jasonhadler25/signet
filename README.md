@@ -8,6 +8,14 @@ Stateless hash-based signatures built on [BLAKE3](https://github.com/servil-soft
 - **Salted two-pass streaming content hash** — messages are hashed directly in 256 KiB chunks with no pre-hash API. Pre-hashing makes users vulnerable to collision attacks; passing the message or stream to BLINCS relies on second-preimage resistance and hashes at BLAKE3 speed.
 - **Design target:** at least 128 bits of classical security up to $2^{33}$ signatures per signing key (8,589,934,592: 10 signatures a second for 27 years) under the SPHINCS+ / PORS+FP cover-probability model, pending independent cryptographic review.
 
+## Thanks to Project 11
+
+Thanks to [Project 11](https://research.projecteleven.com/) — and Conor Deegan in particular — for their open hash-based signature research, tools, and review feedback that directly shaped BLINCS:
+
+- [PQC Suite B / SLH-DSA-B](https://github.com/PQC-Suite-B/signatures) for the BLAKE3-in-SLH-DSA benchmark methodology reproduced in [`BENCHMARKS.md`](BENCHMARKS.md).
+- [Project 11 Research](https://research.projecteleven.com/#articles) and the [SPHINCS+ Parameter Explorer](https://research.projecteleven.com/tools/sphincs-parameter) for open parameter-tradeoff tooling and ideas around stateless upper-layer caching (SPHINCS-G) and irregular hypertrees.
+- Conor Deegan's review of `SPEC.md` (clarifying the `0..15` merged-set loop and prompting the explicit `m = 103` vs. `m = 112` grinding analysis in [`DESIGN.md`](DESIGN.md)).
+
 ## Documents
 
 - [`SPEC.md`](SPEC.md) — normative byte-level specification

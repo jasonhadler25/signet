@@ -1,6 +1,8 @@
 # BLINCS design rationale
 
-This document records **why** BLINCS is shaped the way it is: the threat model, the "minimax" parameter strategy, the published optimizations we adopted or declined, the salted two-pass streaming content hash, the startup-only signer randomness, and the crash-only engineering choices. For the normative byte-level definition, see [`SPEC.md`](SPEC.md).
+*Thanks to [Project 11](https://research.projecteleven.com/) — and Conor Deegan in particular — for [PQC Suite B / SLH-DSA-B](https://github.com/PQC-Suite-B/signatures), the [SPHINCS+ Parameter Explorer](https://research.projecteleven.com/tools/sphincs-parameter), [Project 11's hash-based signature research](https://research.projecteleven.com/#articles) (including SPHINCS-G upper-layer caching and irregular hypertrees), and direct feedback on BLINCS's specification and grinding tradeoffs.*
+
+This document records **why** BLINCS is shaped the way it is: the threat model, the quantitative tradeoff ("minimax" and log-regret) models, the published optimizations we adopted or declined, the salted two-pass streaming content hash, the startup-only signer randomness, and the crash-only engineering choices. For the normative byte-level definition, see [`SPEC.md`](SPEC.md).
 
 ---
 
@@ -109,6 +111,20 @@ Using our concrete Apple M6 measurements of `blake3-servil-core = "=0.10.0"` (`x
    - Every candidate from **`3,988 B`** to **`7,440 B`** strictly beats `SLH-DSA-BLAKE3-128s` on **all three** dimensions simultaneously (smaller signatures, 7–98× faster signing, 3.8–6.2× faster verification).
    - The **`4,804 B`**, **`5,048 B`**, and **`7,440 B`** candidates also match or beat `SLH-DSA-BLAKE3-128f`'s 5.81 ms signing time while being **2.3–3.6× smaller** and **15–17× faster to verify**.
 2. **Why equal-ratio rules pick ~7.4–9.8 KB while `0.1.0` sits at 3,988 B:** the hash-based frontier is highly asymmetric — signature size only spans **4.6×** across the full search space (`3.3–15.1 KB`), whereas signing spans **190×** (`0.51–98 ms`). Treating a 2× worsening in size as equally costly as a 2× worsening in signing time lands at **`7,440 B` (1.24 ms, 23.5 µs)** under $L_\infty$/squared-excess or **`9,840 B` (1.01 ms, 19.6 µs)** under $L_2$ log-regret. Staying under 4 KiB (`3,988 B`) corresponds to weighting size roughly 64–100× heavier than signing in squared log-regret (or imposing a ~5 KiB ceiling $U_B$), while the intermediate **`4,804–5,048 B`** sets sit at `w_B ≈ 16` or the SLH-DSA-128s ceiling `U_B = 7,856 B` (+20–26% bytes over `0.1.0` for **3–4× faster signing** and **1.4–1.6× faster verification**). Because BLINCS is pre-1.0, `tools/optimize.py` keeps the full tradeoff reproducible for any choice of preference.
+
+### Irregular hypertrees + stateless top-tree caching (`--max-top-height 15`, 1 MiB cache)
+
+Prompted by Conor Deegan and Project 11's [SPHINCS-G work](https://research.projecteleven.com/articles/raising-sphincs-lifetime-budgets), we also evaluated **irregular hypertrees** whose cached top tree is taller than the lower layers (`h_top <= 15`, i.e., a **1 MiB** stateless cache whose loss only requires recomputing the top tree in ~100–290 ms on one core). Without caching, equal heights minimize $\sum 2^{h_i}$; once the top tree is cached, the signer only builds the $d - 1$ lower layers, so putting more height into the cached top layer shrinks size, signing time, and verification time **simultaneously** (`python3 tools/optimize.py --max-top-height 15`):
+
+| Rule (`--max-top-height 15`, 1 MiB stateless cache) | Bytes | Sign (1 core) | Verify (1 core) | Cold keygen | Shape (`h_top + (d-1)×h_low`) & params |
+|---|---:|---:|---:|---:|---|
+| **$L_\infty$ minimax ratio** $\max(x/x_{\min})$ | **6,812 B** | **0.73 ms** | **20.9 µs** | 127 ms | `35 (15+5×4) v=42 w=8 g=2 S=176 b=13 k=16 gf=4 m=119` |
+| **$L_2$ log-regret** $\sum(\ln(x/x_{\min}))^2$ | **7,736 B** | **0.72 ms** | **17.0 µs** | 96 ms | `35 (15+4×5) v=62 w=4 g=4 S=93 b=13 k=16 gf=4 m=119` |
+| **Span-normalized $L_2$** & **$w = (16, 1, 1)$** | **4,868 B** | **1.90 ms** | **19.6 µs** | 190 ms | `33 (15+3×6) v=32 w=16 g=0 S=300 b=14 k=15 gf=6 m=125` |
+| **Unknown thresholds**, $U=(7856,100,1000)$ survival | **4,500 B** | **3.07 ms** | **20.3 µs** | 184 ms | `36 (15+3×7) v=31 w=16 g=4 S=270 b=14 k=13 gf=3 m=105` |
+| **Unknown thresholds**, $U=(5000,100,1000)$ survival | **3,760 B** | **12.91 ms** | **21.2 µs** | 294 ms | `33 (15+2×9) v=25 w=32 g=3 S=488 b=16 k=12 gf=0 m=112` |
+
+*(Trade-off: long-lived signers keep the 1 MiB top tree in RAM forever; one-shot processes such as `git commit` either read the 1 MiB cache file from disk or pay the ~100–290 ms cold rebuild on cache miss.)*
 
 ### Why `m = 103` is not signing-time-bottlenecked in BLINCS (`tools/optimize.py --grinding-sweep`)
 

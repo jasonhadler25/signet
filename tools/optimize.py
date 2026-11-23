@@ -128,7 +128,7 @@ def pors_ns_per_comp(leaves):
     return 10.0 + 4.8 * (2048.0 / (leaves + 2048.0))
 
 
-def build_frontier(q, target_bits, cached_top, ns_grind, ns_ver_batch, ns_ver_scalar, sign_speedup, sign_cap_ms):
+def build_frontier(q, target_bits, cached_top, ns_grind, ns_ver_batch, ns_ver_scalar, sign_speedup, sign_cap_ms, max_top_height=0):
     b_lo, b_hi = 10, 17
     # Small trees (b <= 12) can use larger k (up to 32); taller trees only need smaller k (<= 16).
     k_cap = lambda h: 32 if h <= 12 else (20 if h == 13 else (16 if h <= 15 else 12))
@@ -180,89 +180,106 @@ def build_frontier(q, target_bits, cached_top, ns_grind, ns_ver_batch, ns_ver_sc
                 wots_options.append((v, width, g, chosen_s, vsteps, wtries, leaf_c, pk_c))
 
     raw_sets = []
+    # Hypertree shapes: uniform (top == hp) when max_top_height == 0, or irregular tall cached top tree
+    # (top in hp..=max_top_height, lower d-1 layers all height hp).
+    shapes = []
     for d in range(2, 13):
         for hp in range(3, 13):
-            h = d * hp
-            if not (28 <= h <= 48):
+            top_hi = max(hp, max_top_height) if (cached_top and max_top_height > 0) else hp
+            for h_top in range(hp, top_hi + 1):
+                h = h_top + (d - 1) * hp
+                if 28 <= h <= 48:
+                    shapes.append((d, hp, h_top, h))
+
+    # Cache few-time Pareto fronts by total hypertree height h
+    fts_by_h = {}
+    for _, _, _, h in shapes:
+        if h in fts_by_h:
+            continue
+        fts_choices = []
+        for (b, k), entries in pors_cum.items():
+            if h + k * b > 256:
                 continue
-            leaves = 1 << hp
-
-            fts_choices = []
-            for (b, k), entries in pors_cum.items():
-                if h + k * b > 256:
+            for gf in range(0, 11):
+                if gf + h + k * b > 256:
                     continue
-                for gf in range(0, 11):
-                    if gf + h + k * b > 256:
-                        continue
-                    bits = security_bits(q, h, b, k, gf)
-                    if bits < target_bits:
-                        continue
-                    seen_m = set()
-                    for cap in (1_000, 3_000, 10_000, 30_000, 100_000, 300_000):
-                        for m, prob in entries:
-                            ftries = (1 << gf) / prob
-                            if ftries <= cap:
-                                if m not in seen_m:
-                                    seen_m.add(m)
-                                    fts_choices.append((b, k, gf, m, ftries, bits))
-                                break
-                    break
-            if not fts_choices:
+                bits = security_bits(q, h, b, k, gf)
+                if bits < target_bits:
+                    continue
+                seen_m = set()
+                for cap in (1_000, 3_000, 10_000, 30_000, 100_000, 300_000):
+                    for m, prob in entries:
+                        ftries = (1 << gf) / prob
+                        if ftries <= cap:
+                            if m not in seen_m:
+                                seen_m.add(m)
+                                fts_choices.append((b, k, gf, m, ftries, bits))
+                            break
+                break
+        fts_pruned = []
+        for b, k, gf, m, ftries, bits in fts_choices:
+            fts_bytes = 4 + N * (k + m)
+            p_leaves = 1 << b
+            fts_sign_ns = (3 * p_leaves - 1) * pors_ns_per_comp(p_leaves) + ftries * ns_grind
+            fts_ver_ns = (k + (k + m - 1)) * ns_ver_batch + 2 * ns_ver_scalar
+            fts_pruned.append((fts_bytes, fts_sign_ns, fts_ver_ns, b, k, gf, m, ftries, bits))
+        fts_pruned.sort()
+        fts_front = []
+        for item in fts_pruned:
+            if any(o[0] <= item[0] and o[1] <= item[1] and o[2] <= item[2] for o in fts_front):
                 continue
+            fts_front.append(item)
+        fts_by_h[h] = fts_front
 
-            fts_pruned = []
-            for b, k, gf, m, ftries, bits in fts_choices:
-                fts_bytes = 4 + N * (k + m)
-                p_leaves = 1 << b
-                fts_sign_ns = (3 * p_leaves - 1) * pors_ns_per_comp(p_leaves) + ftries * ns_grind
-                fts_ver_ns = (k + (k + m - 1)) * ns_ver_batch + 2 * ns_ver_scalar
-                fts_pruned.append((fts_bytes, fts_sign_ns, fts_ver_ns, b, k, gf, m, ftries, bits))
-            fts_pruned.sort()
-            fts_front = []
-            for item in fts_pruned:
-                if any(o[0] <= item[0] and o[1] <= item[1] and o[2] <= item[2] for o in fts_front):
+    for d, hp, h_top, h in shapes:
+        fts_front = fts_by_h[h]
+        if not fts_front:
+            continue
+        leaves = 1 << hp
+        top_leaves = 1 << h_top
+        trees_built = (d - 1) if cached_top else d
+        for v, width, g, s_val, vsteps, wtries, leaf_c, pk_c in wots_options:
+            tree_c = leaves * (leaf_c + 1) - 1
+            top_tree_c = top_leaves * (leaf_c + 1) - 1
+            ns_tree = xmss_ns_per_comp(leaves * v)
+            ns_top = xmss_ns_per_comp(top_leaves * v)
+            keygen_ms = top_tree_c * ns_top / 1e6
+            ht_bytes = d * (4 + N * v) + N * h
+            top_extra_ns = (v + v * ((1 << width) - 1) // 2) * ns_ver_batch if cached_top else 0.0
+            sign_trees_ns = (d - 1) * tree_c * ns_tree if cached_top else ((d - 1) * tree_c * ns_tree + top_tree_c * ns_top)
+            ht_sign_ns = (sign_trees_ns + top_extra_ns + d * wtries * ns_grind) / sign_speedup
+            if ht_sign_ns / 1e6 >= sign_cap_ms:
+                continue
+            ht_ver_ns = d * (vsteps * ns_ver_batch + (pk_c + 1) * ns_ver_scalar) + h * ns_ver_scalar
+            for fts_bytes, fts_sign_ns, fts_ver_ns, b, k, gf, m, ftries, bits in fts_front:
+                total_bytes = 2 * N + fts_bytes + ht_bytes
+                total_sign_ms = (ht_sign_ns + fts_sign_ns / sign_speedup) / 1e6
+                if total_sign_ms > sign_cap_ms:
                     continue
-                fts_front.append(item)
-
-            trees_built = (d - 1) if cached_top else d
-            for v, width, g, s_val, vsteps, wtries, leaf_c, pk_c in wots_options:
-                tree_c = leaves * (leaf_c + 1) - 1
-                ns_tree = xmss_ns_per_comp(leaves * v)
-                keygen_ms = tree_c * ns_tree / 1e6
-                ht_bytes = d * (4 + N * v) + N * h
-                top_extra_ns = (v + v * ((1 << width) - 1) // 2) * ns_ver_batch if cached_top else 0.0
-                ht_sign_ns = (trees_built * tree_c * ns_tree + top_extra_ns + d * wtries * ns_grind) / sign_speedup
-                if ht_sign_ns / 1e6 >= sign_cap_ms:
-                    continue
-                ht_ver_ns = d * (vsteps * ns_ver_batch + (pk_c + 1 + hp) * ns_ver_scalar)
-                for fts_bytes, fts_sign_ns, fts_ver_ns, b, k, gf, m, ftries, bits in fts_front:
-                    total_bytes = 2 * N + fts_bytes + ht_bytes
-                    total_sign_ms = (ht_sign_ns + fts_sign_ns / sign_speedup) / 1e6
-                    if total_sign_ms > sign_cap_ms:
-                        continue
-                    total_ver_us = (ht_ver_ns + fts_ver_ns + 2 * ns_ver_scalar) / 1e3
-                    raw_sets.append(
-                        {
-                            "bytes": total_bytes,
-                            "sign_ms": total_sign_ms,
-                            "verify_us": total_ver_us,
-                            "keygen_ms": keygen_ms,
-                            "bits": bits,
-                            "h": h,
-                            "d": d,
-                            "hp": hp,
-                            "v": v,
-                            "width": width,
-                            "g": g,
-                            "S": s_val,
-                            "b": b,
-                            "k": k,
-                            "gf": gf,
-                            "m": m,
-                            "ftries": ftries,
-                            "wtries": wtries,
-                        }
-                    )
+                total_ver_us = (ht_ver_ns + fts_ver_ns + 2 * ns_ver_scalar) / 1e3
+                raw_sets.append(
+                    {
+                        "bytes": total_bytes,
+                        "sign_ms": total_sign_ms,
+                        "verify_us": total_ver_us,
+                        "keygen_ms": keygen_ms,
+                        "bits": bits,
+                        "h": h,
+                        "d": d,
+                        "hp": hp,
+                        "h_top": h_top,
+                        "v": v,
+                        "width": width,
+                        "g": g,
+                        "S": s_val,
+                        "b": b,
+                        "k": k,
+                        "gf": gf,
+                        "m": m,
+                        "ftries": ftries,
+                        "wtries": wtries,
+                    }
+                )
 
     raw_sets.sort(key=lambda x: (x["bytes"], x["sign_ms"], x["verify_us"]))
     frontier = []
@@ -300,10 +317,11 @@ def fmt_row(p, mins=None):
     rat = ""
     if mins is not None:
         rat = f" | ratios=({p['bytes']/mins[0]:.2f}x, {p['sign_ms']/mins[1]:.2f}x, {p['verify_us']/mins[2]:.2f}x)"
+    shape = f"h={p['h']} d={p['d']}" if p["h_top"] == p["hp"] else f"h={p['h']} ({p['h_top']}+{(p['d']-1)}x{p['hp']})"
     return (
         f"{p['bytes']:5d} B | sign={p['sign_ms']:5.2f} ms | ver={p['verify_us']:5.1f} us | "
-        f"kg={p['keygen_ms']:4.2f} ms | {p['bits']:6.2f} bits | "
-        f"h={p['h']} d={p['d']} v={p['v']} w={1<<p['width']} g={p['g']} S={p['S']} "
+        f"kg={p['keygen_ms']:6.2f} ms | {p['bits']:6.2f} bits | "
+        f"{shape} v={p['v']} w={1<<p['width']} g={p['g']} S={p['S']} "
         f"b={p['b']} k={p['k']} gf={p['gf']} m={p['m']}{rat}"
     )
 
@@ -370,6 +388,7 @@ def main():
     ap.add_argument("--ns-ver-batch", type=float, default=18.5, help="ns per batched on-core verify hash")
     ap.add_argument("--ns-ver-scalar", type=float, default=45.0, help="ns per scalar verify hash")
     ap.add_argument("--sign-speedup", type=float, default=1.0, help="Signing speedup factor (e.g. 3.0 for 8-core leaf parallelism)")
+    ap.add_argument("--max-top-height", type=int, default=0, help="Allow irregular cached top tree up to this height (0 = uniform heights; e.g. 15 = 1 MiB cache)")
     ap.add_argument("--sign-cap-ms", type=float, default=100.0)
     ap.add_argument("--ceilings", default="7856,100,1000", help="Upper ceilings U_B (bytes), U_S (ms), U_V (us)")
     ap.add_argument("--grinding-sweep", action="store_true")
@@ -394,6 +413,7 @@ def main():
         args.ns_ver_scalar,
         args.sign_speedup,
         args.sign_cap_ms,
+        args.max_top_height,
     )
     elapsed = time.perf_counter() - t0
     mins = (min(p["bytes"] for p in frontier), min(p["sign_ms"] for p in frontier), min(p["verify_us"] for p in frontier))
