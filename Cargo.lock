@@ -9,6 +9,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
+name = "blake3-servil"
+version = "0.10.0+b0b4c80c39ff28c2dbcc2234a6dc17b40911830d"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69a34a6598bfae54dc08a4aed4c3c7d10b8c8f52d8132944ae4350fdeb076081"
+dependencies = [
+ "arrayvec",
+ "blake3-servil-core",
+ "cc",
+]
+
+[[package]]
 name = "blake3-servil-core"
 version = "0.10.0+b0b4c80c39ff28c2dbcc2234a6dc17b40911830d"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -32,7 +43,7 @@ checksum = "a2dd9388ff4d0afe6036b59b2002708163797aa4b8779aeceebfcf4016b59c8b"
 name = "blincs"
 version = "0.1.0"
 dependencies = [
- "blake3-servil-core",
+ "blake3-servil",
 ]
 
 [[package]]
@@ -77,6 +88,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [metadata]
 "hashset arrayvec 0.7.8 (registry+https://github.com/rust-lang/crates.io-index)" = "blake3-ubkyi7e6lymsmdpxi4yoof5e3ca3bt777zkj5sdrq5tm6yxo7v5a.sha256-2p5wpjxarlhsj7pmzowcznvmimcyew6r6elumlqon4xrsm2fvvla"
+"hashset blake3-servil 0.10.0+b0b4c80c39ff28c2dbcc2234a6dc17b40911830d (registry+https://github.com/rust-lang/crates.io-index)" = "blake3-mrcom3byutu3imulnszbcpzqpq3ne2ah5rae5w2rtrqcb6urtgta.sha256-ngruuzmyx6xfjxaiusxnjq6h2efyzd2s3ajssrfoinip32yhmcaq"
 "hashset blake3-servil-core 0.10.0+b0b4c80c39ff28c2dbcc2234a6dc17b40911830d (registry+https://github.com/rust-lang/crates.io-index)" = "blake3-kz5wisevit2hgquuncceeicgsbqlpvahjniyg5zxu52ignejunja.sha256-rgwu64c3ovk7ebhrcnon6oy4drcmbkrgzv3xxj5fgw6umltby7jq"
 "hashset blake3-servil-version 0.10.0+b0b4c80c39ff28c2dbcc2234a6dc17b40911830d (registry+https://github.com/rust-lang/crates.io-index)" = "blake3-xc6udbo435a4yitcwlxv3abrpzmlsrsuhejf45esgbpvy6xwbnpa.sha256-ulozhch7jufp4ybwwwnsaatqqfrxs6vexb3zv3hox7huafvvtsfq"
 "hashset cc 1.11.3 (registry+https://github.com/rust-lang/crates.io-index)" = "blake3-g326lo5rdbpo4k27nl2cc6nakouha46bcj5uuyzi23pg7dwi4u3a.sha256-alyoai5nwnudixhazjwn7qhsjidfkrdi2dufapquuccb3z437juq"

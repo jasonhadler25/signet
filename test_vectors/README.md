@@ -6,12 +6,12 @@
 - draw `0707070707070707070707070707070707070707070707070707070707070707`,
 - message `hello, BLINCS` (13 bytes, no newline).
 
-The verifying key of that seed is `0ad9c13b8972b912a211f9fd2ba1eec80f172d89ea2869ab004a78588619f97c`.
+The verifying key of that seed is `0ad9c13b8972b912a211f9fd2ba1eec86ec7ac0e8af7b03012a5cf3a6d9bdbb0`.
 
-The signature's hashes: SHA-256 `dbeeb3cf497205fb4f3bf0f18c1861a8d62acdd69febe3e22f31decdd16942b2`,
-BLAKE3 `dc4e894a5640047ce03904bffc6a6384fc03b534cd0343636cad4ad2c048a8b1`.
+The signature's hashes: SHA-256 `03d4fe3f6646f8b3b986a45333947931497c941f4a225db00d06303ff3ee65dc`,
+BLAKE3 `5c56af6af07a04f769008290dcb5d608bcdd25c1e62765d8309948ab2f5b25ea`.
 
-To make it again (about a minute):
+To make it again (about 85 seconds across CPU cores):
 
     printf 'hello, BLINCS' > /tmp/message
     python3 reference/blincs.py sign 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f \

@@ -1,4 +1,4 @@
-use crate::params::{CTX_MIX, CTX_NEXT_SEED, CTX_RUN_KEY, derive_key, keyed};
+use crate::params::{CTX_MIX, CTX_NEXT_SEED, CTX_RUN_KEY, derive_key, ensure_init, keyed};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
@@ -117,7 +117,7 @@ impl Randomness {
     /// Open an existing state file at `path`, mix it with OS randomness and the monotonic clock, write the
     /// updated counter and seed in place (without `fsync`), and return the in-memory generator for this run.
     pub fn initialize(path: impl AsRef<Path>) -> io::Result<Self> {
-        blake3_servil_core::initialize();
+        ensure_init();
         let mut file = OpenOptions::new().read(true).write(true).open(path.as_ref())?;
         file.lock()?;
         let state = read_exact_or_reject(&mut file)?;

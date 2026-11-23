@@ -1,18 +1,23 @@
 include!("../tools/require_nextest.rs");
 
-use crate::content::{content_from_reader, content_from_slice};
-use crate::few_time::{merged_set, merged_size, parse_pick, pick};
-use crate::one_time::{Pos, advance_chains, digits, parse_digits};
+use crate::content::content_from_reader;
+use crate::few_time::parse_digest;
+use crate::one_time::{Pos, advance_chains, digits, lower_tree_len_check};
 use crate::params::{
-    AUTH_NODES, CHAIN_STEPS, CHAINS, DIGIT_SUM, FEW_HEIGHT, FEW_LEN, HYPER_BITS, LAYER_LEN, LAYERS, N, OPENED, SIGNATURE_LEN, THRESHOLD_BITS, TREE_HEIGHT,
+    CHAIN_STEPS, CHAINS, FORS_HEIGHT, FORS_LEN, FORS_TREES, HYPER_BITS, LAYERS, LOWER_HEIGHT, LOWER_LAYER_LEN, MSG_CHAINS, N, SIGNATURE_LEN, TOP_HEIGHT,
+    TOP_LAYER_LEN, ensure_init,
 };
 use crate::randomness::{STATE_LEN, mix, read_exact_or_reject, read_monotonic_clock};
 use crate::{Randomness, SEED_LEN, Signature, SigningKey, VERIFYING_KEY_LEN, VerifyingKey};
+use blake3_servil::Mode;
+use blake3_servil::throughput::{Batch, TreeHasher};
 use std::fs;
 use std::io::{self, Cursor, ErrorKind, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
+
+const REF_VK_HEX: &str = "0ad9c13b8972b912a211f9fd2ba1eec86ec7ac0e8af7b03012a5cf3a6d9bdbb0";
 
 fn from_hex(s: &str) -> Vec<u8> {
     assert_eq!(s.len() % 2, 0);
@@ -81,37 +86,23 @@ impl Read for FailingReader {
     }
 }
 
-/// Pack a synthetic 32-byte `PICK` digest from its fields for targeted boundary tests.
-fn pack_pick(threshold: u8, position: u64, indices: &[u16; OPENED]) -> [u8; 32] {
-    let mut bits = [0u8; 256];
-    for (b, slot) in bits.iter_mut().enumerate().take(THRESHOLD_BITS) {
-        *slot = (threshold >> b) & 1;
-    }
-    for b in 0..HYPER_BITS {
-        bits[THRESHOLD_BITS + b] = ((position >> b) & 1) as u8;
-    }
-    for (j, &idx) in indices.iter().enumerate() {
-        for b in 0..FEW_HEIGHT {
-            bits[THRESHOLD_BITS + HYPER_BITS + j * FEW_HEIGHT + b] = ((idx >> b) & 1) as u8;
-        }
-    }
-    let mut out = [0u8; 32];
-    for (i, &bit) in bits.iter().enumerate() {
-        out[i / 8] |= bit << (i % 8);
-    }
-    out
+/// Yields `prefix_len` zero bytes and then returns `BrokenPipe` (exercises `Pipeline::abort`).
+struct FailAfterReader {
+    remaining: usize,
+    failed: bool,
 }
-
-/// Pack a synthetic 32-byte `ONE_TIME_MESSAGE` digest from its low zero byte and 24 five-bit digits.
-fn pack_digits(low_byte: u8, d: &[u8; CHAINS]) -> [u8; 32] {
-    let mut x = low_byte as u128;
-    for (i, &v) in d.iter().enumerate() {
-        assert!(v < 32);
-        x |= (v as u128) << (8 + 5 * i);
+impl Read for FailAfterReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        assert!(!self.failed, "retried non-Interrupted I/O error after prefix");
+        if self.remaining > 0 {
+            let n = self.remaining.min(buf.len());
+            buf[..n].fill(0x5A);
+            self.remaining -= n;
+            return Ok(n);
+        }
+        self.failed = true;
+        Err(io::Error::new(ErrorKind::BrokenPipe, "simulated mid-stream failure"))
     }
-    let mut out = [0u8; 32];
-    out[..16].copy_from_slice(&x.to_le_bytes());
-    out
 }
 
 #[test]
@@ -122,7 +113,8 @@ fn reference_vector_matches_python_byte_for_byte() {
 
     let sk = SigningKey::from_seed(&seed);
     assert_eq!(sk.seed(), &seed);
-    assert_eq!(to_hex(sk.verifying_key().as_bytes()), "0ad9c13b8972b912a211f9fd2ba1eec80f172d89ea2869ab004a78588619f97c");
+    assert_eq!(to_hex(sk.verifying_key().as_bytes()), REF_VK_HEX);
+    assert_eq!(lower_tree_len_check(), 65_536);
 
     let expected = fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/test_vectors/reference-signature-1.bin")).unwrap();
     assert_eq!(expected.len(), SIGNATURE_LEN);
@@ -142,7 +134,7 @@ fn reference_vector_matches_python_byte_for_byte() {
 
 #[test]
 fn verify_alone_initializes_blake3_in_fresh_process() {
-    let vk_bytes: [u8; VERIFYING_KEY_LEN] = from_hex("0ad9c13b8972b912a211f9fd2ba1eec80f172d89ea2869ab004a78588619f97c").try_into().unwrap();
+    let vk_bytes: [u8; VERIFYING_KEY_LEN] = from_hex(REF_VK_HEX).try_into().unwrap();
     let sig_bytes = fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/test_vectors/reference-signature-1.bin")).unwrap();
     let vk = VerifyingKey::from_bytes(&vk_bytes);
     let sig = Signature::try_from(sig_bytes.as_slice()).unwrap();
@@ -150,98 +142,72 @@ fn verify_alone_initializes_blake3_in_fresh_process() {
 }
 
 #[test]
-fn parse_pick_checks_threshold_distinctness_and_merged_limit() {
-    // 11 consecutive leaves starting at 0: merged size is small (14).
-    let compact: [u16; OPENED] = core::array::from_fn(|i| i as u16);
-    assert_eq!(merged_size(&compact), merged_set(&compact).len());
-    let valid = pack_pick(0, 0x123456789, &compact);
-    let p = parse_pick(&valid).expect("valid pick");
-    assert_eq!((p.tree << TREE_HEIGHT) | p.leaf as u64, 0x123456789);
-    assert_eq!(p.indices, compact);
-    assert_eq!(p.merged_len, merged_size(&compact));
+fn wots_digits_and_checksum_boundaries() {
+    // All zeros: 32 zero nibbles, checksum = 32 * 15 = 480 = 0x1e0 -> [0, 14, 1].
+    let d0 = digits(&[0u8; N]);
+    assert!(d0[..MSG_CHAINS].iter().all(|&x| x == 0));
+    assert_eq!(&d0[MSG_CHAINS..], &[0, 14, 1]);
 
-    // Unsorted inputs sort ascending and give the same result.
-    let mut reversed = compact;
-    reversed.reverse();
-    assert_eq!(parse_pick(&pack_pick(0, 0x123456789, &reversed)), Some(p));
+    // All 0xff: 32 nibbles of 15, checksum = 0 -> [0, 0, 0].
+    let dmax = digits(&[0xffu8; N]);
+    assert!(dmax[..MSG_CHAINS].iter().all(|&x| x == 15));
+    assert_eq!(&dmax[MSG_CHAINS..], &[0, 0, 0]);
 
-    // Any threshold bit set is rejected.
-    for bit in 0..THRESHOLD_BITS {
-        let bad = pack_pick(1 << bit, 0x123456789, &compact);
-        assert!(parse_pick(&bad).is_none(), "threshold bit {bit} accepted");
+    // Single-bit message: csum = 480 - 1 = 479 = 0x1df -> nonzero low nibble [15, 13, 1].
+    let mut one = [0u8; N];
+    one[0] = 1;
+    let d1 = digits(&one);
+    assert_eq!(&d1[MSG_CHAINS..], &[15, 13, 1]);
+
+    // Mixed nibbles: verify little-endian nibble ordering and exact checksum.
+    let node: [u8; N] = core::array::from_fn(|i| ((i as u8) << 4) | ((15 - i) as u8));
+    let dm = digits(&node);
+    for i in 0..N {
+        assert_eq!(dm[2 * i], (15 - i) as u8);
+        assert_eq!(dm[2 * i + 1], i as u8);
     }
-
-    // Duplicate leaf index is rejected even when threshold is 0 and merged size would be tiny.
-    let mut dup = compact;
-    dup[5] = dup[4];
-    assert!(parse_pick(&pack_pick(0, 7, &dup)).is_none());
-
-    // Exact merged-set boundary: construct sets with merged_size == 103 (accepted) and 104 (rejected).
-    // Two widely spaced leaves contribute ~15 each; adjust one leaf to land on 103 and 104.
-    let mut set103 = None;
-    let mut set104 = None;
-    let mut state = 0x9e3779b97f4a7c15u64;
-    for _ in 0..200_000 {
-        let mut idx = [0u16; OPENED];
-        for slot in &mut idx {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            *slot = ((state >> 33) & 0x7fff) as u16;
-        }
-        idx.sort_unstable();
-        if idx.windows(2).any(|w| w[0] == w[1]) {
-            continue;
-        }
-        let sz = merged_size(&idx);
-        assert_eq!(sz, merged_set(&idx).len());
-        if sz == AUTH_NODES && set103.is_none() {
-            set103 = Some(idx);
-        }
-        if sz == AUTH_NODES + 1 && set104.is_none() {
-            set104 = Some(idx);
-        }
-        if set103.is_some() && set104.is_some() {
-            break;
-        }
-    }
-    let s103 = set103.expect("found size-103 set");
-    let s104 = set104.expect("found size-104 set");
-    assert_eq!(parse_pick(&pack_pick(0, 1, &s103)).unwrap().merged_len, AUTH_NODES);
-    assert!(parse_pick(&pack_pick(0, 1, &s104)).is_none());
+    let expected_csum: u16 = dm[..MSG_CHAINS].iter().map(|&v| 15 - v as u16).sum();
+    assert_eq!(expected_csum, 240); // 0x0f0 -> [0, 15, 0]
+    assert_eq!(&dm[MSG_CHAINS..], &[0, 15, 0]);
 }
 
 #[test]
-fn parse_digits_checks_zero_bits_and_exact_sum() {
-    // 12 * 15 + 12 * 16 = 180 + 192 = 372.
-    let valid_d: [u8; CHAINS] = core::array::from_fn(|i| if i < 12 { 15 } else { 16 });
-    assert_eq!(valid_d.iter().map(|&v| v as u32).sum::<u32>(), DIGIT_SUM);
-    assert_eq!(parse_digits(&pack_digits(0, &valid_d)), Some(valid_d));
-
-    for bit in 0..8 {
-        assert!(parse_digits(&pack_digits(1 << bit, &valid_d)).is_none(), "zero bit {bit} accepted");
+fn parse_digest_extracts_all_fors_indices_and_33bit_leaf_addr() {
+    let mut d = [0u8; 32];
+    // Pack known distinct 10-bit values into bytes 0..20 (4 values per 5 bytes).
+    let expected_idx: [u16; FORS_TREES] = core::array::from_fn(|t| ((t * 67 + 13) & 0x3ff) as u16);
+    for group in 0..4 {
+        let mut bits = 0u64;
+        for j in 0..4 {
+            bits |= (expected_idx[group * 4 + j] as u64) << (10 * j);
+        }
+        let le = bits.to_le_bytes();
+        d[group * 5..group * 5 + 5].copy_from_slice(&le[..5]);
     }
-    let mut low = valid_d;
-    low[0] -= 1;
-    assert!(parse_digits(&pack_digits(0, &low)).is_none());
-    let mut high = valid_d;
-    high[0] += 1;
-    assert!(parse_digits(&pack_digits(0, &high)).is_none());
+    // Pack a 33-bit leaf_addr with bit 32 set AND junk in bits 33..63 to verify exact masking.
+    let expected_addr = (1u64 << (HYPER_BITS - 1)) | 0x0123_4567;
+    let raw_addr = expected_addr | (0x7fff_fffe_u64 << HYPER_BITS);
+    d[20..28].copy_from_slice(&raw_addr.to_le_bytes());
+
+    let (indices, addr) = parse_digest(&d);
+    assert_eq!(indices, expected_idx);
+    assert_eq!(addr, expected_addr);
 }
 
 #[test]
 fn advance_chains_handles_zero_partial_and_full_lengths() {
-    blake3_servil_core::initialize();
+    ensure_init();
     let public = [0x33u8; 32];
     let starts: [u8; CHAINS] = core::array::from_fn(|i| (i % 5) as u8);
     let ends: [u8; CHAINS] = core::array::from_fn(|i| if i % 6 == 0 { starts[i] } else { CHAIN_STEPS as u8 - (i % 4) as u8 });
     let initial: [[u8; N]; CHAINS] = core::array::from_fn(|i| [i as u8; N]);
 
     let mut batched = initial;
-    let mut b32 = blake3_servil_core::throughput::Batch::new(32, CHAINS);
+    let mut b32 = Batch::new(32, CHAINS);
     let mut out = [[0u8; 32]; CHAINS];
-    let pub_core = blake3_servil_core::throughput::TreeHasher::new(blake3_servil_core::Mode::Keyed(&public)).on_this_core();
+    let pub_core = TreeHasher::new(Mode::Keyed(&public)).on_this_core();
     advance_chains(&pub_core, Pos { layer: 2, tree: 17, leaf: 9 }, &mut batched, &starts, &ends, &mut b32, &mut out);
 
-    // Compare against scalar one-step-at-a-time computation.
     for c in 0..CHAINS {
         let mut expected = initial[c];
         for step in starts[c]..ends[c] {
@@ -250,39 +216,19 @@ fn advance_chains_handles_zero_partial_and_full_lengths() {
         assert_eq!(batched[c], expected, "chain {c}");
     }
 
-    // All-zero lengths leave every value unchanged.
     let mut noop = initial;
     advance_chains(&pub_core, Pos { layer: 0, tree: 0, leaf: 0 }, &mut noop, &[5u8; CHAINS], &[5u8; CHAINS], &mut b32, &mut out);
     assert_eq!(noop, initial);
 }
 
 #[test]
-fn every_signature_region_and_unused_padding_is_checked() {
+fn every_signature_region_is_checked() {
     let seed: [u8; SEED_LEN] = core::array::from_fn(|i| i as u8);
     let sk = SigningKey::from_seed(&seed);
     let vk = sk.verifying_key();
-    let pub_core = blake3_servil_core::throughput::TreeHasher::new(blake3_servil_core::Mode::Keyed(&vk.public)).on_this_core();
     let msg = b"hello, BLINCS";
-
-    // Find a signature with spare auth slots (< 103) so we exercise the trailing zero-padding check too.
-    let (base, picked) = (0u8..=255)
-        .find_map(|d| {
-            let sig = sk.sign_with_draw(&[d; 32], msg);
-            let salt: [u8; N] = sig.as_bytes()[..N].try_into().unwrap();
-            let rand: [u8; N] = sig.as_bytes()[N..2 * N].try_into().unwrap();
-            let short = content_from_slice(&vk.content_key, &salt, msg);
-            let digest = vk.message_digest(&pub_core, &rand, &short);
-            let fts_counter = u32::from_le_bytes(sig.as_bytes()[32..36].try_into().unwrap());
-            let picked = pick(&pub_core, &digest, fts_counter).unwrap();
-            (picked.merged_len < AUTH_NODES).then_some((sig, picked))
-        })
-        .expect("found signature with spare auth slots");
+    let base = sk.sign_with_draw(&[7u8; 32], msg);
     assert!(vk.verify(msg, &base));
-
-    let salt: [u8; N] = base.as_bytes()[..N].try_into().unwrap();
-    let rand: [u8; N] = base.as_bytes()[N..2 * N].try_into().unwrap();
-    let short = content_from_slice(&vk.content_key, &salt, msg);
-    let digest = vk.message_digest(&pub_core, &rand, &short);
 
     let flip = |offset: usize| -> bool {
         let mut raw = *base.as_bytes();
@@ -290,47 +236,34 @@ fn every_signature_region_and_unused_padding_is_checked() {
         vk.verify(msg, &Signature::from_bytes(&raw))
     };
 
-    // Salt, randomizer, fts_counter.
-    for &off in &[0, 15, 16, 31, 32, 35] {
+    // Salt and randomizer boundaries.
+    for &off in &[0, 15, 16, 31] {
         assert!(!flip(off), "accepted flip at offset {off}");
     }
-    // Every opened fts secret.
-    for j in 0..OPENED {
-        assert!(!flip(36 + N * j), "accepted flip in fts secret {j}");
-    }
-    // First and last used fts auth node.
-    assert!(!flip(212));
-    assert!(!flip(212 + N * (picked.merged_len - 1)));
-    // First and last UNUSED fts auth padding byte (canonical zero check).
-    assert!(!flip(212 + N * picked.merged_len), "accepted nonzero unused auth byte");
-    assert!(!flip(212 + N * AUTH_NODES - 1), "accepted nonzero last unused auth byte");
 
-    // Every hypertree layer: counter, chain 0, chain 23, path 0, path 8.
-    let mut tree = picked.tree;
-    let mut leaf = picked.leaf;
-    let mut node = crate::workspace::with_verify_workspace(|ws| {
-        crate::few_time::few_time_verify(&pub_core, &digest, &base.as_bytes()[2 * N..2 * N + FEW_LEN], ws).unwrap().2
-    });
+    // Every FORS tree: secret, first auth node, last auth node.
+    let fors_stride = (1 + FORS_HEIGHT) * N;
+    for t in 0..FORS_TREES {
+        let base_off = 2 * N + t * fors_stride;
+        assert!(!flip(base_off), "accepted flip in FORS tree {t} secret");
+        assert!(!flip(base_off + N), "accepted flip in FORS tree {t} auth 0");
+        assert!(!flip(base_off + FORS_HEIGHT * N), "accepted flip in FORS tree {t} last auth");
+    }
+
+    // Every hypertree layer: every chain value, first auth node, and last auth node.
+    let mut at = 2 * N + FORS_LEN;
     for layer in 0..LAYERS {
-        let pos = Pos { layer: layer as u8, tree, leaf };
-        let at = 2 * N + FEW_LEN + layer * LAYER_LEN;
-        assert!(!flip(at), "accepted flip in layer {layer} counter");
-        let counter = u32::from_le_bytes(base.as_bytes()[at..at + 4].try_into().unwrap());
-        let d = digits(&pub_core, pos, &node, counter).unwrap();
-        // Flip every chain value in this layer.
-        for (c, &dc) in d.iter().enumerate() {
-            assert!(!flip(at + 4 + N * c), "accepted flip in layer {layer} chain {c} (d={dc})");
+        let (height, layer_len) = if layer + 1 == LAYERS { (TOP_HEIGHT, TOP_LAYER_LEN) } else { (LOWER_HEIGHT, LOWER_LAYER_LEN) };
+        for c in 0..CHAINS {
+            assert!(!flip(at + c * N), "accepted flip in layer {layer} chain {c}");
         }
-        assert!(!flip(at + 4 + N * CHAINS), "accepted flip in layer {layer} path 0");
-        assert!(!flip(at + 4 + N * (CHAINS + TREE_HEIGHT - 1)), "accepted flip in layer {layer} path 8");
-        node = crate::workspace::with_verify_workspace(|ws| {
-            crate::one_time::verify_layer(&pub_core, pos, &node, &base.as_bytes()[at..at + LAYER_LEN], ws).unwrap()
-        });
-        leaf = (tree & ((1u64 << TREE_HEIGHT) - 1)) as u16;
-        tree >>= TREE_HEIGHT;
+        assert!(!flip(at + CHAINS * N), "accepted flip in layer {layer} auth 0");
+        assert!(!flip(at + (CHAINS + height - 1) * N), "accepted flip in layer {layer} last auth");
+        at += layer_len;
     }
+    assert_eq!(at, SIGNATURE_LEN);
 
-    // Wrong verifying key (pk_seed byte 0, root byte 31).
+    // Wrong verifying key (public_seed byte 0, root byte 31).
     let mut bad_vk = *vk.as_bytes();
     bad_vk[0] ^= 1;
     assert!(!VerifyingKey::from_bytes(&bad_vk).verify(msg, &base));
@@ -346,13 +279,75 @@ fn every_signature_region_and_unused_padding_is_checked() {
 }
 
 #[test]
+fn top_tree_cache_save_load_and_tamper_rejection() {
+    let seed: [u8; SEED_LEN] = core::array::from_fn(|i| (i as u8).wrapping_mul(11));
+    let sk = SigningKey::from_seed(&seed);
+    let cache_path = temp_state_path("top-cache");
+
+    // Missing cache returns NotFound.
+    assert_eq!(SigningKey::from_seed_with_cache(&seed, &cache_path).unwrap_err().kind(), ErrorKind::NotFound);
+
+    // Save and reload.
+    sk.save_top_tree_cache(&cache_path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(&cache_path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    let loaded = SigningKey::from_seed_with_cache(&seed, &cache_path).unwrap();
+    assert_eq!(loaded.verifying_key(), sk.verifying_key());
+    assert_eq!(loaded.sign_with_draw(&[9u8; 32], b"cached-msg"), sk.sign_with_draw(&[9u8; 32], b"cached-msg"));
+
+    // Wrong seed fails MAC check.
+    let mut wrong_seed = seed;
+    wrong_seed[0] ^= 1;
+    assert_eq!(SigningKey::from_seed_with_cache(&wrong_seed, &cache_path).unwrap_err().kind(), ErrorKind::InvalidData);
+
+    // Tampering magic, MAC, node payload, truncating, or appending a byte all fail with InvalidData.
+    let good_bytes = fs::read(&cache_path).unwrap();
+    for (name, mut bad) in [
+        ("bad-magic", {
+            let mut b = good_bytes.clone();
+            b[0] ^= 1;
+            b
+        }),
+        ("bad-mac", {
+            let mut b = good_bytes.clone();
+            b[16] ^= 1;
+            b
+        }),
+        ("bad-node", {
+            let mut b = good_bytes.clone();
+            b[1000] ^= 1;
+            b
+        }),
+        ("truncated", good_bytes[..good_bytes.len() - 1].to_vec()),
+        ("trailing-byte", {
+            let mut b = good_bytes.clone();
+            b.push(0);
+            b
+        }),
+    ] {
+        let p = temp_state_path(name);
+        fs::write(&p, &bad).unwrap();
+        assert_eq!(SigningKey::from_seed_with_cache(&seed, &p).unwrap_err().kind(), ErrorKind::InvalidData, "accepted {name}");
+        bad.clear();
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    let _ = fs::remove_dir_all(cache_path.parent().unwrap());
+}
+
+#[test]
 fn streaming_boundaries_and_fragmented_readers_match_slices() {
     let seed = [0x11u8; SEED_LEN];
     let sk = SigningKey::from_seed(&seed);
     let vk = sk.verifying_key();
     let draw = [0x22u8; 32];
 
-    for &len in &[0usize, 1, 63, 64, 65, 1024, 65_535, 65_536, 65_537, 256 * 1024, 512 * 1024 + 19] {
+    // Covers small (< 64 KiB on-core path), exact 64 KiB boundary, Pipeline path (> 64 KiB),
+    // and multithreaded slice threshold (>= 512 KiB).
+    for &len in &[0usize, 1, 63, 64, 65, 1024, 65_535, 65_536, 65_537, 256 * 1024, 512 * 1024, 1024 * 1024 + 19] {
         let msg: Vec<u8> = (0..len).map(|i| ((i.wrapping_mul(37) ^ (i >> 8)) & 0xff) as u8).collect();
         let sig = sk.sign_with_draw(&draw, &msg);
         assert!(vk.verify(&msg, &sig), "slice verify failed for len {len}");
@@ -364,7 +359,6 @@ fn streaming_boundaries_and_fragmented_readers_match_slices() {
         let frag_ver = FragmentedReader::new(&msg, 11113, 3);
         assert!(vk.verify_reader(frag_ver, &sig).unwrap(), "reader verify failed for len {len}");
 
-        // Length change and content flip must fail.
         let mut longer = msg.clone();
         longer.push(0);
         assert!(!vk.verify(&longer, &sig), "accepted trailing zero byte for len {len}");
@@ -375,23 +369,45 @@ fn streaming_boundaries_and_fragmented_readers_match_slices() {
         }
     }
 
-    // Content helper propagates real I/O errors.
+    // Immediate I/O errors propagate cleanly.
     let err = content_from_reader(&[0u8; 32], &[0u8; N], FailingReader::default()).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::BrokenPipe);
     assert_eq!(sk.sign_reader_with_draw(&draw, FailingReader::default()).unwrap_err().kind(), ErrorKind::BrokenPipe);
     let sig = sk.sign_with_draw(&draw, b"x");
     assert_eq!(vk.verify_reader(FailingReader::default(), &sig).unwrap_err().kind(), ErrorKind::BrokenPipe);
+
+    // Mid-stream I/O error AFTER 64 KiB cleanly aborts the Pipeline without panicking.
+    let err_mid = content_from_reader(&[0u8; 32], &[0u8; N], FailAfterReader { remaining: 90_000, failed: false }).unwrap_err();
+    assert_eq!(err_mid.kind(), ErrorKind::BrokenPipe);
+}
+
+#[test]
+fn concurrent_signing_threads_produce_identical_signatures() {
+    let sk = Arc::new(SigningKey::from_seed(&[0x55u8; SEED_LEN]));
+    let vk = sk.verifying_key();
+    let expected: Vec<Signature> = (0u8..8).map(|i| sk.sign_with_draw(&[i; 32], &[i; 128])).collect();
+
+    let handles: Vec<_> = (0u8..8)
+        .map(|i| {
+            let sk = Arc::clone(&sk);
+            thread::spawn(move || sk.sign_with_draw(&[i; 32], &[i; 128]))
+        })
+        .collect();
+    for (i, h) in handles.into_iter().enumerate() {
+        let sig = h.join().unwrap();
+        assert_eq!(sig, expected[i]);
+        assert!(vk.verify(&[i as u8; 128], &sig));
+    }
 }
 
 #[test]
 fn randomness_mix_matches_python_reference() {
-    blake3_servil_core::initialize();
+    ensure_init();
     let seed = [0x01u8; 32];
     let system = [0x02u8; 32];
     let clock = b"clock-reading";
     let (next_seed, run_key) = mix(&seed, 42, &system, clock);
 
-    // Exact hex values from `reference/blincs.py::mix` and `blincs.py::draw`.
     assert_eq!(to_hex(&next_seed), "c0c6b6b9b4b215c0c9f1b2009f61a44b0f3756c95f33987fd05accc567079596");
     assert_eq!(to_hex(&run_key), "ad9e373e2f5993eb67f17095c133073f746d32759f51fae8c5e9cc2ee7e96ad9");
 
@@ -403,7 +419,7 @@ fn randomness_mix_matches_python_reference() {
 #[test]
 #[should_panic(expected = "randomness draw counter exhausted")]
 fn randomness_draw_panics_on_counter_exhaustion() {
-    blake3_servil_core::initialize();
+    ensure_init();
     let r = Randomness::from_run_key_at([1u8; 32], u64::MAX);
     let _ = r.draw();
 }
@@ -411,11 +427,9 @@ fn randomness_draw_panics_on_counter_exhaustion() {
 #[test]
 fn randomness_create_and_initialize_lifecycle_and_rejection() {
     let path = temp_state_path("lifecycle");
-    // Missing file: initialize fails and does not create it.
     assert_eq!(Randomness::initialize(&path).unwrap_err().kind(), ErrorKind::NotFound);
     assert!(!path.exists());
 
-    // Explicit create makes a 48-byte file with count = 0 and refuses to overwrite.
     assert_eq!(STATE_LEN, 48);
     Randomness::create(&path).unwrap();
     let initial = fs::read(&path).unwrap();
@@ -427,7 +441,6 @@ fn randomness_create_and_initialize_lifecycle_and_rejection() {
     assert_eq!(Randomness::create(&path).unwrap_err().kind(), ErrorKind::AlreadyExists);
     assert_eq!(fs::read(&path).unwrap(), initial);
 
-    // A second independent create gets fresh OS randomness.
     let path_other = temp_state_path("lifecycle-other");
     Randomness::create(&path_other).unwrap();
     let other_initial = fs::read(&path_other).unwrap();
@@ -440,7 +453,6 @@ fn randomness_create_and_initialize_lifecycle_and_rejection() {
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
-    // Sequential initializes increment the counter and rotate the seed without touching magic.
     let rng1 = Randomness::initialize(&path).unwrap();
     let after1 = fs::read(&path).unwrap();
     assert_eq!(after1.len(), STATE_LEN);
@@ -454,7 +466,6 @@ fn randomness_create_and_initialize_lifecycle_and_rejection() {
     assert_ne!(&after2[16..48], &after1[16..48]);
     assert_ne!(rng1.draw(), rng2.draw());
 
-    // Concurrent initializes serialize via the file lock.
     let shared = Arc::new(path.clone());
     let handles: Vec<_> = (0..8)
         .map(|_| {
@@ -469,7 +480,6 @@ fn randomness_create_and_initialize_lifecycle_and_rejection() {
     let after10 = fs::read(&path).unwrap();
     assert_eq!(u64::from_le_bytes(after10[8..16].try_into().unwrap()), 10);
 
-    // Invalid files are rejected without modifying a single byte.
     for (name, bad) in [
         ("empty", vec![]),
         ("short", b"BLINCSr1short".to_vec()),
@@ -485,7 +495,6 @@ fn randomness_create_and_initialize_lifecycle_and_rejection() {
         let _ = fs::remove_dir_all(p.parent().unwrap());
     }
 
-    // State-file reader handles EINTR, short reads, non-EINTR errors, and exact-length checks.
     let valid_raw = [b"BLINCSr1".as_slice(), &7u64.to_le_bytes(), &[0x55u8; 32]].concat();
     let mut frag = FragmentedReader::new(&valid_raw, 5, 2);
     assert_eq!(read_exact_or_reject(&mut frag).unwrap().as_slice(), valid_raw.as_slice());
@@ -509,13 +518,17 @@ fn monotonic_clock_advances_and_is_nontrivial() {
 
 #[test]
 fn create_works_with_bare_relative_filename() {
-    // Safe because cargo-nextest runs every test in its own process.
     let dir = std::env::temp_dir().join(format!("blincs-rel-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     std::env::set_current_dir(&dir).unwrap();
     Randomness::create("state.bin").unwrap();
     assert_eq!(fs::read("state.bin").unwrap().len(), 48);
+    let seed = [0x99u8; SEED_LEN];
+    let sk = SigningKey::from_seed(&seed);
+    sk.save_top_tree_cache("top.cache").unwrap();
+    let loaded = SigningKey::from_seed_with_cache(&seed, "top.cache").unwrap();
+    assert_eq!(loaded.verifying_key(), sk.verifying_key());
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -532,7 +545,7 @@ fn debug_redacts_secrets() {
 
     let sig = sk.sign_with_draw(&[1u8; 32], b"dbg");
     let sd = format!("{sig:?}");
-    assert!(sd.contains("3988 bytes") && sd.contains(&to_hex(&sig.as_bytes()[..N])));
+    assert!(sd.contains("5616 bytes") && sd.contains(&to_hex(&sig.as_bytes()[..N])));
 }
 
 #[test]
@@ -598,14 +611,12 @@ fn reader_never_sees_previous_callers_bytes() {
     let vk = sk.verifying_key();
     let secret_msg = vec![0xAAu8; 128 * 1024];
 
-    // Sign a 128 KiB 0xAA message, then ensure a subsequent signing reader sees all zeros.
     let sig = sk.sign_reader_with_draw(&[1u8; 32], Cursor::new(&secret_msg)).unwrap();
     let mut snoop_sign = SnoopingReader { data: b"second", pos: 0, saw_nonzero: false };
     let sig2 = sk.sign_reader_with_draw(&[2u8; 32], &mut snoop_sign).unwrap();
     assert!(!snoop_sign.saw_nonzero, "second sign_reader observed previous caller's bytes");
     assert!(vk.verify(b"second", &sig2));
 
-    // Verify a 128 KiB 0xAA message, then fail a reader that dirtied the buffer, then ensure next reader sees zeros.
     assert!(vk.verify_reader(Cursor::new(&secret_msg), &sig).unwrap());
     assert!(vk.verify_reader(DirtyThenFail::default(), &sig).is_err());
     let mut snoop_ver = SnoopingReader { data: b"second", pos: 0, saw_nonzero: false };
@@ -631,7 +642,6 @@ fn reentrant_reader_can_sign_and_verify_without_borrowing_panic() {
                 return Ok(0);
             }
             self.done = true;
-            // Nested sign, sign_reader, verify, and verify_reader on the same thread.
             let nested = self.sk.sign_reader_with_draw(&[8u8; 32], Cursor::new(b"nested")).unwrap();
             assert!(self.vk.verify_reader(Cursor::new(b"nested"), &nested).unwrap());
             assert!(self.vk.verify(b"inner", self.inner_sig));

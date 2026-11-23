@@ -1,28 +1,9 @@
 use crate::params::{
-    CHAIN_STEPS, CHAINS, DIGIT_SUM, KIND_CHAIN, KIND_CHAIN_SECRET, KIND_NODE, KIND_ONE_TIME_KEY, KIND_ONE_TIME_MESSAGE, LAYER_LEN, N, TOP_NODES, TREE_HEIGHT,
-    TREE_LEAVES, ZERO_BITS, first_n, tweak,
+    CHAIN_STEPS, CHAINS, KIND_CHAIN, KIND_CHAIN_SECRET, KIND_NODE, KIND_ONE_TIME_KEY, LOWER_LAYER_LEN, MSG_CHAINS, N, TOP_HEIGHT, TOP_LAYER_LEN, first_n, tweak,
 };
-use crate::workspace::{GRIND, SignWorkspace, VerifyWorkspace};
-use blake3_servil_core::Mode;
-use blake3_servil_core::throughput::{self, Batch, Prepared, TreeHasher};
-
-/// Check a 16-byte `ONE_TIME_MESSAGE` digest: low 8 bits zero and 24 five-bit digits summing to 372.
-#[inline]
-pub(crate) fn parse_digits(digest: &[u8; 32]) -> Option<[u8; CHAINS]> {
-    if digest[0] != 0 {
-        return None;
-    }
-    let mut x = u128::from_le_bytes(digest[..N].try_into().unwrap()) >> ZERO_BITS;
-    let mut out = [0u8; CHAINS];
-    let mut sum = 0u32;
-    for slot in &mut out {
-        let d = (x & 31) as u8;
-        *slot = d;
-        sum += d as u32;
-        x >>= 5;
-    }
-    (sum == DIGIT_SUM).then_some(out)
-}
+use crate::workspace::{VerifyWorkspace, WOTS_CHUNK_LEAVES, WorkerScratch};
+use blake3_servil::Mode;
+use blake3_servil::throughput::{Batch, Prepared, TreeHasher};
 
 /// Position of a one-time signature in the hypertree.
 #[derive(Clone, Copy)]
@@ -32,40 +13,26 @@ pub(crate) struct Pos {
     pub leaf: u16,
 }
 
-/// Evaluate `ONE_TIME_MESSAGE` for one `(pos, node, counter)`.
-pub(crate) fn digits(public: &TreeHasher, pos: Pos, node: &[u8; N], counter: u32) -> Option<[u8; CHAINS]> {
-    let mut input = [0u8; 36];
-    input[..16].copy_from_slice(&tweak(KIND_ONE_TIME_MESSAGE, pos.layer, pos.tree, pos.leaf, 0, 0));
-    input[16..32].copy_from_slice(node);
-    input[32..36].copy_from_slice(&counter.to_le_bytes());
-    parse_digits(public.hash(&input).as_bytes())
+/// Convert a 16-byte message/root into 35 WOTS+ nibble digits (32 message nibbles + 3 checksum nibbles,
+/// little-endian nibble order; SPEC.md, "One-time signatures").
+#[inline]
+pub(crate) fn digits(node: &[u8; N]) -> [u8; CHAINS] {
+    let mut out = [0u8; CHAINS];
+    let mut csum = 0u16;
+    for (i, &byte) in node.iter().enumerate() {
+        let lo = byte & 0x0f;
+        let hi = byte >> 4;
+        out[2 * i] = lo;
+        out[2 * i + 1] = hi;
+        csum += (CHAIN_STEPS as u16 - lo as u16) + (CHAIN_STEPS as u16 - hi as u16);
+    }
+    out[MSG_CHAINS] = (csum & 0x0f) as u8;
+    out[MSG_CHAINS + 1] = ((csum >> 4) & 0x0f) as u8;
+    out[MSG_CHAINS + 2] = ((csum >> 8) & 0x0f) as u8;
+    out
 }
 
-/// Find the smallest `counter` in `0..=u32::MAX` that passes `ONE_TIME_MESSAGE`.
-fn search_wots(public: &[u8; 32], pos: Pos, node: &[u8; N], ws: &mut SignWorkspace) -> (u32, [u8; CHAINS]) {
-    const { assert!((1u64 << 32).is_multiple_of(GRIND as u64)) };
-    let t = tweak(KIND_ONE_TIME_MESSAGE, pos.layer, pos.tree, pos.leaf, 0, 0);
-    for i in 0..GRIND {
-        let m = ws.b_wmsg.message_mut(i);
-        m[..16].copy_from_slice(&t);
-        m[16..32].copy_from_slice(node);
-    }
-    for base in (0u64..=u32::MAX as u64).step_by(GRIND) {
-        for i in 0..GRIND {
-            ws.b_wmsg.message_mut(i)[32..36].copy_from_slice(&((base + i as u64) as u32).to_le_bytes());
-        }
-        throughput::hash_many(Mode::Keyed(public), &ws.b_wmsg, &mut ws.out[..GRIND]);
-        for (i, digest) in ws.out.iter().enumerate().take(GRIND) {
-            if let Some(d) = parse_digits(digest) {
-                return ((base + i as u64) as u32, d);
-            }
-        }
-    }
-    panic!("one-time counter search exhausted 2^32 tries");
-}
-
-/// Advance each of 24 chains in place from `starts[c]` to `ends[c]`, batching active chains at each step.
-/// Shared by layer-3 signing (using the cached top tree) and by signature verification.
+/// Advance each of 35 chains in place from `starts[c]` to `ends[c]`, batching active chains at each step.
 pub(crate) fn advance_chains(
     public: &TreeHasher,
     pos: Pos,
@@ -91,10 +58,11 @@ pub(crate) fn advance_chains(
         m[..16].copy_from_slice(&tweak(KIND_CHAIN, pos.layer, pos.tree, pos.leaf, c as u16, starts[c] as u32));
         m[16..32].copy_from_slice(&values[c]);
     }
-    let mut step = 0u8;
-    while active > 0 {
+    for step in 1..=(CHAIN_STEPS as u8) {
+        if active == 0 {
+            break;
+        }
         public.hash_many(&b32.part(0..active), &mut out[..active]);
-        step += 1;
         for (slot, &(rem, c)) in order[..active].iter().enumerate() {
             if step < rem {
                 let m = b32.message_mut(slot);
@@ -110,177 +78,178 @@ pub(crate) fn advance_chains(
     }
 }
 
-/// Build one 512-leaf hypertree tree, returning its root.
-/// When `top_out` is `Some`, writes all 1,023 nodes into 1-indexed heap layout (`nodes[1]` = root).
-/// When `sign_out` is `Some`, simultaneously harvests the 24 signature chain values and 9 path siblings
-/// for `(target_leaf, digits)` into `sig_part` (`LAYER_LEN` bytes, after the 4-byte counter).
-pub(crate) fn build_tree(
-    secret: &[u8; 32],
-    public: &[u8; 32],
-    layer: u8,
-    tree: u64,
-    mut top_out: Option<&mut [[u8; N]; TOP_NODES]>,
-    mut sign_out: Option<(u16, &[u8; CHAINS], &mut [u8])>,
-    ws: &mut SignWorkspace,
-) -> [u8; N] {
-    let total_chains = TREE_LEAVES * CHAINS;
-    for leaf in 0..TREE_LEAVES {
+/// Secret and public hash keys passed together to one-time tree helpers.
+#[derive(Clone, Copy)]
+pub(crate) struct KeyPair<'a> {
+    pub secret: &'a [u8; 32],
+    pub public: &'a [u8; 32],
+}
+
+/// Build `out_leaves.len()` consecutive WOTS+ public-key leaves starting at `start_leaf`.
+pub(crate) fn build_wots_leaves_chunk(keys: KeyPair<'_>, pos: Pos, use_sme2: bool, ws: &mut WorkerScratch, out_leaves: &mut [[u8; N]]) {
+    let count = out_leaves.len();
+    assert!(count > 0 && count <= WOTS_CHUNK_LEAVES);
+    let total = count * CHAINS;
+
+    let sec_h = if use_sme2 { TreeHasher::new(Mode::Keyed(keys.secret)) } else { TreeHasher::new(Mode::Keyed(keys.secret)).on_this_core() };
+    let pub_h = if use_sme2 { TreeHasher::new(Mode::Keyed(keys.public)) } else { TreeHasher::new(Mode::Keyed(keys.public)).on_this_core() };
+
+    for i in 0..count {
+        let leaf = pos.leaf + i as u16;
         for c in 0..CHAINS {
-            ws.b16.message_mut(leaf * CHAINS + c).copy_from_slice(&tweak(KIND_CHAIN_SECRET, layer, tree, leaf as u16, c as u16, 0));
+            ws.b16.message_mut(i * CHAINS + c).copy_from_slice(&tweak(KIND_CHAIN_SECRET, pos.layer, pos.tree, leaf, c as u16, 0));
         }
     }
-    throughput::hash_many(Mode::Keyed(secret), &ws.b16.part(0..total_chains), &mut ws.out[..total_chains]);
+    sec_h.hash_many(&ws.b16.part(0..total), &mut ws.out[..total]);
 
-    if let Some((target_leaf, target_digits, ref mut sig_part)) = sign_out {
-        let base = target_leaf as usize * CHAINS;
+    for i in 0..count {
+        let leaf = pos.leaf + i as u16;
         for c in 0..CHAINS {
-            if target_digits[c] == 0 {
-                sig_part[4 + N * c..4 + N * (c + 1)].copy_from_slice(&ws.out[base + c][..N]);
-            }
-        }
-    }
-
-    for leaf in 0..TREE_LEAVES {
-        for c in 0..CHAINS {
-            let j = leaf * CHAINS + c;
-            let m = ws.b32.message_mut(j);
-            m[..16].copy_from_slice(&tweak(KIND_CHAIN, layer, tree, leaf as u16, c as u16, 0));
-            m[16..32].copy_from_slice(&ws.out[j][..N]);
+            let slot = i * CHAINS + c;
+            let m = ws.b32.message_mut(slot);
+            m[..16].copy_from_slice(&tweak(KIND_CHAIN, pos.layer, pos.tree, leaf, c as u16, 0));
+            m[16..32].copy_from_slice(&ws.out[slot][..N]);
         }
     }
     for step in 0..CHAIN_STEPS {
-        throughput::hash_many(Mode::Keyed(public), &ws.b32.part(0..total_chains), &mut ws.out[..total_chains]);
-        if let Some((target_leaf, target_digits, ref mut sig_part)) = sign_out {
-            let base = target_leaf as usize * CHAINS;
-            for c in 0..CHAINS {
-                if target_digits[c] as u32 == step + 1 {
-                    sig_part[4 + N * c..4 + N * (c + 1)].copy_from_slice(&ws.out[base + c][..N]);
-                }
-            }
-        }
+        pub_h.hash_many(&ws.b32.part(0..total), &mut ws.out[..total]);
         if step + 1 < CHAIN_STEPS {
-            let next_bytes = (step + 1).to_le_bytes();
-            for (j, digest) in ws.out[..total_chains].iter().enumerate() {
-                let m = ws.b32.message_mut(j);
-                m[12..16].copy_from_slice(&next_bytes);
-                m[16..32].copy_from_slice(&digest[..N]);
+            let next = (step + 1).to_le_bytes();
+            for slot in 0..total {
+                let m = ws.b32.message_mut(slot);
+                m[12..16].copy_from_slice(&next);
+                m[16..32].copy_from_slice(&ws.out[slot][..N]);
             }
         }
     }
 
-    for leaf in 0..TREE_LEAVES {
-        let m = ws.b400.message_mut(leaf);
-        m[..16].copy_from_slice(&tweak(KIND_ONE_TIME_KEY, layer, tree, leaf as u16, 0, 0));
+    for i in 0..count {
+        let leaf = pos.leaf + i as u16;
+        let m = ws.b_pk.message_mut(i);
+        m[..16].copy_from_slice(&tweak(KIND_ONE_TIME_KEY, pos.layer, pos.tree, leaf, 0, 0));
         for c in 0..CHAINS {
-            m[16 + N * c..16 + N * (c + 1)].copy_from_slice(&ws.out[leaf * CHAINS + c][..N]);
+            m[16 + c * N..16 + (c + 1) * N].copy_from_slice(&ws.out[i * CHAINS + c][..N]);
         }
     }
-    throughput::hash_many(Mode::Keyed(public), &ws.b400, &mut ws.out[..TREE_LEAVES]);
+    pub_h.hash_many(&ws.b_pk.part(0..count), &mut ws.out[..count]);
+    for i in 0..count {
+        out_leaves[i] = first_n(&ws.out[i]);
+    }
+}
 
-    for height in 0..TREE_HEIGHT {
-        let count = TREE_LEAVES >> height;
-        if let Some(ref mut top) = top_out {
-            for i in 0..count {
-                top[count + i].copy_from_slice(&ws.out[i][..N]);
-            }
-        }
-        if let Some((target_leaf, _, ref mut sig_part)) = sign_out {
-            let sib = ((target_leaf as usize) >> height) ^ 1;
-            let at = 4 + N * CHAINS + N * height;
-            sig_part[at..at + N].copy_from_slice(&ws.out[sib][..N]);
-        }
+/// Build the 1-indexed binary Merkle heap (`2 * leaves.len()` nodes; index `1` is the root) from `leaves`.
+pub(crate) fn build_merkle_heap(public_key: &[u8; 32], layer: u8, tree: u64, height: usize, leaves: &[[u8; N]], ws: &mut WorkerScratch) -> Vec<[u8; N]> {
+    let n_leaves = 1usize << height;
+    assert_eq!(leaves.len(), n_leaves);
+    let mut nodes = vec![[0u8; N]; 2 * n_leaves];
+    nodes[n_leaves..].copy_from_slice(leaves);
+
+    let pub_h = TreeHasher::new(Mode::Keyed(public_key));
+    let mut level_start = n_leaves;
+    let mut count = n_leaves;
+    for level in 1..=height {
         let parents = count / 2;
-        for i in 0..parents {
-            let m = ws.b48.message_mut(i);
-            m[..16].copy_from_slice(&tweak(KIND_NODE, layer, tree, 0, height as u16 + 1, i as u32));
-            m[16..32].copy_from_slice(&ws.out[2 * i][..N]);
-            m[32..48].copy_from_slice(&ws.out[2 * i + 1][..N]);
+        let parent_start = level_start / 2;
+        let mut offset = 0usize;
+        while offset < parents {
+            let chunk = (parents - offset).min(ws.b48.len());
+            for j in 0..chunk {
+                let idx = offset + j;
+                let m = ws.b48.message_mut(j);
+                m[..16].copy_from_slice(&tweak(KIND_NODE, layer, tree, 0, level as u16, idx as u32));
+                m[16..32].copy_from_slice(&nodes[level_start + 2 * idx]);
+                m[32..48].copy_from_slice(&nodes[level_start + 2 * idx + 1]);
+            }
+            pub_h.hash_many(&ws.b48.part(0..chunk), &mut ws.out[..chunk]);
+            for j in 0..chunk {
+                nodes[parent_start + offset + j] = first_n(&ws.out[j]);
+            }
+            offset += chunk;
         }
-        throughput::hash_many(Mode::Keyed(public), &ws.b48.part(0..parents), &mut ws.out[..parents]);
+        level_start = parent_start;
+        count = parents;
     }
-    let root = first_n(&ws.out[0]);
-    if let Some(top) = top_out {
-        top[1] = root;
-    }
-    root
+    nodes
 }
 
-/// Sign one hypertree layer by building its tree (layers 0..3). Returns the tree root.
-pub(crate) fn sign_layer(secret: &[u8; 32], public: &[u8; 32], pos: Pos, node: &[u8; N], sig_part: &mut [u8], ws: &mut SignWorkspace) -> [u8; N] {
-    debug_assert_eq!(sig_part.len(), LAYER_LEN);
-    let (counter, d) = search_wots(public, pos, node, ws);
-    sig_part[0..4].copy_from_slice(&counter.to_le_bytes());
-    build_tree(secret, public, pos.layer, pos.tree, None, Some((pos.leaf, &d, sig_part)), ws)
-}
-
-/// Sign the top hypertree layer using its cached tree (no full tree rebuild). Returns the top root.
-pub(crate) fn sign_top_layer(
-    secret: &[u8; 32],
-    public: &[u8; 32],
+/// Write a WOTS+ signature (35 chains) and authentication path (`height` nodes) for `pos` into `out`.
+pub(crate) fn write_layer_signature(
+    keys: KeyPair<'_>,
     pos: Pos,
+    height: usize,
     node: &[u8; N],
-    top: &[[u8; N]; TOP_NODES],
-    sig_part: &mut [u8],
-    ws: &mut SignWorkspace,
-) -> [u8; N] {
-    debug_assert_eq!(sig_part.len(), LAYER_LEN);
-    let (counter, d) = search_wots(public, pos, node, ws);
-    sig_part[0..4].copy_from_slice(&counter.to_le_bytes());
+    tree_nodes: &[[u8; N]],
+    ws: &mut WorkerScratch,
+    out: &mut [u8],
+) {
+    let expected_len = if height == TOP_HEIGHT { TOP_LAYER_LEN } else { LOWER_LAYER_LEN };
+    assert_eq!(out.len(), expected_len);
+    assert_eq!(tree_nodes.len(), 2usize << height);
+    let d = digits(node);
+
+    let sec_h = TreeHasher::new(Mode::Keyed(keys.secret)).on_this_core();
+    let pub_h = TreeHasher::new(Mode::Keyed(keys.public)).on_this_core();
 
     for c in 0..CHAINS {
-        ws.b16.message_mut(c).copy_from_slice(&tweak(KIND_CHAIN_SECRET, pos.layer, 0, pos.leaf, c as u16, 0));
+        ws.b16.message_mut(c).copy_from_slice(&tweak(KIND_CHAIN_SECRET, pos.layer, pos.tree, pos.leaf, c as u16, 0));
     }
-    throughput::hash_many(Mode::Keyed(secret), &ws.b16.part(0..CHAINS), &mut ws.out[..CHAINS]);
+    sec_h.hash_many(&ws.b16.part(0..CHAINS), &mut ws.out[..CHAINS]);
     let mut values = [[0u8; N]; CHAINS];
     for c in 0..CHAINS {
         values[c] = first_n(&ws.out[c]);
     }
-    let pub_core = TreeHasher::new(Mode::Keyed(public)).on_this_core();
-    advance_chains(&pub_core, pos, &mut values, &[0u8; CHAINS], &d, &mut ws.b32, &mut ws.out[..CHAINS]);
+    advance_chains(&pub_h, pos, &mut values, &[0u8; CHAINS], &d, &mut ws.b32, &mut ws.out);
+
     for c in 0..CHAINS {
-        sig_part[4 + N * c..4 + N * (c + 1)].copy_from_slice(&values[c]);
+        out[c * N..(c + 1) * N].copy_from_slice(&values[c]);
     }
-    for height in 0..TREE_HEIGHT {
-        let sib = (TREE_LEAVES >> height) + (((pos.leaf as usize) >> height) ^ 1);
-        let at = 4 + N * CHAINS + N * height;
-        sig_part[at..at + N].copy_from_slice(&top[sib]);
+    let mut cursor = (1usize << height) + pos.leaf as usize;
+    let auth_off = CHAINS * N;
+    for level in 0..height {
+        out[auth_off + level * N..auth_off + (level + 1) * N].copy_from_slice(&tree_nodes[cursor ^ 1]);
+        cursor >>= 1;
     }
-    top[1]
 }
 
-/// Verify one hypertree layer in `sig_part` (`LAYER_LEN` bytes), returning the recovered tree root.
-pub(crate) fn verify_layer(public: &TreeHasher, pos: Pos, node: &[u8; N], sig_part: &[u8], ws: &mut VerifyWorkspace) -> Option<[u8; N]> {
-    debug_assert_eq!(sig_part.len(), LAYER_LEN);
-    let counter = u32::from_le_bytes(sig_part[0..4].try_into().unwrap());
-    let d = digits(public, pos, node, counter)?;
-
+/// Verify one hypertree layer signature and return its reconstructed Merkle root.
+pub(crate) fn verify_layer(public: &TreeHasher, pos: Pos, height: usize, node: &[u8; N], layer_sig: &[u8], ws: &mut VerifyWorkspace) -> [u8; N] {
+    debug_assert_eq!(layer_sig.len(), (CHAINS + height) * N);
+    let d = digits(node);
     let mut values = [[0u8; N]; CHAINS];
     for c in 0..CHAINS {
-        values[c].copy_from_slice(&sig_part[4 + N * c..4 + N * (c + 1)]);
+        values[c].copy_from_slice(&layer_sig[c * N..(c + 1) * N]);
     }
     advance_chains(public, pos, &mut values, &d, &[CHAIN_STEPS as u8; CHAINS], &mut ws.b32, &mut ws.out);
 
     let mut pk_in = [0u8; 16 + N * CHAINS];
     pk_in[..16].copy_from_slice(&tweak(KIND_ONE_TIME_KEY, pos.layer, pos.tree, pos.leaf, 0, 0));
     for c in 0..CHAINS {
-        pk_in[16 + N * c..16 + N * (c + 1)].copy_from_slice(&values[c]);
+        pk_in[16 + c * N..16 + (c + 1) * N].copy_from_slice(&values[c]);
     }
     let mut cur = first_n(public.hash(&pk_in).as_bytes());
 
-    let path = &sig_part[4 + N * CHAINS..];
-    let mut buf = [0u8; 16 + 2 * N];
-    for height in 0..TREE_HEIGHT {
-        let sibling = &path[N * height..N * (height + 1)];
-        let index = (pos.leaf as usize) >> height;
-        buf[..16].copy_from_slice(&tweak(KIND_NODE, pos.layer, pos.tree, 0, height as u16 + 1, (index >> 1) as u32));
+    let auth_off = CHAINS * N;
+    let mut index = pos.leaf as u32;
+    let mut pair = [0u8; 48];
+    for level in 1..=height {
+        let sib = &layer_sig[auth_off + (level - 1) * N..auth_off + level * N];
+        pair[..16].copy_from_slice(&tweak(KIND_NODE, pos.layer, pos.tree, 0, level as u16, index >> 1));
         if index & 1 == 0 {
-            buf[16..32].copy_from_slice(&cur);
-            buf[32..48].copy_from_slice(sibling);
+            pair[16..32].copy_from_slice(&cur);
+            pair[32..48].copy_from_slice(sib);
         } else {
-            buf[16..32].copy_from_slice(sibling);
-            buf[32..48].copy_from_slice(&cur);
+            pair[16..32].copy_from_slice(sib);
+            pair[32..48].copy_from_slice(&cur);
         }
-        cur = first_n(public.hash(&buf).as_bytes());
+        cur = first_n(public.hash(&pair).as_bytes());
+        index >>= 1;
     }
-    Some(cur)
+    cur
+}
+
+#[cfg(test)]
+pub(crate) fn lower_tree_len_check() -> usize {
+    assert_eq!(crate::params::LOWER_LEAVES, 1 << crate::params::LOWER_HEIGHT);
+    assert_eq!(crate::params::TOP_NODES, 2 << TOP_HEIGHT);
+    crate::params::TOP_NODES
 }

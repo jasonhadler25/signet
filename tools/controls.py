@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""Planted-fault controls for BLINCS: each security check must fail a test when removed.
+"""Planted-fault positive controls for BLINCS.
 
-    python3 tools/controls.py
-
-First confirms the unmutated test suite passes under cargo-nextest. Then, for each
-control below, removes or disables that protection with one exact edit, runs its
-targeted test under cargo-nextest, and requires that test to fail. Restores every
-file unconditionally. Exits 0 only if every planted fault is caught.
+Each control injects one deliberate bug into src/, runs the targeted test via
+cargo-nextest, restores the file immediately, and checks that the test fails.
 """
 
 import os
@@ -15,69 +11,75 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# (description, rel_path, old_text, new_text, nextest_filter)
 CONTROLS = [
     (
-        "PORS+FP threshold zero-bits check (parse_pick)",
-        "src/few_time.rs",
-        "    if g[0] & ((1u8 << THRESHOLD_BITS) - 1) != 0 {\n        return None;\n    }\n",
-        "",
-        "parse_pick_checks_threshold_distinctness_and_merged_limit",
-    ),
-    (
-        "PORS+FP duplicate-leaf check (parse_pick)",
-        "src/few_time.rs",
-        "    for j in 0..OPENED - 1 {\n        if indices[j] == indices[j + 1] {\n            return None;\n        }\n    }\n",
-        "",
-        "parse_pick_checks_threshold_distinctness_and_merged_limit",
-    ),
-    (
-        "PORS+FP merged-set size limit <= 103 (parse_pick)",
-        "src/few_time.rs",
-        "    if merged_len > AUTH_NODES {\n        return None;\n    }\n",
-        "",
-        "parse_pick_checks_threshold_distinctness_and_merged_limit",
-    ),
-    (
-        "PORS+FP trailing unused auth-slot zero padding (few_time_verify)",
-        "src/few_time.rs",
-        "    if auth[N * picked.merged_len..].iter().any(|&b| b != 0) {\n        return None;\n    }\n",
-        "",
-        "every_signature_region_and_unused_padding_is_checked",
-    ),
-    (
-        "WOTS+C low 8 zero-bits check (parse_digits)",
+        "WOTS+ checksum nibbles computed in digits()",
         "src/one_time.rs",
-        "    if digest[0] != 0 {\n        return None;\n    }\n",
-        "",
-        "parse_digits_checks_zero_bits_and_exact_sum",
+        "    out[MSG_CHAINS] = (csum & 0x0f) as u8;",
+        "    out[MSG_CHAINS] = 0;",
+        "wots_digits_and_checksum_boundaries",
     ),
     (
-        "WOTS+C exact digit sum == 372 check (parse_digits)",
-        "src/one_time.rs",
-        "    (sum == DIGIT_SUM).then_some(out)",
-        "    let _ = sum;\n    Some(out)",
-        "parse_digits_checks_zero_bits_and_exact_sum",
+        "FORS 33-bit leaf_addr masking in parse_digest()",
+        "src/few_time.rs",
+        "    let leaf_addr = u64::from_le_bytes(digest[20..28].try_into().unwrap()) & ((1u64 << HYPER_BITS) - 1);",
+        "    let leaf_addr = u64::from_le_bytes(digest[20..28].try_into().unwrap());",
+        "parse_digest_extracts_all_fors_indices_and_33bit_leaf_addr",
+    ),
+    (
+        "FORS root binds all 16 tree roots (fors_verify)",
+        "src/few_time.rs",
+        "        public.hash_many(&ws.b48.part(0..FORS_TREES), &mut ws.out[..FORS_TREES]);",
+        "        public.hash_many(&ws.b48.part(0..FORS_TREES - 1), &mut ws.out[..FORS_TREES - 1]);",
+        "every_signature_region_is_checked",
     ),
     (
         "Hypertree final top-root equality check (verify_short)",
         "src/lib.rs",
-        "            node == self.root()",
-        "            let _ = node;\n            true",
-        "every_signature_region_and_unused_padding_is_checked",
+        "            ct_eq_n(&node, self.root())",
+        "            true",
+        "every_signature_region_is_checked",
+    ),
+    (
+        "Top-tree cache keyed BLAKE3 MAC check (from_seed_with_cache)",
+        "src/lib.rs",
+        "        if !ct_eq_32(&stored_mac, &expected_mac) {",
+        "        if false {",
+        "top_tree_cache_save_load_and_tamper_rejection",
+    ),
+    (
+        "Top-tree cache magic and exact-length check (from_seed_with_cache)",
+        "src/lib.rs",
+        "        if raw.len() != TOP_CACHE_LEN || &raw[..16] != TOP_CACHE_MAGIC {",
+        "        if raw.len() != TOP_CACHE_LEN {",
+        "top_tree_cache_save_load_and_tamper_rejection",
     ),
     (
         "Per-signature salt keyed into content hash (content_from_slice)",
         "src/content.rs",
-        "    let msg_key = keyed(content_key, salt);\n    let message_hash = *TreeHasher::new(Mode::Keyed(&msg_key)).hash(message).as_bytes();",
-        "    let message_hash = *TreeHasher::new(Mode::Keyed(content_key)).hash(message).as_bytes();",
+        "    let msg_key = keyed(content_key, salt);\n    let message_hash = if message.len() >= MT_SLICE_THRESHOLD {",
+        "    let msg_key = *content_key;\n    let message_hash = if message.len() >= MT_SLICE_THRESHOLD {",
         "reference_vector_matches_python_byte_for_byte",
+    ),
+    (
+        "Streaming content_from_reader Pipeline path commits room bytes",
+        "src/content.rs",
+        "        if room_filled > 0 {\n            pipe.commit(&mut msg, &mut room, room_filled);\n        }",
+        "        let _ = room_filled;",
+        "streaming_boundaries_and_fragmented_readers_match_slices",
+    ),
+    (
+        "Streaming content_from_reader aborts Pipeline cleanly on mid-stream I/O error",
+        "src/content.rs",
+        "                    pipe.abort(msg);\n                    while pipe.next_event().is_none() {\n                        block_on(pipe.ready());\n                    }\n                    return Err(e);",
+        "                    return Err(e);",
+        "streaming_boundaries_and_fragmented_readers_match_slices",
     ),
     (
         "State file magic and exact-48-byte check (read_exact_or_reject)",
         "src/randomness.rs",
-        '    if filled != STATE_LEN || &buf[..8] != MAGIC {\n        return Err(io::Error::new(ErrorKind::InvalidData, "not a BLINCS randomness state file"));\n    }',
-        "    let _ = filled;",
+        "    if filled != STATE_LEN || &buf[..8] != MAGIC {",
+        "    if filled != STATE_LEN {",
         "randomness_create_and_initialize_lifecycle_and_rejection",
     ),
     (
@@ -95,39 +97,32 @@ CONTROLS = [
         "randomness_create_and_initialize_lifecycle_and_rejection",
     ),
     (
-        "VerifyingKey::from_bytes initializes blake3-servil-core",
+        "VerifyingKey::from_bytes initializes blake3-servil",
         "src/lib.rs",
-        "    pub fn from_bytes(bytes: &[u8; VERIFYING_KEY_LEN]) -> Self {\n        blake3_servil_core::initialize();",
+        "    pub fn from_bytes(bytes: &[u8; VERIFYING_KEY_LEN]) -> Self {\n        ensure_init();",
         "    pub fn from_bytes(bytes: &[u8; VERIFYING_KEY_LEN]) -> Self {",
         "verify_alone_initializes_blake3_in_fresh_process",
     ),
     (
-        "SigningKey::from_seed initializes blake3-servil-core",
+        "SigningKey::from_seed initializes blake3-servil",
         "src/lib.rs",
-        "    pub fn from_seed(seed: &[u8; SEED_LEN]) -> Self {\n        blake3_servil_core::initialize();",
+        "    pub fn from_seed(seed: &[u8; SEED_LEN]) -> Self {\n        ensure_init();",
         "    pub fn from_seed(seed: &[u8; SEED_LEN]) -> Self {",
         "signing_key_alone_initializes_blake3_in_fresh_process",
     ),
     (
         "Randomness::draw panics instead of wrapping at u64::MAX",
         "src/randomness.rs",
-        "let n = self.count.try_update(Ordering::Relaxed, Ordering::Relaxed, |c| c.checked_add(1)).expect(\"randomness draw counter exhausted\");",
-        "let n = self.count.fetch_add(1, Ordering::Relaxed);",
+        '        let n = self.count.try_update(Ordering::Relaxed, Ordering::Relaxed, |c| c.checked_add(1)).expect("randomness draw counter exhausted");',
+        "        let n = self.count.fetch_add(1, Ordering::Relaxed);",
         "randomness_draw_panics_on_counter_exhaustion",
     ),
     (
-        "Randomness::initialize initializes blake3-servil-core",
+        "Randomness::initialize initializes blake3-servil",
         "src/randomness.rs",
-        "    pub fn initialize(path: impl AsRef<Path>) -> io::Result<Self> {\n        blake3_servil_core::initialize();",
+        "    pub fn initialize(path: impl AsRef<Path>) -> io::Result<Self> {\n        ensure_init();",
         "    pub fn initialize(path: impl AsRef<Path>) -> io::Result<Self> {",
         "initialize_alone_initializes_blake3_in_fresh_process",
-    ),
-    (
-        "Streaming content_from_reader feeds read bytes into keyed hasher",
-        "src/content.rs",
-        "            Ok(n) => {\n                hasher.update(&buf[..n]);\n            }\n",
-        "            Ok(_n) => {}\n",
-        "streaming_boundaries_and_fragmented_readers_match_slices",
     ),
 ]
 

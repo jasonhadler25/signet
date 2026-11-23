@@ -9,6 +9,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
+name = "blake3-servil"
+version = "0.10.0+b0b4c80c39ff28c2dbcc2234a6dc17b40911830d"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69a34a6598bfae54dc08a4aed4c3c7d10b8c8f52d8132944ae4350fdeb076081"
+dependencies = [
+ "arrayvec",
+ "blake3-servil-core",
+ "cc",
+]
+
+[[package]]
 name = "blake3-servil-core"
 version = "0.10.0+b0b4c80c39ff28c2dbcc2234a6dc17b40911830d"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -32,7 +43,7 @@ checksum = "a2dd9388ff4d0afe6036b59b2002708163797aa4b8779aeceebfcf4016b59c8b"
 name = "blincs"
 version = "0.1.0"
 dependencies = [
- "blake3-servil-core",
+ "blake3-servil",
 ]
 
 [[package]]

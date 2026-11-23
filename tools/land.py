@@ -17,8 +17,8 @@ import blake3  # noqa: E402
 import blincs  # noqa: E402
 
 REF_SIG = os.path.join(ROOT, "test_vectors", "reference-signature-1.bin")
-REF_SHA256 = "dbeeb3cf497205fb4f3bf0f18c1861a8d62acdd69febe3e22f31decdd16942b2"
-REF_BLAKE3 = "dc4e894a5640047ce03904bffc6a6384fc03b534cd0343636cad4ad2c048a8b1"
+REF_SHA256 = "03d4fe3f6646f8b3b986a45333947931497c941f4a225db00d06303ff3ee65dc"
+REF_BLAKE3 = "5c56af6af07a04f769008290dcb5d608bcdd25c1e62765d8309948ab2f5b25ea"
 
 
 def run(label, cmd):
@@ -55,7 +55,7 @@ def check_vectors_and_python():
                 "(blincs.mix,(b'x',0,b'0'*32,b'')),(blincs.draw,(b'x',0))]:\n"
                 "    try:\n        fn(*args)\n        raise SystemExit(1)\n"
                 "    except ValueError:\n        pass\n"
-                "ba = bytearray(bytes.fromhex('0ad9c13b8972b912a211f9fd2ba1eec80f172d89ea2869ab004a78588619f97c'))\n"
+                "ba = bytearray(bytes.fromhex('0ad9c13b8972b912a211f9fd2ba1eec86ec7ac0e8af7b03012a5cf3a6d9bdbb0'))\n"
                 "vk = blincs.VerifyingKey(ba)\n"
                 "ba[0] ^= 0xff\n"
                 "if vk.bytes[0] != 0x0a: raise SystemExit(1)\n"

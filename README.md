@@ -3,10 +3,11 @@
 Stateless hash-based signatures built on [BLAKE3](https://github.com/servil-software-factory/BLAKE3).
 
 - **32-byte verifying key** — short enough to embed directly in a name or URL.
-- **32-byte signing-key seed** — caller-supplied; stateless across machines and backups.
-- **3,988-byte fixed-size signature** — fits inside a 4 KiB page for any message length (0 bytes to multi-gigabyte streams).
-- **Salted single-pass streaming content hash** — messages are hashed directly with keyed BLAKE3 under a fresh per-signature salt with no pre-hash API. Pre-hashing makes users vulnerable to collision attacks; passing the message or stream to BLINCS relies on second-preimage resistance and hashes at full BLAKE3 speed (**7.40 GB/s** on 1 core, up to **30.4–30.6 GB/s** multi-core via `blake3-servil`).
-- **Design target:** at least 128 bits of classical security up to $2^{33}$ signatures per signing key (8,589,934,592: 10 signatures a second for 27 years) under the SPHINCS+ / PORS+FP cover-probability model, pending independent cryptographic review.
+- **32-byte signing-key seed** — caller-supplied; stateless across machines and backups, with an optional authenticated 1 MiB top-tree cache file (`203 µs` reload vs. `40 ms` cold rebuild).
+- **5,616-byte fixed-size signature** (`7,488 B` Base64 — clears default Apache `8,190 B` and nginx `8,192 B` HTTP headers with 702 B to spare) for any message length from 0 bytes to multi-gigabyte streams.
+- **Zero counter grinding & textbook FIPS 205 building blocks** — pure nibble `WOTS+` (`w = 16`, 35 chains) + `FORS` (`16` trees of `1,024` leaves) on a `15 + 3×6` hypertree: deterministic signing latency (no grinding tails), ~40% simpler spec and code, and textbook FIPS 205 security proofs.
+- **Salted single-pass multi-core content hash** — messages are hashed directly with keyed BLAKE3 under a fresh per-signature salt with no pre-hash API. Pre-hashing makes users vulnerable to collision attacks; passing the message or stream to BLINCS relies on second-preimage resistance and runs at full multi-core BLAKE3 speed (**27.9 GB/s** slice / **26.9 GB/s** streaming on Apple M6 via `blake3-servil`).
+- **Design target:** **133.2 bits** of classical security up to **$2^{32}$ signatures** per signing key (4,294,967,296: 10 signatures a second for 13.6 years; degrading gracefully to `126.8` bits at $2^{33}$ and `119.3` bits at $2^{34}$), pending independent cryptographic review.
 
 ## Credits and thanks
 
@@ -40,20 +41,23 @@ Special thanks to the [Project 11](https://research.projecteleven.com/) research
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — repository layout and landing gates
 - [`docs/history/manifesto.md`](docs/history/manifesto.md) — original project strategy note (historical context)
 
-## Measured speed (single core, Apple M6)
+## Measured speed (Apple M6, multithreaded by default)
 
-Measured with `bench/` (`bench-hashes`'s `clocks` crate, single thread, quiet machine, 0% E-cores):
+Measured with `bench/` (`bench-hashes`'s `clocks` crate, quiet machine, `blake3-servil = "=0.10.0"`, verification 1 core / signing & large-message hashing multi-core by default):
 
-| Operation | Wall time | Core cycles | Throughput |
+| Operation | Wall time | Core cycles (main thread) | Throughput |
 |---|---:|---:|---:|
-| `SigningKey::from_seed` (loads & caches 16 KiB top tree) | 4.49 ms | 19.9M cyc | 223 / s |
-| `SigningKey::sign` (64 B) | 16.44 ms | 72.2M cyc | 60.8 / s |
-| `VerifyingKey::verify` (64 B) | 31.8 µs | 152k cyc | 31,400 / s |
-| `VerifyingKey::verify_reader` (64 B) | 32.2 µs | 154k cyc | 31,100 / s |
-| `SigningKey::sign` (100 MiB) | 31.33 ms | 137.4M cyc | 3,347 MB/s |
-| `VerifyingKey::verify` (16 MiB, single-pass salted) | 2.27 ms | 9.9M cyc | **7,400 MB/s** |
-| `VerifyingKey::verify` (100 MiB, single-pass salted) | 15.04 ms | 65.9M cyc | **6,974 MB/s** |
-| `Randomness::initialize` (48 B state update, no `fsync`) | 22.9 µs | 104k cyc | — |
+| `SigningKey::from_seed` (cold 1 MiB top-tree build, 12 cores) | 40.33 ms | 143.7M cyc | 24.8 / s |
+| `SigningKey::from_seed_with_cache` (authenticated 1 MiB disk cache) | **203.4 µs** | 888k cyc | **4,916 / s** |
+| `SigningKey::sign` (64 B) | **439.8 µs** | 1.48M cyc | **2,274 / s** |
+| `SigningKey::sign_reader` (64 B) | **440.3 µs** | 1.48M cyc | **2,271 / s** |
+| `VerifyingKey::verify` (64 B, 1 core) | **26.2 µs** | 120k cyc | **38,200 / s** |
+| `VerifyingKey::verify_reader` (64 B, 1 core) | **26.4 µs** | 121k cyc | **37,900 / s** |
+| `SigningKey::sign` (16 MiB) | **1.01 ms** | 3.94M cyc | **16,651 MB/s** |
+| `VerifyingKey::verify` (16 MiB) | **637.6 µs** | 2.48M cyc | **26,312 MB/s** *(up to 27.9 GB/s)* |
+| `SigningKey::sign_reader` (100 MiB, zero-copy `Pipeline`) | **4.35 ms** | 16.4M cyc | **24,096 MB/s** |
+| `VerifyingKey::verify_reader` (100 MiB, zero-copy `Pipeline`) | **3.89 ms** | 15.1M cyc | **26,941 MB/s** |
+| `Randomness::initialize` (48 B state update, no `fsync`) | 24.7 µs | 105k cyc | — |
 
 ## Quick start
 
@@ -77,7 +81,7 @@ For large files or streams, use `SigningKey::sign_reader` and `VerifyingKey::ver
 
 ## Trusted base and testing
 
-The library enforces `#![forbid(unsafe_code)]`, has **one** runtime dependency (`blake3-servil-core = "=0.10.0"`, 10 crates total in `Cargo.lock`, all SHA-256 checksummed), and zero dev-dependencies. An independent pure-Python implementation (`reference/blincs.py` + `reference/blake3.py`) cross-checks the Rust implementation byte for byte.
+The library enforces `#![forbid(unsafe_code)]`, has **one** runtime dependency (`blake3-servil = "=0.10.0"`, 10 crates total in `Cargo.lock`, all BLAKE3 + SHA-256 hashset-verified before building), and zero dev-dependencies. An independent pure-Python implementation (`reference/blincs.py` + `reference/blake3.py`) cross-checks the Rust implementation byte for byte.
 
 Tests run under `cargo-nextest` (one process per test):
 

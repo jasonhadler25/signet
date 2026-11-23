@@ -105,6 +105,13 @@ fn main() {
     });
     report("from_seed (keygen/load)", &b, 0);
 
+    let cache_path = dir.join("top-tree.cache");
+    sk.save_top_tree_cache(&cache_path).unwrap();
+    let bc = clocks::measure(10, 100_000_000, || {
+        black_box(SigningKey::from_seed_with_cache(black_box(&seed), &cache_path).unwrap());
+    });
+    report("from_seed_with_cache", &bc, 0);
+
     for &(label, len) in &[
         ("64 B", 64usize),
         ("1 KiB", 1024),
@@ -128,7 +135,7 @@ fn main() {
         });
         report(&format!("verify slice {label}"), &ver_batches, if len >= 65536 { len as u64 } else { 0 });
 
-        if len == 64 || len == 262144 || len == 1024 * 1024 {
+        if len == 64 || len == 262144 || len == 1024 * 1024 || len == 100 * 1024 * 1024 {
             let sr = clocks::measure(10, 150_000_000, || {
                 black_box(sk.sign_reader(&rng, Cursor::new(black_box(&msg))).unwrap());
             });

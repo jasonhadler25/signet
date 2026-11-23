@@ -1,255 +1,144 @@
 use crate::params::{
-    AUTH_NODES, FEW_HEIGHT, FEW_LEAVES, FEW_LEN, HYPER_BITS, KIND_FEW_LEAF, KIND_FEW_NODE, KIND_FEW_SECRET, KIND_PICK, N, OPENED, THRESHOLD_BITS, TREE_HEIGHT,
-    first_n, tweak,
+    FORS_HEIGHT, FORS_LEAVES, FORS_LEN, FORS_TREES, HYPER_BITS, KIND_FEW_LEAF, KIND_FEW_NODE, KIND_FEW_ROOT, KIND_FEW_SECRET, N, first_n, tweak,
 };
-use crate::workspace::{GRIND, SignWorkspace, VerifyWorkspace};
-use blake3_servil_core::Mode;
-use blake3_servil_core::throughput::{self, Prepared, TreeHasher};
+use crate::workspace::{VerifyWorkspace, WorkerScratch};
+use blake3_servil::Mode;
+use blake3_servil::throughput::{Prepared, TreeHasher};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Picked {
-    pub tree: u64,
-    pub leaf: u16,
-    pub indices: [u16; OPENED],
-    pub merged_len: usize,
-}
-
-#[inline(always)]
-fn bits_at(buf: &[u8; 40], bit: usize, width: usize) -> u64 {
-    let byte = bit / 8;
-    let shift = bit % 8;
-    let word = u64::from_le_bytes(buf[byte..byte + 8].try_into().unwrap());
-    (word >> shift) & ((1u64 << width) - 1)
-}
-
-/// Parse and check a 32-byte `PICK` output: 6 zero bits, 11 distinct leaves, merged set <= 103.
-pub(crate) fn parse_pick(g: &[u8; 32]) -> Option<Picked> {
-    if g[0] & ((1u8 << THRESHOLD_BITS) - 1) != 0 {
-        return None;
-    }
-    let mut buf = [0u8; 40];
-    buf[..32].copy_from_slice(g);
-    let position = bits_at(&buf, THRESHOLD_BITS, HYPER_BITS);
-    let mut indices = [0u16; OPENED];
-    let first = THRESHOLD_BITS + HYPER_BITS;
-    for (j, slot) in indices.iter_mut().enumerate() {
-        *slot = bits_at(&buf, first + j * FEW_HEIGHT, FEW_HEIGHT) as u16;
-    }
-    // Insertion sort on 11 values.
-    for i in 1..OPENED {
-        let key = indices[i];
-        let mut j = i;
-        while j > 0 && indices[j - 1] > key {
-            indices[j] = indices[j - 1];
-            j -= 1;
-        }
-        indices[j] = key;
-    }
-    for j in 0..OPENED - 1 {
-        if indices[j] == indices[j + 1] {
-            return None;
-        }
-    }
-    let merged_len = merged_size(&indices);
-    if merged_len > AUTH_NODES {
-        return None;
-    }
-    let tree = position >> TREE_HEIGHT;
-    let leaf = (position & ((1u64 << TREE_HEIGHT) - 1)) as u16;
-    Some(Picked { tree, leaf, indices, merged_len })
-}
-
-/// Number of nodes in the merged authentication set of `OPENED` sorted distinct leaves.
+/// Unpack the 16 ten-bit FORS leaf indices (`digest[0..20]`) and 33-bit hypertree leaf address
+/// (`digest[20..28]`, low 33 bits) directly from the 32-byte message digest `D`.
 #[inline]
-pub(crate) fn merged_size(indices: &[u16; OPENED]) -> usize {
-    let mut common = 0usize;
-    for j in 1..OPENED {
-        let diff_bits = (u16::BITS - (indices[j] ^ indices[j - 1]).leading_zeros()) as usize;
-        common += FEW_HEIGHT - diff_bits;
-    }
-    FEW_HEIGHT + (OPENED - 1) * (FEW_HEIGHT - 2) - common
-}
-
-/// The `(height, index)` coordinates of the merged authentication set, bottom level first and left to right
-/// within each level (SPEC.md, "Merged authentication set").
-pub(crate) fn merged_set(indices: &[u16; OPENED]) -> Vec<(u8, u16)> {
-    let mut needed = Vec::with_capacity(AUTH_NODES);
-    let mut known = *indices;
-    let mut len = OPENED;
-    for height in 0..FEW_HEIGHT {
-        let mut next_len = 0;
-        let mut i = 0;
-        while i < len {
-            let index = known[i];
-            if index & 1 == 0 && i + 1 < len && known[i + 1] == index + 1 {
-                i += 2;
-            } else {
-                needed.push((height as u8, index ^ 1));
-                i += 1;
-            }
-            known[next_len] = index >> 1;
-            next_len += 1;
-        }
-        len = next_len;
-    }
-    debug_assert_eq!(len, 1);
-    debug_assert_eq!(needed.len(), merged_size(indices));
-    needed
-}
-
-/// Evaluate `PICK` for one `(digest, counter)` pair.
-pub(crate) fn pick(public: &TreeHasher, digest: &[u8; 32], counter: u32) -> Option<Picked> {
-    let mut input = [0u8; 52];
-    input[..16].copy_from_slice(&tweak(KIND_PICK, 0, 0, 0, 0, 0));
-    input[16..48].copy_from_slice(digest);
-    input[48..52].copy_from_slice(&counter.to_le_bytes());
-    parse_pick(public.hash(&input).as_bytes())
-}
-
-/// Find the smallest `counter` in `0..=u32::MAX` that passes `PICK`, batching `GRIND` counters at a time.
-fn search_pick(public: &[u8; 32], digest: &[u8; 32], ws: &mut SignWorkspace) -> (u32, Picked) {
-    const { assert!((1u64 << 32).is_multiple_of(GRIND as u64)) };
-    let t = tweak(KIND_PICK, 0, 0, 0, 0, 0);
-    for i in 0..GRIND {
-        let m = ws.b_pick.message_mut(i);
-        m[..16].copy_from_slice(&t);
-        m[16..48].copy_from_slice(digest);
-    }
-    for base in (0u64..=u32::MAX as u64).step_by(GRIND) {
-        for i in 0..GRIND {
-            ws.b_pick.message_mut(i)[48..52].copy_from_slice(&((base + i as u64) as u32).to_le_bytes());
-        }
-        throughput::hash_many(Mode::Keyed(public), &ws.b_pick, &mut ws.out[..GRIND]);
-        for (i, out) in ws.out.iter().enumerate().take(GRIND) {
-            if let Some(picked) = parse_pick(out) {
-                return ((base + i as u64) as u32, picked);
-            }
+pub(crate) fn parse_digest(digest: &[u8; 32]) -> ([u16; FORS_TREES], u64) {
+    let mut indices = [0u16; FORS_TREES];
+    for group in 0..4 {
+        let b = &digest[group * 5..group * 5 + 5];
+        let bits = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], 0, 0, 0]);
+        for j in 0..4 {
+            indices[group * 4 + j] = ((bits >> (10 * j)) & 0x3ff) as u16;
         }
     }
-    panic!("few-time counter search exhausted 2^32 tries");
+    let leaf_addr = u64::from_le_bytes(digest[20..28].try_into().unwrap()) & ((1u64 << HYPER_BITS) - 1);
+    (indices, leaf_addr)
 }
 
-/// Build the few-time signature into `sig_part` (`FEW_LEN` bytes) and return `(tree, leaf, few_time_root)`.
-pub(crate) fn few_time_sign(secret: &[u8; 32], public: &[u8; 32], digest: &[u8; 32], sig_part: &mut [u8], ws: &mut SignWorkspace) -> (u64, u16, [u8; N]) {
-    debug_assert_eq!(sig_part.len(), FEW_LEN);
-    let (counter, picked) = search_pick(public, digest, ws);
-    let (tree, leaf) = (picked.tree, picked.leaf);
-    let needed = merged_set(&picked.indices);
-    assert!(needed.len() <= AUTH_NODES);
+/// Output of building one FORS tree during signing: secret value, authentication path, and tree root.
+#[derive(Clone, Copy)]
+pub(crate) struct ForsTreeOut {
+    pub secret: [u8; N],
+    pub auth: [[u8; N]; FORS_HEIGHT],
+    pub root: [u8; N],
+}
 
-    sig_part[0..4].copy_from_slice(&counter.to_le_bytes());
-
-    // 2^15 leaf secrets under K_sec.
-    for i in 0..FEW_LEAVES {
-        ws.b16.message_mut(i).copy_from_slice(&tweak(KIND_FEW_SECRET, 0, tree, leaf, 0, i as u32));
+impl Default for ForsTreeOut {
+    fn default() -> Self {
+        Self { secret: [0u8; N], auth: [[0u8; N]; FORS_HEIGHT], root: [0u8; N] }
     }
-    throughput::hash_many(Mode::Keyed(secret), &ws.b16, &mut ws.out);
+}
 
-    for (j, &idx) in picked.indices.iter().enumerate() {
-        sig_part[4 + N * j..4 + N * (j + 1)].copy_from_slice(&ws.out[idx as usize][..N]);
+/// Build one FORS tree `tree_idx` (0..16, 1,024 leaves) for `leaf_addr` and extract the signature slice
+/// for `chosen_leaf`.
+pub(crate) fn build_fors_tree(
+    secret_key: &[u8; 32],
+    public_key: &[u8; 32],
+    leaf_addr: u64,
+    tree_idx: u16,
+    chosen_leaf: u16,
+    use_sme2: bool,
+    ws: &mut WorkerScratch,
+) -> ForsTreeOut {
+    debug_assert!((tree_idx as usize) < FORS_TREES && (chosen_leaf as usize) < FORS_LEAVES);
+    let sec_h = if use_sme2 { TreeHasher::new(Mode::Keyed(secret_key)) } else { TreeHasher::new(Mode::Keyed(secret_key)).on_this_core() };
+    let pub_h = if use_sme2 { TreeHasher::new(Mode::Keyed(public_key)) } else { TreeHasher::new(Mode::Keyed(public_key)).on_this_core() };
+
+    for i in 0..FORS_LEAVES {
+        ws.b16.message_mut(i).copy_from_slice(&tweak(KIND_FEW_SECRET, 0, leaf_addr, tree_idx, 0, i as u32));
     }
+    sec_h.hash_many(&ws.b16.part(0..FORS_LEAVES), &mut ws.out[..FORS_LEAVES]);
+    let chosen_secret = first_n(&ws.out[chosen_leaf as usize]);
 
-    // 2^15 leaf hashes under K_pub.
-    for i in 0..FEW_LEAVES {
+    for i in 0..FORS_LEAVES {
         let m = ws.b32.message_mut(i);
-        m[..16].copy_from_slice(&tweak(KIND_FEW_LEAF, 0, tree, leaf, 0, i as u32));
+        m[..16].copy_from_slice(&tweak(KIND_FEW_LEAF, 0, leaf_addr, tree_idx, 0, i as u32));
         m[16..32].copy_from_slice(&ws.out[i][..N]);
     }
-    throughput::hash_many(Mode::Keyed(public), &ws.b32, &mut ws.out);
+    pub_h.hash_many(&ws.b32.part(0..FORS_LEAVES), &mut ws.out[..FORS_LEAVES]);
 
-    // Harvest merged authentication nodes while folding the tree up to the root.
-    let auth_out = &mut sig_part[4 + N * OPENED..];
-    auth_out.fill(0);
-    let mut cursor = 0usize;
-    for height in 0..FEW_HEIGHT {
-        while cursor < needed.len() && needed[cursor].0 == height as u8 {
-            let idx = needed[cursor].1 as usize;
-            auth_out[N * cursor..N * (cursor + 1)].copy_from_slice(&ws.out[idx][..N]);
-            cursor += 1;
-        }
-        let parents = FEW_LEAVES >> (height + 1);
-        for i in 0..parents {
-            let m = ws.b48.message_mut(i);
-            m[..16].copy_from_slice(&tweak(KIND_FEW_NODE, 0, tree, leaf, height as u16 + 1, i as u32));
-            m[16..32].copy_from_slice(&ws.out[2 * i][..N]);
-            m[32..48].copy_from_slice(&ws.out[2 * i + 1][..N]);
-        }
-        throughput::hash_many(Mode::Keyed(public), &ws.b48.part(0..parents), &mut ws.out[..parents]);
+    let mut level_nodes = [[0u8; N]; FORS_LEAVES];
+    for i in 0..FORS_LEAVES {
+        level_nodes[i] = first_n(&ws.out[i]);
     }
-    assert_eq!(cursor, needed.len());
-    (tree, leaf, first_n(&ws.out[0]))
+
+    let mut auth = [[0u8; N]; FORS_HEIGHT];
+    let mut cur_idx = chosen_leaf as usize;
+    let mut count = FORS_LEAVES;
+    for level in 1..=FORS_HEIGHT {
+        auth[level - 1] = level_nodes[cur_idx ^ 1];
+        let parents = count / 2;
+        for p in 0..parents {
+            let m = ws.b48.message_mut(p);
+            m[..16].copy_from_slice(&tweak(KIND_FEW_NODE, 0, leaf_addr, tree_idx, level as u16, p as u32));
+            m[16..32].copy_from_slice(&level_nodes[2 * p]);
+            m[32..48].copy_from_slice(&level_nodes[2 * p + 1]);
+        }
+        pub_h.hash_many(&ws.b48.part(0..parents), &mut ws.out[..parents]);
+        for p in 0..parents {
+            level_nodes[p] = first_n(&ws.out[p]);
+        }
+        cur_idx >>= 1;
+        count = parents;
+    }
+
+    ForsTreeOut { secret: chosen_secret, auth, root: level_nodes[0] }
 }
 
-/// Verify the few-time signature in `sig_part` (`FEW_LEN` bytes), returning `(tree, leaf, few_time_root)`.
-pub(crate) fn few_time_verify(public: &TreeHasher, digest: &[u8; 32], sig_part: &[u8], ws: &mut VerifyWorkspace) -> Option<(u64, u16, [u8; N])> {
-    debug_assert_eq!(sig_part.len(), FEW_LEN);
-    let counter = u32::from_le_bytes(sig_part[0..4].try_into().unwrap());
-    let picked = pick(public, digest, counter)?;
-    let (tree, leaf) = (picked.tree, picked.leaf);
+/// Compress the 16 FORS tree roots into the 16-byte FORS public key signed by hypertree layer 0.
+pub(crate) fn fors_root(public: &TreeHasher, leaf_addr: u64, roots: &[[u8; N]; FORS_TREES]) -> [u8; N] {
+    let mut input = [0u8; 16 + N * FORS_TREES];
+    input[..16].copy_from_slice(&tweak(KIND_FEW_ROOT, 0, leaf_addr, 0, 0, 0));
+    for t in 0..FORS_TREES {
+        input[16 + t * N..16 + (t + 1) * N].copy_from_slice(&roots[t]);
+    }
+    first_n(public.hash(&input).as_bytes())
+}
 
-    let (secrets, auth) = sig_part[4..].split_at(N * OPENED);
+/// Verify a FORS signature and return its reconstructed 16-byte FORS root (batching all 16 trees per level).
+pub(crate) fn fors_verify(public: &TreeHasher, leaf_addr: u64, indices: &[u16; FORS_TREES], sig: &[u8], ws: &mut VerifyWorkspace) -> [u8; N] {
+    debug_assert_eq!(sig.len(), FORS_LEN);
+    let tree_stride = (1 + FORS_HEIGHT) * N;
 
-    // Check trailing unused auth slots are zero.
-    if auth[N * picked.merged_len..].iter().any(|&b| b != 0) {
-        return None;
+    for t in 0..FORS_TREES {
+        let m = ws.b32.message_mut(t);
+        m[..16].copy_from_slice(&tweak(KIND_FEW_LEAF, 0, leaf_addr, t as u16, 0, indices[t] as u32));
+        m[16..32].copy_from_slice(&sig[t * tree_stride..t * tree_stride + N]);
+    }
+    public.hash_many(&ws.b32.part(0..FORS_TREES), &mut ws.out[..FORS_TREES]);
+
+    let mut cur = [[0u8; N]; FORS_TREES];
+    let mut idx = [0u32; FORS_TREES];
+    for t in 0..FORS_TREES {
+        cur[t] = first_n(&ws.out[t]);
+        idx[t] = indices[t] as u32;
     }
 
-    // Hash the 11 opened secrets into leaf values in one batch.
-    for (j, &idx) in picked.indices.iter().enumerate() {
-        let m = ws.b32.message_mut(j);
-        m[..16].copy_from_slice(&tweak(KIND_FEW_LEAF, 0, tree, leaf, 0, idx as u32));
-        m[16..32].copy_from_slice(&secrets[N * j..N * (j + 1)]);
-    }
-    public.hash_many(&ws.b32.part(0..OPENED), &mut ws.out[..OPENED]);
-
-    let mut known: [(u16, [u8; N]); OPENED] = [(0, [0u8; N]); OPENED];
-    for j in 0..OPENED {
-        known[j] = (picked.indices[j], first_n(&ws.out[j]));
-    }
-
-    let mut len = OPENED;
-    let mut used = 0usize;
-    let mut parent_indices = [0u16; OPENED];
-    for height in 0..FEW_HEIGHT {
-        let mut next_len = 0;
-        let mut i = 0;
-        while i < len {
-            let (index, value) = known[i];
-            let parent_idx = index >> 1;
-            let m = ws.b48.message_mut(next_len);
-            m[..16].copy_from_slice(&tweak(KIND_FEW_NODE, 0, tree, leaf, height as u16 + 1, parent_idx as u32));
-            if index & 1 == 0 && i + 1 < len && known[i + 1].0 == index + 1 {
-                m[16..32].copy_from_slice(&value);
-                m[32..48].copy_from_slice(&known[i + 1].1);
-                i += 2;
+    for level in 1..=FORS_HEIGHT {
+        for t in 0..FORS_TREES {
+            let sib = &sig[t * tree_stride + level * N..t * tree_stride + (level + 1) * N];
+            let m = ws.b48.message_mut(t);
+            m[..16].copy_from_slice(&tweak(KIND_FEW_NODE, 0, leaf_addr, t as u16, level as u16, idx[t] >> 1));
+            if idx[t] & 1 == 0 {
+                m[16..32].copy_from_slice(&cur[t]);
+                m[32..48].copy_from_slice(sib);
             } else {
-                assert!(used < AUTH_NODES);
-                let other = &auth[N * used..N * (used + 1)];
-                used += 1;
-                if index & 1 == 0 {
-                    m[16..32].copy_from_slice(&value);
-                    m[32..48].copy_from_slice(other);
-                } else {
-                    m[16..32].copy_from_slice(other);
-                    m[32..48].copy_from_slice(&value);
-                }
-                i += 1;
+                m[16..32].copy_from_slice(sib);
+                m[32..48].copy_from_slice(&cur[t]);
             }
-            parent_indices[next_len] = parent_idx;
-            next_len += 1;
         }
-        if next_len >= 2 {
-            public.hash_many(&ws.b48.part(0..next_len), &mut ws.out[..next_len]);
-            for j in 0..next_len {
-                known[j] = (parent_indices[j], first_n(&ws.out[j]));
-            }
-        } else {
-            let h = public.hash(ws.b48.message_mut(0));
-            known[0] = (parent_indices[0], first_n(h.as_bytes()));
+        public.hash_many(&ws.b48.part(0..FORS_TREES), &mut ws.out[..FORS_TREES]);
+        for t in 0..FORS_TREES {
+            cur[t] = first_n(&ws.out[t]);
+            idx[t] >>= 1;
         }
-        len = next_len;
     }
-    assert_eq!(len, 1);
-    assert_eq!(used, picked.merged_len);
-    Some((tree, leaf, known[0].1))
+
+    fors_root(public, leaf_addr, &cur)
 }

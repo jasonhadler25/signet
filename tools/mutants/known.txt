@@ -1,11 +1,9 @@
 # Known equivalent or test-indistinguishable mutants for BLINCS (cargo-mutants, --profile mutants).
-# Format: <file>\t<mutation>\t<reason>
+# Format: <file>	<mutation>	<reason>
 # Line numbers are stripped when matching so unrelated edits do not churn this file.
 # Every entry must name a real surviving mutant; stale entries fail tools/mutants/check.py.
 
-src/few_time.rs	replace > with >= in parse_pick	Equivalent: insertion-sorting plain u16 leaf indices with >= produces the identical sorted array; duplicates are rejected four lines later.
-src/one_time.rs	replace < with <= in build_tree	Equivalent: optimization guard skipping the dead copy-back after the final chain step (step == 30); running it writes into unused ws.b32 and changes no output.
-src/one_time.rs	replace + with * in build_tree	Equivalent: same optimization guard (step * 1 < 31 is true on step == 30); writes into unused ws.b32 and changes no output.
-src/one_time.rs	replace / with * in build_tree	Equivalent: hashes the same count/2 parents into ws.out[..count/2] plus unused trailing entries inside the 32,768-slot workspace buffer.
+src/content.rs	replace >= with < in content_from_slice	Equivalent: selects between single-core TreeHasher::hash and multi-core update_multithreaded, both of which compute the identical BLAKE3 keyed hash.
+src/content.rs	replace > with >= in content_from_reader	Equivalent: Pipeline::commit with 0 bytes written is a documented no-op.
 src/randomness.rs	replace read_monotonic_clock::<impl Hasher for Collect>::finish -> u64 with 1	Equivalent: Hasher::finish is never called; Instant::now().hash only invokes Hasher::write.
 src/randomness.rs	replace match guard !p.as_os_str().is_empty() with false in Randomness::create	Unobservable without power loss: syncs "." instead of path.parent(), both of which succeed when readable.
