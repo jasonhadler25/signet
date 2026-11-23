@@ -19,11 +19,12 @@ Thanks to [Project 11](https://research.projecteleven.com/) — and Conor Deegan
 ## Documents
 
 - [`SPEC.md`](SPEC.md) — normative byte-level specification
-- [`DESIGN.md`](DESIGN.md) — rationale for every design choice (including the quantitative unknown-thresholds "minimax" model and `tools/optimize.py`)
+- [`DESIGN.md`](DESIGN.md) — rationale for every design choice, every candidate technique evaluated (including Project 11's ideas), and the calibrated tradeoff models (`tools/optimize.py`)
 - [`BENCHMARKS.md`](BENCHMARKS.md) — Project 11 SLH-DSA-B reproduction, BLINCS comparison, `clocks` wall/cycle tables, and multithreading results
 - [`QUALITY.md`](QUALITY.md) — verification layers, planted-fault controls, mutation testing, and known gaps
 - [`SECURITY.md`](SECURITY.md) — operational boundaries, threat model, and vulnerability reporting
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — repository layout and landing gates
+- [`docs/history/manifesto.md`](docs/history/manifesto.md) — original project strategy note (historical context)
 
 ## Measured speed (single core, Apple M6)
 

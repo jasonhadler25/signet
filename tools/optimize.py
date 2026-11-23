@@ -20,6 +20,8 @@ the PORS+FP + hypertree cover-probability security bound, the full 3-D Pareto fr
 
 Usage:
     python3 tools/optimize.py                       # default: 2^33 sigs, >= 128 bits, calibrated M6 model
+    python3 tools/optimize.py --max-top-height 15   # irregular hypertrees with <= 1 MiB stateless top-tree cache
+    python3 tools/optimize.py --four-axis           # unconstrained 4-axis (bytes, cached sign, uncached 1-shot, verify)
     python3 tools/optimize.py --sign-speedup 3.0    # e.g. 8-core leaf-parallel signing
     python3 tools/optimize.py --uncached            # count all d trees in signing time
     python3 tools/optimize.py --grinding-sweep      # m = 95..120 trade-off for BLINCS 0.1.0
@@ -128,9 +130,37 @@ def pors_ns_per_comp(leaves):
     return 10.0 + 4.8 * (2048.0 / (leaves + 2048.0))
 
 
-def build_frontier(q, target_bits, cached_top, ns_grind, ns_ver_batch, ns_ver_scalar, sign_speedup, sign_cap_ms, max_top_height=0):
+def _pareto3(items):
+    items.sort()
+    out = []
+    for it in items:
+        s, v = it[1], it[2]
+        if any(o[1] <= s and o[2] <= v for o in out):
+            continue
+        out.append(it)
+    return out
+
+
+def _pareto4(items):
+    items.sort()
+    out = []
+    for it in items:
+        s, v, k = it[1], it[2], it[3]
+        if any(o[1] <= s and o[2] <= v and o[3] <= k for o in out):
+            continue
+        out.append(it)
+    return out
+
+
+def build_candidates_4d(
+    q, target_bits, cached_top, ns_grind, ns_ver_batch, ns_ver_scalar, sign_speedup, sign_cap_ms, max_top_height=16, keep_cold_axis=True
+):
+    """Build exact 4-D non-dominated candidates across uniform + all optimal irregular hypertrees (h_top <= max_top_height).
+
+    By convexity of 2^x, for fixed (h, d, h_top), lower-layer signing work is uniquely minimized when the
+    (d - 1) uncached lower layers differ in height by at most 1.
+    """
     b_lo, b_hi = 10, 17
-    # Small trees (b <= 12) can use larger k (up to 32); taller trees only need smaller k (<= 16).
     k_cap = lambda h: 32 if h <= 12 else (20 if h == 13 else (16 if h <= 15 else 12))
     pors_dp = pors_merged_table(b_hi, k_cap)
 
@@ -146,7 +176,6 @@ def build_frontier(q, target_bits, cached_top, ns_grind, ns_ver_batch, ns_ver_sc
                 entries.append((m, (k_fact * cum) / denom))
             pors_cum[(b, k)] = entries
 
-    # Plain uniform WOTS+C options across w in {4, 8, 16, 32, 64, 128, 256}
     wots_options = []
     for width in (2, 3, 4, 5, 6, 7, 8):
         max_digit = (1 << width) - 1
@@ -179,23 +208,8 @@ def build_frontier(q, target_bits, cached_top, ns_grind, ns_ver_batch, ns_ver_sc
                 leaf_c = v + v * max_digit + pk_c
                 wots_options.append((v, width, g, chosen_s, vsteps, wtries, leaf_c, pk_c))
 
-    raw_sets = []
-    # Hypertree shapes: uniform (top == hp) when max_top_height == 0, or irregular tall cached top tree
-    # (top in hp..=max_top_height, lower d-1 layers all height hp).
-    shapes = []
-    for d in range(2, 13):
-        for hp in range(3, 13):
-            top_hi = max(hp, max_top_height) if (cached_top and max_top_height > 0) else hp
-            for h_top in range(hp, top_hi + 1):
-                h = h_top + (d - 1) * hp
-                if 28 <= h <= 48:
-                    shapes.append((d, hp, h_top, h))
-
-    # Cache few-time Pareto fronts by total hypertree height h
     fts_by_h = {}
-    for _, _, _, h in shapes:
-        if h in fts_by_h:
-            continue
+    for h in range(28, 49):
         fts_choices = []
         for (b, k), entries in pors_cum.items():
             if h + k * b > 256:
@@ -231,42 +245,73 @@ def build_frontier(q, target_bits, cached_top, ns_grind, ns_ver_batch, ns_ver_sc
             fts_front.append(item)
         fts_by_h[h] = fts_front
 
-    for d, hp, h_top, h in shapes:
-        fts_front = fts_by_h[h]
-        if not fts_front:
+    ht_by_h = {}
+    for h in range(28, 49):
+        if not fts_by_h[h]:
             continue
-        leaves = 1 << hp
-        top_leaves = 1 << h_top
-        trees_built = (d - 1) if cached_top else d
-        for v, width, g, s_val, vsteps, wtries, leaf_c, pk_c in wots_options:
-            tree_c = leaves * (leaf_c + 1) - 1
-            top_tree_c = top_leaves * (leaf_c + 1) - 1
-            ns_tree = xmss_ns_per_comp(leaves * v)
-            ns_top = xmss_ns_per_comp(top_leaves * v)
-            keygen_ms = top_tree_c * ns_top / 1e6
-            ht_bytes = d * (4 + N * v) + N * h
-            top_extra_ns = (v + v * ((1 << width) - 1) // 2) * ns_ver_batch if cached_top else 0.0
-            sign_trees_ns = (d - 1) * tree_c * ns_tree if cached_top else ((d - 1) * tree_c * ns_tree + top_tree_c * ns_top)
-            ht_sign_ns = (sign_trees_ns + top_extra_ns + d * wtries * ns_grind) / sign_speedup
-            if ht_sign_ns / 1e6 >= sign_cap_ms:
-                continue
-            ht_ver_ns = d * (vsteps * ns_ver_batch + (pk_c + 1) * ns_ver_scalar) + h * ns_ver_scalar
-            for fts_bytes, fts_sign_ns, fts_ver_ns, b, k, gf, m, ftries, bits in fts_front:
-                total_bytes = 2 * N + fts_bytes + ht_bytes
-                total_sign_ms = (ht_sign_ns + fts_sign_ns / sign_speedup) / 1e6
-                if total_sign_ms > sign_cap_ms:
+        per_h = []
+        for d in range(2, 13):
+            h_top_lo = max(2, h // d)
+            h_top_hi = min(max_top_height, h - (d - 1) * 2) if (cached_top and max_top_height > 0) else h // d
+            for h_top in range(h_top_lo, h_top_hi + 1):
+                rem = h - h_top
+                low_base = rem // (d - 1)
+                low_hi_cnt = rem % (d - 1)
+                low_lo_cnt = (d - 1) - low_hi_cnt
+                max_low = low_base + (1 if low_hi_cnt else 0)
+                if max_low > 12 or h_top < max_low:
                     continue
-                total_ver_us = (ht_ver_ns + fts_ver_ns + 2 * ns_ver_scalar) / 1e3
-                raw_sets.append(
+                if max_top_height == 0 and (low_hi_cnt != 0 or h_top != low_base):
+                    continue
+                top_leaves = 1 << h_top
+                l_lo = 1 << low_base
+                l_hi = 1 << (low_base + 1)
+                shape_pts = []
+                for v, width, g, s_val, vsteps, wtries, leaf_c, pk_c in wots_options:
+                    top_tree_c = top_leaves * (leaf_c + 1) - 1
+                    ns_top = xmss_ns_per_comp(top_leaves * v)
+                    keygen_ms = top_tree_c * ns_top / 1e6
+                    t_lo_ns = (l_lo * (leaf_c + 1) - 1) * xmss_ns_per_comp(l_lo * v) if low_lo_cnt else 0.0
+                    t_hi_ns = (l_hi * (leaf_c + 1) - 1) * xmss_ns_per_comp(l_hi * v) if low_hi_cnt else 0.0
+                    sign_trees_ns = low_lo_cnt * t_lo_ns + low_hi_cnt * t_hi_ns
+                    if not cached_top:
+                        sign_trees_ns += top_tree_c * ns_top
+                    top_extra_ns = (v + v * ((1 << width) - 1) // 2) * ns_ver_batch if cached_top else 0.0
+                    ht_sign_ms = ((sign_trees_ns + top_extra_ns + d * wtries * ns_grind) / sign_speedup) / 1e6
+                    if ht_sign_ms >= sign_cap_ms:
+                        continue
+                    ht_bytes = d * (4 + N * v) + N * h
+                    ht_ver_us = (d * (vsteps * ns_ver_batch + (pk_c + 1) * ns_ver_scalar) + h * ns_ver_scalar) / 1e3
+                    shape_pts.append((ht_bytes, ht_sign_ms, ht_ver_us, keygen_ms, d, h_top, low_base, low_hi_cnt, v, width, g, s_val, wtries))
+                prune = _pareto4 if keep_cold_axis else _pareto3
+                per_h.extend(prune(shape_pts))
+        ht_by_h[h] = (_pareto4 if keep_cold_axis else _pareto3)(per_h)
+
+    out = []
+    for h, ht_list in ht_by_h.items():
+        for fts_bytes, fts_sign_ns, fts_ver_ns, b, k, gf, m, ftries, bits in fts_by_h[h]:
+            fs_ms = (fts_sign_ns / sign_speedup) / 1e6
+            fv_us = (fts_ver_ns + 2 * ns_ver_scalar) / 1e3
+            for ht_bytes, ht_sign_ms, ht_ver_us, keygen_ms, d, h_top, low_base, low_hi_cnt, v, width, g, s_val, wtries in ht_list:
+                sign_ms = ht_sign_ms + fs_ms
+                if sign_ms > sign_cap_ms:
+                    continue
+                total_bytes = 2 * N + fts_bytes + ht_bytes
+                ver_us = ht_ver_us + fv_us
+                cold_ms = sign_ms + (keygen_ms / sign_speedup if cached_top else 0.0)
+                out.append(
                     {
                         "bytes": total_bytes,
-                        "sign_ms": total_sign_ms,
-                        "verify_us": total_ver_us,
+                        "sign_ms": sign_ms,
+                        "verify_us": ver_us,
+                        "cold_ms": cold_ms,
                         "keygen_ms": keygen_ms,
+                        "cache_kib": ((2 << h_top) - 1) * N / 1024.0,
                         "bits": bits,
                         "h": h,
                         "d": d,
-                        "hp": hp,
+                        "hp": low_base,
+                        "low_hi_cnt": low_hi_cnt,
                         "h_top": h_top,
                         "v": v,
                         "width": width,
@@ -280,7 +325,13 @@ def build_frontier(q, target_bits, cached_top, ns_grind, ns_ver_batch, ns_ver_sc
                         "wtries": wtries,
                     }
                 )
+    return out
 
+
+def build_frontier(q, target_bits, cached_top, ns_grind, ns_ver_batch, ns_ver_scalar, sign_speedup, sign_cap_ms, max_top_height=0):
+    raw_sets = build_candidates_4d(
+        q, target_bits, cached_top, ns_grind, ns_ver_batch, ns_ver_scalar, sign_speedup, sign_cap_ms, max_top_height, keep_cold_axis=False
+    )
     raw_sets.sort(key=lambda x: (x["bytes"], x["sign_ms"], x["verify_us"]))
     frontier = []
     for p in raw_sets:
@@ -313,15 +364,27 @@ def score_minimax_risk(p, mins, ceilings):
     )
 
 
-def fmt_row(p, mins=None):
+def fmt_shape(p):
+    if p["low_hi_cnt"] == 0 and p["h_top"] == p["hp"]:
+        return f"h={p['h']} ({p['d']}x{p['hp']})"
+    low_lo_cnt = (p["d"] - 1) - p["low_hi_cnt"]
+    parts = [str(p["h_top"])]
+    if p["low_hi_cnt"]:
+        parts.append(f"{p['low_hi_cnt']}x{p['hp']+1}" if p["low_hi_cnt"] > 1 else str(p["hp"] + 1))
+    if low_lo_cnt:
+        parts.append(f"{low_lo_cnt}x{p['hp']}" if low_lo_cnt > 1 else str(p["hp"]))
+    return f"h={p['h']} ({'+'.join(parts)})"
+
+
+def fmt_row(p, mins=None, show_cold=False):
     rat = ""
     if mins is not None:
         rat = f" | ratios=({p['bytes']/mins[0]:.2f}x, {p['sign_ms']/mins[1]:.2f}x, {p['verify_us']/mins[2]:.2f}x)"
-    shape = f"h={p['h']} d={p['d']}" if p["h_top"] == p["hp"] else f"h={p['h']} ({p['h_top']}+{(p['d']-1)}x{p['hp']})"
+    cold_str = f" | 1shot={p['cold_ms']:5.1f} ms | cache={p['cache_kib']:6.1f} KiB" if show_cold else ""
     return (
         f"{p['bytes']:5d} B | sign={p['sign_ms']:5.2f} ms | ver={p['verify_us']:5.1f} us | "
-        f"kg={p['keygen_ms']:6.2f} ms | {p['bits']:6.2f} bits | "
-        f"{shape} v={p['v']} w={1<<p['width']} g={p['g']} S={p['S']} "
+        f"kg={p['keygen_ms']:6.2f} ms{cold_str} | {p['bits']:6.2f} bits | "
+        f"{fmt_shape(p)} v={p['v']} w={1<<p['width']} g={p['g']} S={p['S']} "
         f"b={p['b']} k={p['k']} gf={p['gf']} m={p['m']}{rat}"
     )
 
@@ -389,6 +452,7 @@ def main():
     ap.add_argument("--ns-ver-scalar", type=float, default=45.0, help="ns per scalar verify hash")
     ap.add_argument("--sign-speedup", type=float, default=1.0, help="Signing speedup factor (e.g. 3.0 for 8-core leaf parallelism)")
     ap.add_argument("--max-top-height", type=int, default=0, help="Allow irregular cached top tree up to this height (0 = uniform heights; e.g. 15 = 1 MiB cache)")
+    ap.add_argument("--four-axis", action="store_true", help="Evaluate 4-axis minimax (bytes, cached sign, uncached 1-shot sign, verify) across uniform + irregular hypertrees")
     ap.add_argument("--sign-cap-ms", type=float, default=100.0)
     ap.add_argument("--ceilings", default="7856,100,1000", help="Upper ceilings U_B (bytes), U_S (ms), U_V (us)")
     ap.add_argument("--grinding-sweep", action="store_true")
@@ -404,6 +468,42 @@ def main():
 
     t0 = time.perf_counter()
     q = parse_q(args.signatures)
+    if args.four_axis:
+        cap = args.max_top_height if args.max_top_height > 0 else 16
+        cands = build_candidates_4d(
+            q, args.security, not args.uncached, args.ns_grind, args.ns_ver_batch, args.ns_ver_scalar, args.sign_speedup, args.sign_cap_ms, cap
+        )
+        elapsed = time.perf_counter() - t0
+        bmin = min(p["bytes"] for p in cands)
+        smin = min(p["sign_ms"] for p in cands)
+        vmin = min(p["verify_us"] for p in cands)
+        cmin = min(p["cold_ms"] for p in cands)
+        print(f"Budget: {args.signatures} ({q:,}) sigs, >= {args.security:.0f} bits | {len(cands):,} 4-D non-dominated candidates (h_top <= {cap}, {elapsed:.2f} s)")
+        print(f"Global minima: B_min={bmin} B, S_min(cached)={smin:.2f} ms, 1shot_min={cmin:.2f} ms, V_min={vmin:.1f} us\n")
+        print("=== Unconstrained 4-axis (Bytes, Cached sign, Uncached 1-shot sign, Verify) ===")
+        for label, fn in [
+            ("4-axis L2 (1, 1, 1, 1)", lambda p: math.log(p["bytes"]/bmin)**2 + math.log(p["sign_ms"]/smin)**2 + math.log(p["cold_ms"]/cmin)**2 + math.log(p["verify_us"]/vmin)**2),
+            ("4-axis L_inf max(x/min)", lambda p: max(p["bytes"]/bmin, p["sign_ms"]/smin, p["cold_ms"]/cmin, p["verify_us"]/vmin)),
+            ("4-axis L2 (B=1, S=0.5, 1shot=0.5, V=1)", lambda p: math.log(p["bytes"]/bmin)**2 + 0.5*math.log(p["sign_ms"]/smin)**2 + 0.5*math.log(p["cold_ms"]/cmin)**2 + math.log(p["verify_us"]/vmin)**2),
+            ("4-axis L2 (B=4, S=0.5, 1shot=0.5, V=1)", lambda p: 4*math.log(p["bytes"]/bmin)**2 + 0.5*math.log(p["sign_ms"]/smin)**2 + 0.5*math.log(p["cold_ms"]/cmin)**2 + math.log(p["verify_us"]/vmin)**2),
+            ("4-axis L2 (B=16, S=0.5, 1shot=0.5, V=1)", lambda p: 16*math.log(p["bytes"]/bmin)**2 + 0.5*math.log(p["sign_ms"]/smin)**2 + 0.5*math.log(p["cold_ms"]/cmin)**2 + math.log(p["verify_us"]/vmin)**2),
+            ("4-axis L2 (B=25, S=0.5, 1shot=0.5, V=1)", lambda p: 25*math.log(p["bytes"]/bmin)**2 + 0.5*math.log(p["sign_ms"]/smin)**2 + 0.5*math.log(p["cold_ms"]/cmin)**2 + math.log(p["verify_us"]/vmin)**2),
+        ]:
+            best = min(cands, key=fn)
+            print(f"  {label:<40} -> {fmt_row(best, show_cold=True)}")
+        print("\n=== Effect of top-tree cache cap on 3-axis w=(16,1,1) ===")
+        for label, pred in [
+            ("Uniform (h_top == h_low)", lambda p: p["low_hi_cnt"] == 0 and p["h_top"] == p["hp"]),
+            ("h_top <= 10 (<= 32 KiB)", lambda p: p["h_top"] <= 10),
+            ("h_top <= 12 (<= 128 KiB)", lambda p: p["h_top"] <= 12),
+            ("h_top <= 14 (<= 512 KiB)", lambda p: p["h_top"] <= 14),
+            ("h_top <= 15 (<= 1 MiB)", lambda p: p["h_top"] <= 15),
+        ]:
+            sub = [p for p in cands if pred(p)]
+            b3 = min(sub, key=lambda p: 16*math.log(p["bytes"]/bmin)**2 + math.log(p["sign_ms"]/smin)**2 + math.log(p["verify_us"]/vmin)**2)
+            print(f"  3-axis {label:<24} -> {fmt_row(b3, show_cold=True)}")
+        return 0
+
     frontier = build_frontier(
         q,
         args.security,
@@ -416,6 +516,7 @@ def main():
         args.max_top_height,
     )
     elapsed = time.perf_counter() - t0
+    show_cold = args.max_top_height > 0
     mins = (min(p["bytes"] for p in frontier), min(p["sign_ms"] for p in frontier), min(p["verify_us"] for p in frontier))
     maxs = (max(p["bytes"] for p in frontier), max(p["sign_ms"] for p in frontier), max(p["verify_us"] for p in frontier))
     print(f"Budget: {args.signatures} ({q:,}) sigs, >= {args.security:.0f} bits | {len(frontier)} Pareto-optimal plain sets ({elapsed:.2f} s)")
@@ -434,21 +535,21 @@ def main():
     ]
     for label, fn in rules:
         best = min(frontier, key=fn)
-        print(f"  {label:<52} -> {fmt_row(best, mins)}")
+        print(f"  {label:<52} -> {fmt_row(best, mins, show_cold)}")
 
     # 2. Size-weighted L2 log-regret sweep
     print("\n=== 2. Weighted L2 log-regret: w_B*(ln B/Bmin)^2 + (ln S/Smin)^2 + (ln V/Vmin)^2 ===")
     for wb in (1, 4, 8, 16, 32, 64):
         best = min(frontier, key=lambda p, w=wb: l2_log_regret(p, mins, (float(w), 1.0, 1.0)))
-        print(f"  w=({wb:2d}, 1, 1) -> {fmt_row(best, mins)}")
+        print(f"  w=({wb:2d}, 1, 1) -> {fmt_row(best, mins, show_cold)}")
 
-    # 3. Log-uniform unknown-thresholds rules
+    # 3. Unknown application cutoffs (log-uniform up to upper ceilings)
     u_b, u_s, u_v = (float(x) for x in args.ceilings.split(","))
-    print("\n=== 3. Log-uniform unknown-thresholds model ===")
+    print("\n=== 3. Unknown application cutoffs (log-uniform up to upper ceilings) ===")
     for label, (cb, cs, cv) in [
-        (f"U = ({int(u_b)} B, {u_s:g} ms, {u_v:g} us)", (u_b, u_s, u_v)),
-        ("U = (7856 B [SLH-DSA-128s], 100 ms, 127 us [128s-B3])", (7856.0, 100.0, 127.0)),
-        ("U = (5000 B [compact], 100 ms, 1000 us)", (5000.0, 100.0, 1000.0)),
+        (f"Max cutoffs = ({int(u_b)} B, {u_s:g} ms, {u_v:g} us)", (u_b, u_s, u_v)),
+        ("Max cutoffs = (7856 B [SLH-DSA-128s], 100 ms, 127 us [128s-B3])", (7856.0, 100.0, 127.0)),
+        ("Max cutoffs = (5000 B [compact], 100 ms, 1000 us)", (5000.0, 100.0, 1000.0)),
     ]:
         sub = [p for p in frontier if p["bytes"] < cb and p["sign_ms"] < cs and p["verify_us"] < cv]
         if not sub:
@@ -457,8 +558,8 @@ def main():
         best_surv = max(sub, key=lambda p: score_survival(p, cb, cs, cv))
         best_mm = min(sub, key=lambda p: score_minimax_risk(p, s_mins, (cb, cs, cv)))
         print(f"  {label}:")
-        print(f"    Max survival: {fmt_row(best_surv, mins)}")
-        print(f"    Minimax risk: {fmt_row(best_mm, mins)}")
+        print(f"    Max survival: {fmt_row(best_surv, mins, show_cold)}")
+        print(f"    Minimax risk: {fmt_row(best_mm, mins, show_cold)}")
 
     # 4. Reference comparison with BLINCS 0.1.0 and SLH-DSA-B (measured Apple M6, 1 core)
     print("\n=== 4. Comparison with BLINCS 0.1.0 and SLH-DSA-B (Apple M6, 1 thread, 64 B) ===")
