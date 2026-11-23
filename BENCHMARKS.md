@@ -53,43 +53,77 @@ Measured on a quiet machine (`clocks::load` reported zero busy windows, 0% E-cor
 | `sign` 16 MiB | 20.96 ms | 92.66M | 209.54M | 2.26 | 4,422 MHz | 800 MB/s |
 | `Randomness::initialize` | 23.1 µs | 104.6k | 452.7k | 4.33 | 4,536 MHz | — |
 
-## 3. `blake3-servil` API audit and multithreading experiment (`0.10.0`)
+## 3. Optimized `blake3-servil` `0.10.0` benchmarks (single-threaded & multithreaded)
 
-We audited every public API of both `blake3-servil-core = "=0.10.0"` (`convenience::{hash, hash_with, hash_xof, Hasher}`, `throughput::{hash, hash_many, hash_each, update_each, finalize_each, Batch, Packed, Block, TreeHasher, Cv, LastCv}`) and `blake3-servil = "=0.10.0"` (`initialize_multithreaded`, `throughput::{hash_multithreaded, update_multithreaded, hash_many_multithreaded, hash_each_multithreaded, Pipeline}`):
+We audited and benchmarked every relevant API in `blake3-servil-core = "=0.10.0"` and `blake3-servil = "=0.10.0"` (`Batch`, `TreeHasher::on_this_core()`, `hash_many`, `hash_many_multithreaded`, `hash_multithreaded`, and `Pipeline`) on a quiet Apple M6 using `clocks`.
 
-- **Best single-threaded APIs for BLINCS (`blake3-servil-core`):**
-  - `throughput::hash_many` with `Batch` + `Prepared::part` beats `Packed<16|32>` on Apple M6 (`11.2` vs. `19.5 ns/op` including copy-back, because `Packed` currently expands into stack blocks internally).
-  - `TreeHasher::new(Mode::Keyed(&public)).on_this_core()` beats default SME2 dispatch by **1.8×** on verification's small batches (`n <= 24`, keeping the P-core at ~4.6–4.8 GHz instead of downclocking into SME2).
-  - `throughput::hash` (on aligned `Vec<Block>`) for streaming chunks and `TreeHasher::hash` for unaligned `&[u8]` slices.
-  - `hash_each` / `update_each` / `Pipeline` target heterogeneous lengths or independent parallel streams, not BLINCS's uniform tree layers or sequentially chained content chunks.
-- **Multithreading (`blake3-servil`, `MIN_SPLIT_LEN = 512 KiB`):** tested on a quiet Apple M6 using `clocks` (wall time and process CPU time together) on BLINCS's exact batch and chunk shapes:
+### 3.1. Raw `hash_many` (32-byte messages: WOTS+C chain steps & PORS+FP leaves)
 
-| Workload | Single-threaded (`blake3-servil-core`) | Multithreaded | CPU used | Speedup |
+| Count | 1T SME2 (`hash_many`) | 1T NEON (`on_this_core`) | `hash_many_multithreaded` (`b3-MT`) | `b3-MT` vs. 1T |
+|---:|---:|---:|---:|---:|
+| 32 – 4,096 | 8.69 ns/hash | 14.78 ns/hash | 8.69 ns/hash | 1.00× *(< 512 KiB)* |
+| 8,192 (512 KiB) | 8.69 ns/hash | 14.78 ns/hash | 5.57 ns/hash | 1.56× |
+| 16,384 (1 MiB) | 8.69 ns/hash | 14.77 ns/hash | 5.21 ns/hash | 1.67× |
+| 32,768 (2 MiB) | 8.69 ns/hash | 14.79 ns/hash | 3.77 ns/hash | 2.30× |
+| 65,536 (4 MiB) | 8.69 ns/hash | 14.79 ns/hash | 3.22 ns/hash | 2.70× |
+
+### 3.2. Full XMSS tree builds (single tree, merged lower layers, and `h_top = 15` keygen)
+
+In BLINCS signing, all $d - 1$ lower XMSS trees depend only on `(sk_seed, pk_seed, tree_idx)` and can be built together in **one merged batch** (`3× h=6`, `3× h=7`, `3× h=9`). We compare:
+
+- **`1T-SME`:** single-threaded `blake3-servil-core` `Batch` on SME2.
+- **`b3-MT`:** `blake3-servil`'s built-in `hash_many_multithreaded` (zero custom threads; 512 KiB split threshold; barrier per chain step).
+- **`12T-HYB`:** persistent coarse leaf split across all 12 M6 cores — 1 thread on SME2 + 11 threads using `TreeHasher::on_this_core()` NEON, running all $w$ chain steps + copy-back + `ONE_TIME_KEY` locally in L1/L2 with **one** barrier at the end (no SME2 contention).
+
+| XMSS workload | `1T-SME` | `1T-NEON` | `b3-MT` (zero custom threads) | `8T-HYB` | `12T-HYB` |
+|---|---:|---:|---:|---:|---:|
+| `1× h=6` (`w=16, v=32`) | 418 µs | 539 µs | 421 µs (0.99×) | 153 µs (2.73×) | **142 µs (2.95×)** |
+| `3× h=6` (`w=16, v=32`, merged) | 1.18 ms | 1.62 ms | 1.19 ms (1.00×) | 355 µs (3.33×) | **309 µs (3.82×)** |
+| `1× h=7` (`w=16, v=31`) | 784 µs | 1.04 ms | 786 µs (1.00×) | 251 µs (3.12×) | **215 µs (3.65×)** |
+| `3× h=7` (`w=16, v=31`, merged) | 2.20 ms | 3.12 ms | 1.57 ms (1.40×) | 666 µs (3.31×) | **530 µs (4.16×)** |
+| `4× h=7` (`w=16, v=31`, merged) | 2.90 ms | 4.17 ms | 1.89 ms (1.54×) | 879 µs (3.30×) | **689 µs (4.21×)** |
+| `3× h=9` (`w=32, v=24`, BLINCS `0.1.0`) | 12.73 ms | 19.30 ms | 7.66 ms (1.66×) | 4.04 ms (3.15×) | **2.98 ms (4.27×)** |
+| **`h_top = 15` keygen** (`32,768` leaves, `w=16, v=32`) | 177.05 ms | — | 72.33 ms (2.45×) | 59.61 ms (2.97×) | **42.56 ms (4.16×)** |
+
+### 3.3. PORS+FP tree builds (`b = 12..16`) and counter grinding
+
+| Workload | `1T-SME` | `b3-MT` | `8T-HYB` | `12T-HYB` |
 |---|---:|---:|---:|---:|
-| 1 XMSS tree (512 leaves × 24 chains × 31 steps) | 4.42 ms | 3.02 ms (`hash_many_multithreaded`) | 3.5× | 1.46× |
-| 1 XMSS tree, leaves split across 4 threads (zero per-step barriers) | 4.42 ms | 2.12 ms | 3.3× | 2.08× |
-| 1 XMSS tree, leaves split across 8 threads (zero per-step barriers) | 4.42 ms | 1.32 ms | 6.3× | 3.35× |
-| 100 MiB two-pass 256 KiB chunks (`hash_multithreaded`) | 31.11 ms | 31.11 ms | 1.0× | 1.00× |
-| 100 MiB two-pass 1 MiB chunks (`hash_multithreaded`, comparison) | 27.58 ms | 18.49 ms | 4.4× | 1.49× |
+| PORS+FP `b = 12` (4,096 leaves) | 158 µs | 166 µs (1.00×) | 94 µs (1.68×) | **86 µs (1.83×)** |
+| PORS+FP `b = 13` (8,192 leaves) | 299 µs | 279 µs (1.12×) | 134 µs (2.23×) | **115 µs (2.61×)** |
+| PORS+FP `b = 14` (16,384 leaves) | 565 µs | 427 µs (1.35×) | 201 µs (2.81×) | **174 µs (3.26×)** |
+| PORS+FP `b = 15` (32,768 leaves) | 1.08 ms | 688 µs (1.59×) | 335 µs (3.22×) | **295 µs (3.65×)** |
+| PORS+FP `b = 16` (65,536 leaves) | 2.10 ms | 1.08 ms (1.98×) | 669 µs (3.14×) | **531 µs (3.95×)** |
+| Grinding `52 B × 8,192` *(incl. counter write)* | 11.38 ns/try | 5.59 ns/try (1.55×) | 8.33 ns/try (1.37×) | 8.33 ns/try (1.37×) |
+| Grinding `52 B × 16,384` | 11.09 ns/try | 5.22 ns/try (1.67×) | 6.18 ns/try (1.79×) | **5.20 ns/try (2.13×)** |
+| Grinding `52 B × 32,768` | 10.75 ns/try | — | 4.79 ns/try (2.25×) | **3.85 ns/try (2.79×)** |
 
-Observations:
+### 3.4. Large-message two-pass salted content hashing (`100 MiB`, `hash_multithreaded`)
 
-1. `blake3-servil` enforces `MIN_SPLIT_LEN = 512 KiB` for `hash_multithreaded`, `update_multithreaded`, `hash_many_multithreaded`, and `hash_each_multithreaded`:
-   - Below 512 KiB total batch bytes (`8,192` one-block messages), `hash_many_multithreaded` runs single-threaded. Thus it engages on BLINCS `0.1.0`'s large trees (`12,288` chains = 768 KiB; `32,768` leaves = 2 MiB) and on `GRIND >= 8192`, but stays single-threaded on smaller candidate trees (such as `hp = 5, v = 42` = 86 KiB).
-   - On 256 KiB content chunks, `hash_multithreaded` stays single-threaded (31.11 vs. 31.11 ms); at 1 MiB chunks it drops 100 MiB two-pass hashing from 27.6 to 18.5 ms (1.49×).
-2. Calling `hash_many_multithreaded` inside each of the 31 sequential chain steps speeds up an XMSS tree by only **1.46×** (`4.42 → 3.02 ms`), because 31 pool barriers plus the single-threaded 12,288-element copy-back loop dominate.
-3. Parallelizing across the **512 independent leaves** of an XMSS tree (so each thread runs all 31 steps + copy-back + `ONE_TIME_KEY` with zero barriers, while `blake3-servil-core`'s `Sme2Turn` lets one thread use SME2 and the rest run NEON concurrently) reaches **1.32 ms per XMSS tree** (**3.35× faster**) even with fresh thread spawns — projecting **~4.5–5 ms total signing** on 8 cores.
-4. The core `blincs` crate stays single-threaded (`blake3-servil-core`, zero threads, zero locks); coarse leaf parallelism belongs in an optional feature or companion multithreaded API if needed.
+Because `blake3-servil`'s `hash_multithreaded` splits only at `MIN_SPLIT_LEN = 512 KiB`, BLINCS `0.1.0`'s 256 KiB chunks run single-threaded (`1.00×`). Larger chunks are faster even on 1 core and unlock multi-GB/s multithreaded verification/signing directly via `blake3-servil`:
 
-## 4. Measured calibration of candidate parameter sets (Apple M6, 1 core, cached top tree)
+| Chunk size (100 MiB message, 2 salted passes) | Single thread (`throughput::hash`) | `hash_multithreaded` (`b3-MT`) | Speedup |
+|---:|---:|---:|---:|
+| 256 KiB *(BLINCS `0.1.0`)* | 31.57 ms (3,322 MB/s) | 31.56 ms (3,323 MB/s) | 1.00× |
+| 512 KiB | 29.35 ms (3,573 MB/s) | 20.23 ms (5,183 MB/s) | 1.45× |
+| 1 MiB | **28.27 ms (3,709 MB/s)** | 18.70 ms (5,608 MB/s) | 1.51× |
+| 2 MiB | 28.57 ms (3,671 MB/s) | 12.92 ms (8,115 MB/s) | 2.21× |
+| 4 MiB | 28.68 ms (3,656 MB/s) | **10.93 ms (9,596 MB/s)** | **2.62×** |
 
-Direct `clocks` measurements of `blake3-servil-core 0.10.0` workloads across candidate shapes (confirming `tools/optimize.py`'s calibrated cost model):
+### 3.5. Highest-impact `blake3-servil` API optimizations for BLINCS
 
-| Candidate | Bytes | Keygen (1 tree) | Sign (cached top) | Verify (on-core batched) |
-|---|---:|---:|---:|---:|
-| BLINCS `0.1.0` (`h=36 d=4 v=24 w=32`) | 3,988 B | 4.46 ms | 16.13 ms *(real crate: 16.22 ms)* | 29.1 µs *(real crate: 33.3 µs)* |
-| `U=7856` minimax (`h=35 d=5 v=25 w=32`) | 4,536 B | 1.26 ms | 5.91 ms | 36.7 µs |
-| `U=7856` max survival (`h=32 d=4 v=31 w=16`) | 4,804 B | 1.47 ms | 5.83 ms | 18.2 µs |
-| Span-normalized $L_2$ (`h=35 d=5 v=31 w=16`) | 5,160 B | 0.77 ms | 3.57 ms | 21.7 µs |
-| Pure $L_\infty$ / squared excess (`h=35 d=7 v=42 w=8`) | 7,440–7,632 B | 0.14 ms | 1.10–1.24 ms | 21.4–23.5 µs |
-| Plain `B*S*V` (`h=32 d=8 v=42 w=8`) | 9,428 B | 0.07 ms | 0.72 ms | 28.6 µs |
+In BLINCS, **`32 B` messages** (`16 B tweak || 16 B node`) account for **80–88% of all signing compressions** (WOTS+C chains and PORS+FP leaves), `48 B` Merkle internal nodes for ~5–10%, and `16 B` messages (tweak-only leaf seeds) for only ~4–7%. Based on the measurements and `blake3-servil 0.10.0` source audit, the best `blake3-servil` optimizations for BLINCS (in order of impact) are:
+
+1. **Coarse multi-step chain / pool-dispatch support (~3.8–4.3× signing speedup, +20–28% even on 1 core):** a fused in-place chain primitive (`N` messages of `16 B tweak || 16 B value` stepped `s` times with incrementing tweak word in registers, zero intermediate RAM writes, zero per-step barriers, using `blake3-servil`'s existing `Sme2Turn` + NEON worker pool) — or exposing a small coarse-work callback on `blake3-servil`'s warm worker pool so BLINCS doesn't pay 15–31 barriers per tree.
+2. **Native zero-copy `Packed<32>` / `Packed<16>` / `Packed<48>` kernels + optional 16-byte truncated output + `Pipeline::batch` accepting `Packed<N>` (~15–25% on 1 core, 2× less L1/L2 traffic):** `hash_packed` currently expands 16 messages into stack `Block`s (`src/many.rs:149`), and `Pipeline::batch` (`TASK_LEN = 64 KiB`, which already splits far below `hash_many_multithreaded`'s 512 KiB floor!) currently accepts only `Batch<'static>`. Native packed kernels with implicit zero padding words in registers and 16-byte output cut both read and write bandwidth in half.
+3. **Register-only counter-grinding batch:** hashing a single fixed 32 B / 48 B prefix with an incrementing `u32` counter word in registers avoids materializing 2,048–32,768 nearly-identical 64-byte slots in memory.
+4. **256 KiB chunk splitting via `Pipeline` (or 1–2 MiB chunks):** `Pipeline` already splits at `TASK_LEN = 64 KiB`, unlocking multi-core streaming even below `hash_multithreaded`'s 512 KiB threshold.
+
+## 4. Calibrated timing fit summary (used by `tools/optimize.py`)
+
+`tools/optimize.py --check` verifies the fitted M6 models directly against the measurements in Section 3:
+
+- **1T-SME (merged lower trees):** XMSS `10.25 + 2.2 * 6144 / (chains + 6144)` ns/comp (`h_top = 15` predicts `175.5 ms` vs. `177.1 ms` measured); PORS `10.2 + 4.4 * 6144 / (leaves + 6144)` ns/comp; grinding `11.4` ns/try.
+- **`b3-MT` (`hash_many_multithreaded`):** stays single-threaded below 8,192 slots (`512 KiB`), scaling smoothly up to `2.45×` on `h_top = 15` and `1.98×` on `b = 16` PORS.
+- **`12T-HYB` (1 SME2 + 11 NEON `on_this_core()`):** XMSS `2.38 + 3.6 * 1500 / (chains + 1500)` ns/comp + `15 µs` (`h_top = 15` predicts `40.8 ms` vs. `42.6 ms` measured); PORS `2.45 * (3 * leaves - 1) + 56,000` ns (within 1.7% across `b = 12..16`); grinding `4.8` ns/try above 10,000 tries.
+- **Verification (1 core, `on_this_core()`):** `18.5` ns/batched + `45.0` ns/scalar (`33.1 µs` predicted vs. `33.3 µs` measured for BLINCS `0.1.0`).

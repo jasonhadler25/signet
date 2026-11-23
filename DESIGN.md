@@ -42,132 +42,88 @@ Changing the budget moves signature size by roughly **7% per factor of 8** in si
 
 ---
 
-## 3. Quantitative tradeoff models ("minimax" and scale-free log-regret)
+## 3. Simplified minimax tradeoff algorithm ("reduce the magnitude of the worst problem")
 
-Stateless hash-based signatures trade off three competing costs:
+Stateless hash-based signatures trade off three costs with completely different units:
 
-1. **Signature size $B$** (bytes in packets, logs, Git commits, certificates, transactions),
-2. **Signing time $S$** (latency and throughput per core), and
-3. **Verification time $V$** (latency and throughput per core).
+1. **Signature size $B$** (bytes — packets, commits, certificates, logs, witness space),
+2. **Signing time $S$** (milliseconds — interactive latency, release pipelines, servers), and
+3. **Verification time $V$** (microseconds — high-fanout verifiers, package registries, constrained clients).
 
-Any of those three costs may have a hard threshold beyond which it disqualifies the scheme from some use case — including uses that have not been invented yet. Rather than choosing parameters by eye, we formalize the tradeoff in [`tools/optimize.py`](tools/optimize.py) (standard-library Python, ~3.4 s to run, exact integer retry DPs, calibrated to within 1% of our measured Apple M6 `blake3-servil-core 0.10.0` numbers).
+Any of those three can become the bottleneck that disqualifies BLINCS from a real application. Following Ron Rivest's "minimax strategy" ([`docs/history/manifesto.md`](docs/history/manifesto.md)) — *perform well enough for many use cases instead of maximizing one metric to the detriment of others* — we need **one simple, transparent, zero-knob algorithm** whose sole objective is to **reduce the magnitude of the worst problem**.
 
-### Model A: Scale-free sum of squares of log-ratios above the achievable minimum
+### The algorithm: Leximin $L_\infty$ ratio above the physical Pareto floor
 
-A simple, scale-free preference is: *accept an $X\%$ improvement in one dimension for a $Y\%$ worsening in other dimensions whenever $Y \ll X$, without letting any single dimension blow up relative to its achievable best.*
+1. **Fix the hard requirements first:**
+   - Security $\ge 128$ bits at $2^{33}$ signatures per key (exact PORS+FP + hypertree cover bound).
+   - Optional stateless top-tree cache budget: at most **1 MiB** (`h_top <= 15`, where implementations remain free to cache anywhere from `0 B` through `2 KiB`, `8 KiB`, `32 KiB`, `1 MiB`, or even `65 MiB` with zero wire-format change; we also evaluate uniform `h_top == h_low` as a zero-cache baseline).
+2. **Compute the physical Pareto floor** $(B_{\min}, S_{\min}, V_{\min})$: the best physically achievable value of each dimension anywhere on the valid $2^{33}$ frontier under our measured `blake3-servil 0.10.0` timings ([`BENCHMARKS.md`](BENCHMARKS.md) §3–4).
+3. **Measure each problem dimensionlessly** as its multiplicative blowup above the physical floor:
+   $$r_B = \frac{B}{B_{\min}}, \qquad r_S = \frac{S}{S_{\min}}, \qquad r_V = \frac{V}{V_{\min}}.$$
+4. **Minimize the worst problem first (Leximin $L_\infty$):**
+   Sort each candidate's three ratios from largest to smallest, $\big(r_{(1)} \ge r_{(2)} \ge r_{(3)}\big)$, and pick the candidate that minimizes that sorted tuple lexicographically:
+   $$\arg\min_{(B, S, V)} \; \mathrm{sort\_desc}\!\left(\frac{B}{B_{\min}},\; \frac{S}{S_{\min}},\; \frac{V}{V_{\min}}\right).$$
 
-Let $(B_{\min}, S_{\min}, V_{\min})$ be the best achievable value of each dimension on the $2^{33}$ Pareto frontier, and define each dimension's **log-regret** (multiplicative distance above its achievable minimum):
+### Why this algorithm (and why we dropped more complicated rules)
 
-$$r_i = \ln\!\left(\frac{x_i}{x_{i,\min}}\right) \ge 0.$$
+- **Directly minimizes the worst problem:** $r_{(1)} = \max(r_B, r_S, r_V)$ is literally the magnitude of the single worst blowup across all three axes. Breaking ties by $r_{(2)}$ and $r_{(3)}$ guarantees the winner is strictly Pareto-optimal and leaves no free improvements on the table.
+- **Zero arbitrary knobs:** no invented usability ceilings (`max_bytes`, `max_sign_ms`), no hand-tuned weights, completely invariant to units (bytes vs. KiB, µs vs. ms), and **completely independent of the search cap** (unlike span-normalized rules, whose scores shift if you change the 100 ms search ceiling).
+- **Why $L_\infty$ beats $L_1$ and $L_2$ for minimax:**
+  - Plain product $B \cdot S \cdot V$ ($L_1$ in log-space) happily accepts a 10× blowup on one axis to shave 10× off another — it does not protect against a bad worst case.
+  - Quadratic log-regret $L_2 = \sum (\ln r_i)^2$ penalizes large ratios smoothly, but on our frontier it still lets signature size drift up to **2.6–2.8×** (`7.7–8.8 KiB`) just to shave signing from `2.0×` (`0.31 ms`) down to `1.6×` (`0.25 ms`). **Leximin $L_\infty$ refuses to make the worst problem (`B / B_min`) worse just to polish an axis that is already fast.**
 
-Minimize the **sum of squares** (Euclidean $L_2$ distance in log-space from the utopia point):
+### Optional stateless top-tree caching (`h_top <= 15`, 1 MiB full cache) and 1-shot signers
 
-$$\mathcal{L}_2(B, S, V) = \left(\ln \frac{B}{B_{\min}}\right)^2 + \left(\ln \frac{S}{S_{\min}}\right)^2 + \left(\ln \frac{V}{V_{\min}}\right)^2.$$
+A natural question for irregular hypertrees (`h_top > h_low`) is how a **1-shot signer** (such as `git commit` or a fresh CI container) behaves:
 
-Why this captures the preference cleanly:
+- **With an optional stateless cache file on disk:** the signer does **not** rebuild the top tree — and does not even need to read the entire file. Seeking just the $h_{\text{top}}$ sibling nodes along its authentication path reads only **$16 \cdot h_{\text{top}}$ bytes** (`240 B` at `h_top = 15`), taking **~0.01–0.02 ms** from warm OS page cache or **~0.05–0.3 ms** cold on NVMe SSD — **~1,000×–4,000× faster** than rebuilding from the seed. Because the cache is purely deterministic from the 32-byte signing seed, losing it never threatens security; the signer simply rebuilds it.
+- **Without any cache on disk (0 B cold start / key generation):** the signer must hash all $2^{h_{\text{top}}}$ top-tree leaves (`~117–177 ms` on 1 core or **`27–43 ms` on 12 cores** at `h_top = 15`, `w = 8..16`).
+- **Continuous partial caching (caching *less* or *more* with zero wire change):** because the top layer is a plain Merkle tree, an implementation can cache only the top $c$ levels (shrinking memory by $2^{h_{\text{top}} - c}$ and rebuilding only one tiny $2^{h_{\text{top}} - c}$-leaf subtree per signature), or cache even *more* (e.g. caching the next layer down on a server). For example, on `6,088 B` (`15 + 4×5`, `w = 8`), single-core signing scales smoothly from **`0.84 ms`** (1 MiB) → **`0.95 ms`** (32 KiB, top 10 levels) → **`1.30 ms`** (8 KiB) → **`2.72 ms`** (2 KiB, embedded/MCU) → **`118 ms`** (0 B cold; **`28 ms`** on 12 cores). On `4,868 B` (`15 + 3×6`, `w = 16`), it scales from **`1.78 ms`** (1 MiB) → **`1.99 ms`** (32 KiB) → **`2.57 ms`** (8 KiB) → **`4.62 ms`** (2 KiB) → **`172 ms`** (0 B cold; **`41 ms`** on 12 cores).
 
-- **100% scale-free, zero arbitrary ceilings or weights:** switching bytes $\leftrightarrow$ KiB or µs $\leftrightarrow$ ms cancels out of $x_i / x_{i,\min}$.
-- **Its differential is an automatic "$Y \ll X$" rule:**
-  $$d\mathcal{L}_2 = 2\!\left(r_B \frac{dB}{B} + r_S \frac{dS}{S} + r_V \frac{dV}{V}\right) = 0.$$
-  Trading an $X\%$ gain in dimension $i$ for a $Y\%$ cost in dimension $j$ is accepted if and only if
-  $$\frac{Y}{X} < \frac{\ln(x_i / x_{i,\min})}{\ln(x_j / x_{j,\min})}.$$
-  When dimension $i$ is far from its minimum (say $30\times$ above min, $\ln 30 = 3.4$) while $j$ is near its minimum ($1.2\times$, $\ln 1.2 = 0.18$), the rule accepts any trade better than ~19:1 ($Y \ll X$). Unlike plain unsquared $\sum \ln x_i = \ln(B \cdot S \cdot V)$ (which trades 49% for 50% forever), **squaring** creates a rising wall that stops once every dimension sits at roughly the same multiple of its minimum.
-- **Closely related zero-knob variants:** the $L_\infty$ limit minimizes the worst ratio $\max(x_i / x_{i,\min})$; squared percentage excess minimizes $\sum (x_i / x_{i,\min} - 1)^2$; span-normalized $L_2$ divides each $r_i$ by $\ln(x_{i,\max} / x_{i,\min})$; and weighted $L_2$ ($\sum w_i r_i^2$) makes any explicit size preference $w_B > 1$ (bytes are stored and replicated forever while signing runs once) completely transparent.
+### Fresh optimization results on measured `blake3-servil 0.10.0` timings (`python3 tools/optimize.py`)
 
-### Model B: Unknown application cutoffs (how likely is BLINCS to pass an unknown app's limits?)
+We re-ran the full $2^{33}$ search across all three directly measured Apple M6 `blake3-servil 0.10.0` execution models ([`BENCHMARKS.md`](BENCHMARKS.md) §3):
+- **`1t`:** single-threaded `blake3-servil-core` with merged lower XMSS batches on SME2.
+- **`b3mt`:** `blake3-servil`'s built-in `hash_many_multithreaded` (zero custom threads, 512 KiB split threshold).
+- **`12t`:** persistent coarse 12-core hybrid (1 SME2 thread + 11 `TreeHasher::on_this_core()` NEON threads, zero per-step barriers).
 
-Suppose a future application we have not met yet will adopt BLINCS if and only if BLINCS fits under three hard pass/fail cutoffs:
+#### A. Leximin $L_\infty$ winners with 1 MiB optional stateless top-tree cache (`h_top <= 15`)
 
-- a maximum signature size $T_B$ the application can tolerate,
-- a maximum signing time $T_S$ the application can tolerate, and
-- a maximum verification time $T_V$ the application can tolerate.
+| Timing mode & shape | Size | Sign `1T` | Sign `b3-MT` | Sign `12T` | Verify (1c) | Keygen (`1T` / `12T`) | Ratios `(B, S, V)` to floor | Parameters |
+|---|---:|---:|---:|---:|---:|---:|---|---|
+| **`12t` Leximin $L_\infty$ (clean lower)** | **6,088 B** | **0.84 ms** | **0.78 ms** | **0.31 ms** | **20.8 µs** | 117 / 27.2 ms | **(2.05×, 2.03×, 2.16×)** | `h=35 (15+4×5) w=8 v=42 g=2 S=147 b=13 k=16 gf=4 m=116` |
+| **`12t` Leximin $L_\infty$ (all irregular)** | **6,024 B** | 0.95 ms | 0.88 ms | 0.32 ms | 20.7 µs | 117 / 27.2 ms | **(2.02×, 2.12×, 2.15×)** | `h=36 (15+6+3×5) w=8 v=42 g=2 S=147 b=13 k=15 gf=4 m=112` |
+| **`b3mt` Leximin $L_\infty$ (clean lower)** | **6,812 B** | 0.70 ms | **0.63 ms** | 0.31 ms | 20.9 µs | 117 / 27.2 ms | **(2.28×, 2.38×, 2.17×)** | `h=35 (15+5×4) w=8 v=42 g=2 S=176 b=13 k=16 gf=4 m=119` |
+| **`1t` Leximin $L_\infty$ (all irregular)** | **6,844 B** | **0.65 ms** | 0.65 ms | 0.32 ms | 20.9 µs | 117 / 27.2 ms | **(2.20×, 2.43×, 2.18×)** | `h=36 (15+5+4×4) w=8 v=42 g=2 S=176 b=12 k=17 gf=10 m=119` |
+| *`12t` $L_2$ log-regret (sensitivity check)* | *7,816 B* | *0.70 ms* | *0.63 ms* | *0.25 ms* | *17.1 µs* | *90 / 21.0 ms* | *(2.63×, 1.63×, 1.78×)* | *`h=35 (15+4×5) w=4 v=63 g=2 S=94 b=13 k=16 gf=4 m=119`* |
 
-If BLINCS exceeds **any one** of those three cutoffs, that application cannot use BLINCS. Because we do not know each future application's cutoffs in advance, Model B picks each cutoff randomly across a plausible range up to a chosen **upper ceiling** `(max_bytes, max_sign_ms, max_verify_us)` — for example, `(7,856 B, 100 ms, 1,000 µs)` means *"we assume every application we care about can live with at least something smaller than SLH-DSA-128s (7,856 B), faster than 100 ms signing, and faster than 1 ms verification, though we do not know how much tighter its real cutoff is."*
+#### B. Leximin $L_\infty$ winners with uniform heights (`--max-top-height 0`, zero tall-top-tree rebuild)
 
-Using the scale-invariant (log-uniform) distribution on each cutoff up to its ceiling $(U_B, U_S, U_V)$:
+| Timing mode (uniform heights) | Size | Sign `1T` | Sign `b3-MT` | Sign `12T` | Verify (1c) | Keygen (`1T` / `12T`) | Ratios `(B, S, V)` to floor | Parameters |
+|---|---:|---:|---:|---:|---:|---:|---|---|
+| **`12t` / `b3mt` uniform Leximin $L_\infty$** | **6,844 B** | 1.48 ms | **0.93 ms** | **0.51 ms** | **20.9 µs** | **0.3 / 0.1 ms** | **(2.25×, 2.38×, 2.17×)** | `h=36 (6×6) w=8 v=42 g=2 S=176 b=12 k=17 gf=10 m=119` |
+| **`1t` uniform Leximin $L_\infty$** | **7,488 B** | **1.14 ms** | 1.07 ms | 0.42 ms | 23.6 µs | **0.1 / 0.1 ms** | **(2.28×, 2.42×, 2.45×)** | `h=35 (7×5) w=8 v=42 g=2 S=176 b=13 k=16 gf=4 m=119` |
 
-1. **Maximum joint pass probability (Nash bargaining):**
-   $$\arg\max_{(B, S, V)} \Pr[B \le T_B \land S \le T_S \land V \le T_V] = \arg\max_{(B, S, V)} \; \ln\!\left(\frac{U_B}{B}\right) \cdot \ln\!\left(\frac{U_S}{S}\right) \cdot \ln\!\left(\frac{U_V}{V}\right).$$
-   All three lower bounds $L_i$ cancel out identically; only the three upper ceilings $(U_B, U_S, U_V)$ enter, and the result is independent of units.
-2. **Minimax exclusion risk:**
-   Conditioning on each cutoff falling between the achievable minimum $x_{i,\min}$ and the upper ceiling $U_i$, minimize the worst-case chance of failing any single cutoff:
-   $$\arg\min_{(B, S, V)} \; \max_{i \in \{B, S, V\}} \frac{\ln(x_i / x_{i,\min})}{\ln(U_i / x_{i,\min})}.$$
+#### C. Direct comparison with compact `w = 16` / `< 4 KiB` candidates, BLINCS `0.1.0`, and SLH-DSA-B
 
-Compared with Model B, **Model A** (scale-free sum of squares of log-ratios above the achievable minimum) has the advantage that it invents **no** arbitrary upper ceilings at all — every number comes straight from the cryptographic frontier.
+| Candidate / reference scheme | Size | Sign `1T` | Sign `b3-MT` | Sign `12T` | Verify (1c) | Keygen (`1T` / `12T`) | Sign @ 2 KiB cache (`1T`) | Shape |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| **Leximin $L_\infty$ (`12t`, clean, 1 MiB cache)** | **6,088 B** | **0.84 ms** | **0.78 ms** | **0.31 ms** | **20.8 µs** | 117 / 27 ms | **2.72 ms** | `35 (15+4×5) w=8 v=42` |
+| **Leximin $L_\infty$ (uniform, zero tall tree)** | **6,844 B** | 1.48 ms | 0.93 ms | 0.51 ms | 20.9 µs | **0.3 / 0.1 ms** | **1.48 ms** | `36 (6×6) w=8 v=42` |
+| **Compact `w = 16` sweet spot (1 MiB cache)** | **4,868 B** | 1.78 ms | 1.54 ms | 0.59 ms | 19.6 µs | 171 / 41 ms | 4.62 ms | `33 (15+3×6) w=16 v=32 g=0` |
+| **Compact `w = 16` (1 MiB cache)** | **4,500 B** | 2.80 ms | 1.66 ms | 0.87 ms | 20.3 µs | 165 / 40 ms | 5.56 ms | `36 (15+3×7) w=16 v=31` |
+| **Fits in 4 KiB (1 MiB cache)** | **4,084 B** | 4.24 ms | 2.58 ms | 1.23 ms | 29.1 µs | 264 / 63 ms | 8.71 ms | `36 (15+3×7) w=32 v=25` |
+| **BLINCS `0.1.0` *(implemented, measured)*** | **3,988 B** | 16.22 ms | ~7.7 ms | ~3.8 ms | 33.3 µs | 4.4 / 1.1 ms | 16.2 ms | `36 (4×9) w=32 v=24` |
+| *SLH-DSA-BLAKE3-128s ($2^{64}$, FIPS 205)* | *7,856 B* | *121.7 ms* | — | — | *126.6 µs* | — | — | *`63 (7×9) w=16 FORS`* |
+| *SLH-DSA-BLAKE3-128f ($2^{64}$, FIPS 205)* | *17,088 B* | *5.81 ms* | — | — | *353.7 µs* | — | — | *`66 (22×3) w=16 FORS`* |
 
-### Calibrated uniform-hypertree results (`python3 tools/optimize.py`) vs. SLH-DSA-B
+### What the simplified Leximin $L_\infty$ search reveals
 
-Using our concrete Apple M6 measurements of `blake3-servil-core = "=0.10.0"` (`xmss = 11.1 + 3.8 \cdot 1024/(c + 1024)` ns/comp, `pors = 10.0 + 4.8 \cdot 2048/(t + 2048)` ns/comp, `grind = 12.6` ns/try, `verify = 18.5` ns/batched + `45` ns/scalar; predicts BLINCS `0.1.0` to within 1%: `16.33` vs. `16.22 ms` sign, `33.1` vs. `33.3 µs` verify, `4.53` vs. `4.43 ms` keygen), the full $2^{33}$ uniform-hypertree Pareto frontier (`d = 2..12`, `w = 4..256`, `sign <= 100 ms`) has **3,096** points with minima **$B_{\min} = 3{,}284\text{ B}$, $S_{\min} = 0.51\text{ ms}$, $V_{\min} = 9.6\text{ µs}$**:
+1. **Every single Leximin $L_\infty$ winner converges on the exact same family (`w = 8, v = 42`, `6.0–6.9 KiB`, `0.3–1.5 ms` sign, `20.8 µs` verify):** whether you optimize for 1 core, `blake3-servil`'s built-in `hash_many_multithreaded`, or 12-core coarse parallelism — and whether you use a 1 MiB top-tree cache (`6,088 B`, **`2.05× / 2.03× / 2.16×`** of the physical floor!) or uniform heights (`6,844 B`, `2.25× / 2.38× / 2.17×`) — every single dimension stays within **~2.1× of its theoretical physical floor**.
+2. **Versus SLH-DSA-B:** **`6,088 B`** (`15 + 4×5`) is **23% smaller** than `SLH-DSA-BLAKE3-128s`, **145× faster to sign** on 1 core (**390×** on 12 cores), and **6.1× faster to verify** — while also being **2.8× smaller**, **6.9× faster to sign on 1 core** (**18.7×** on 12 cores), and **17× faster to verify** than `SLH-DSA-BLAKE3-128f`.
+3. **Why `4,868 B` (`15 + 3×6`, `w = 16`) sits just below Leximin $L_\infty$:** spending `-1,220 B` (-20% bytes, `1.56×` floor) roughly doubles signing time (`0.31 → 0.59 ms` on 12 cores, `3.86×` floor; `0.84 → 1.78 ms` on 1 core, `6.70×` floor) while keeping verification at **`19.6 µs`** (`2.04×` floor). Under strict equal-ratio minimax (`Leximin L_inf`), `6,088 B` wins (`max ratio = 2.16×` vs. `3.86×`); if bytes carry a mild extra preference (because signatures are stored and replicated forever while signing happens once), `4,868 B` (`w = 16, v = 32, g = 0`) is the cleanest compact step down. BLINCS stays at `0.1.0` (`3,988 B`) until the final 1.0 parameter choice is locked.
 
-| Rule / reference scheme | Bytes | Sign (1 core) | Verify (1 core) | Keygen | Ratios to `(Bmin, Smin, Vmin)` | Parameters (`h d v w g S b k gf m`) |
-|---|---:|---:|---:|---:|---|---|
-| **Scale-free $L_\infty$ minimax ratio** $\max(x/x_{\min})$ | **7,440 B** | **1.24 ms** | **23.5 µs** | 0.14 ms | **(2.27×, 2.43×, 2.44×)** | `35 7 42 8 2 176 13 16 4 116` |
-| **Squared % excess** $\sum(x/x_{\min} - 1)^2$ | **7,488 B** | **1.22 ms** | **23.6 µs** | 0.14 ms | **(2.28×, 2.39×, 2.45×)** | `35 7 42 8 2 176 13 16 4 119` |
-| **Scale-free $L_2$ log-regret** $\sum(\ln(x/x_{\min}))^2$ | **9,840 B** | **1.01 ms** | **19.6 µs** | 0.11 ms | **(3.00×, 1.97×, 2.03×)** | `35 7 63 4 2 114 13 16 4 119` |
-| **Span-normalized $L_2$** | **5,928 B** | **2.89 ms** | **17.2 µs** | 0.52 ms | (1.81×, 5.64×, 1.79×) | `35 5 42 8 2 183 14 14 0 108` |
-| **Weighted $L_2$**, $w = (16, 1, 1)$ | **5,048 B** | **3.88 ms** | **24.3 µs** | 0.77 ms | (1.54×, 7.59×, 2.52×) | `35 5 31 16 4 270 14 14 0 108` |
-| **Unknown cutoffs**, max `(7,856 B, 100 ms, 1 ms)` pass prob | **4,804 B** | **5.91 ms** | **20.5 µs** | 1.49 ms | (1.46×, 11.6×, 2.13×) | `32 4 31 16 4 270 15 14 5 127` |
-| **Unknown cutoffs**, max `(7,856 B, 100 ms, 1 ms)` minimax | **4,536 B** | **5.83 ms** | **41.9 µs** | 1.24 ms | (1.38×, 11.4×, 4.34×) | `35 5 25 32 3 387 14 14 0 106` |
-| **Unknown cutoffs**, max `(5,000 B, 100 ms, 1 ms)` pass prob | **3,940 B** | **17.21 ms** | **32.3 µs** | 4.53 ms | (1.20×, 33.7×, 3.35×) | `36 4 24 32 8 382 15 11 6 100` |
-| **BLINCS `0.1.0` *(implemented, measured)*** | **3,988 B** | **16.22 ms** | **33.3 µs** | **4.43 ms** | (1.21×, 31.7×, 3.46×) | `36 4 24 32 8 372 15 11 6 103` |
-| *SLH-DSA-BLAKE3-128s* ($2^{64}$, FIPS 205, measured M6) | *7,856 B* | *121.7 ms* | *126.6 µs* | — | *(2.39×, 238×, 13.1×)* | *`h=63 d=7 w=16 (35 ch) FORS k=14 a=12`* |
-| *SLH-DSA-BLAKE3-128f* ($2^{64}$, FIPS 205, measured M6) | *17,088 B* | *5.81 ms* | *353.7 µs* | — | *(5.20×, 11.4×, 36.7×)* | *`h=66 d=22 w=16 (35 ch) FORS k=33 a=6`* |
-
-*(With `3×` multithreaded signing via `--sign-speedup 3.0`, $L_2$ log-regret shifts to `8,764 B` / 0.42 ms / 18.2 µs, span-normalized $L_2$ to `5,540 B` / 1.44 ms / 14.9 µs, and max-cutoffs `(7,856 B, 100 ms, 1 ms)` pass probability to `4,468 B` / 3.35 ms / 19.0 µs.)*
-
-### What this comparison reveals
-
-1. **Versus SLH-DSA-B's proposed parameters:** SLH-DSA-B preserves FIPS 205's exact `128s` and `128f` parameter sets (plain WOTS+ with 3 checksum chains, plain FORS with $k$ trees, $2^{64}$ signing budget) and swaps only the hash to BLAKE3. Because BLINCS trades the $2^{64}$ budget down to $2^{33}$, adopts WOTS+C and PORS+FP, and batches hashes on `blake3-servil-core`:
-   - Every candidate from **`3,988 B`** to **`7,440 B`** strictly beats `SLH-DSA-BLAKE3-128s` on **all three** dimensions simultaneously (smaller signatures, 7–98× faster signing, 3.8–6.2× faster verification).
-   - The **`4,804 B`**, **`5,048 B`**, and **`7,440 B`** candidates also match or beat `SLH-DSA-BLAKE3-128f`'s 5.81 ms signing time while being **2.3–3.6× smaller** and **15–17× faster to verify**.
-2. **Why equal-ratio rules pick ~7.4–9.8 KB while `0.1.0` sits at 3,988 B:** the hash-based frontier is highly asymmetric — signature size only spans **4.6×** across the full search space (`3.3–15.1 KB`), whereas signing spans **190×** (`0.51–98 ms`). Treating a 2× worsening in size as equally costly as a 2× worsening in signing time lands at **`7,440 B` (1.24 ms, 23.5 µs)** under $L_\infty$/squared-excess or **`9,840 B` (1.01 ms, 19.6 µs)** under $L_2$ log-regret. Staying under 4 KiB (`3,988 B`) corresponds to weighting size roughly 64–100× heavier than signing in squared log-regret (or assuming a 5 KiB size ceiling), while the intermediate **`4,804–5,048 B`** sets sit at `w_B ≈ 16` or the SLH-DSA-128s ceiling `7,856 B` (+20–26% bytes over `0.1.0` for **3–4× faster signing** and **1.4–1.6× faster verification**).
-
-### Re-running the selection WITH Project 11's latest ideas: irregular hypertrees, top-tree caching, and 1-shot rebuild costs
-
-Prompted by Conor Deegan and Project 11's [SPHINCS-G](https://research.projecteleven.com/articles/raising-sphincs-lifetime-budgets) and [SPHINCS+ Parameter Explorer](https://research.projecteleven.com/articles/sphincs-parameter-explorer-companion-guide) work, we re-ran the full parameter search allowing **general irregular hypertrees** — any top-tree height `h_top <= 16` and maximally balanced lower layers (by convexity of $2^x$, the $d - 1$ uncached lower layers should always differ in height by at most 1).
-
-#### What happens for a 1-shot signer (and what rebuilding the cache actually costs)
-
-A critical question for any irregular hypertree with a taller cached top tree (`h_top > h_low`) is how a **1-shot signer** (such as `git commit`, a CI job, or a hardware device) behaves:
-
-- **If the 1-shot signer has NO cache file on disk (or on a cold cache miss):** it **cannot** skip building the top tree. Producing the top layer's Merkle authentication path requires sibling hashes derived from all $2^{h_{\text{top}}}$ leaves, so an uncached 1-shot signer must compute the entire top tree from scratch on every signature (`uncached 1-shot time = cached sign time + top-tree rebuild time`).
-- **If the 1-shot signer keeps an optional stateless cache file on disk:** it does **not** rebuild the tree — and does not even need to read the entire cache file. Seeking just the $h_{\text{top}}$ sibling nodes along its authentication path reads only **$16 \cdot h_{\text{top}}$ bytes** (160–240 bytes!), taking **~0.01–0.02 ms** from warm OS page cache or **~0.05–0.3 ms** cold on NVMe SSD (roughly 1,000×–4,000× faster than rebuilding `h_top = 15`). Because the cache is purely deterministic from the 32-byte signing seed, losing or corrupting it never threatens security — the signer simply rebuilds it.
-- **Continuous partial caching (caching *less* or *more* with zero wire change):** because the top layer is a plain Merkle tree, an implementation can cache only the top $c$ levels (shrinking memory by $2^{h_{\text{top}} - c}$ and rebuilding only one $2^{h_{\text{top}} - c}$-leaf subtree per signature), or cache even *more* (for example, all $2^{15}$ height-6 layer-2 trees in `15 + 3×6` take 64 MiB and drop signing from `1.90 ms` to `~1.4 ms`). For example, on `4,868 B` (`h = 33 (15 + 3×6)`, `w = 16, v = 32, g = 0`), single-core signing scales smoothly across every cache budget: **1.90 ms** (1 MiB full top tree) → **2.11 ms** (32 KiB, top 10 levels) → **2.69 ms** (8 KiB, top 8 levels) → **4.92 ms** (2 KiB, top 6 levels) → **192 ms** (0 B cold, or ~59 ms on 8 cores).
-- **Exact rebuild cost on Apple M6 (`w = 16`, `v = 31..32`):**
-  - `h_top = 7` (128 leaves, **4 KiB** cache): **0.8 ms** (1 core) / **0.2 ms** (8 cores) — negligible even uncached.
-  - `h_top = 9` (512 leaves, **16 KiB** cache): **2.9–4.4 ms** (1 core) / **0.9–1.3 ms** (8 cores) — negligible even uncached.
-  - `h_top = 10` (1,024 leaves, **32 KiB** cache): **5.8 ms** (1 core) / **1.7 ms** (8 cores).
-  - `h_top = 12` (4,096 leaves, **128 KiB** cache): **23.8 ms** (1 core) / **7.1 ms** (8 cores).
-  - `h_top = 14` (16,384 leaves, **512 KiB** cache): **95.0 ms** (1 core) / **28.4 ms** (8 cores).
-  - `h_top = 15` (32,768 leaves, **1 MiB** cache): **190 ms** (1 core) / **57 ms** (8 cores).
-
-#### Unconstrained 4-axis minimax vs. cached-signer 3-axis sweep (`python3 tools/optimize.py --four-axis` and `--max-top-height 15`)
-
-Evaluating all **1,114,160** 4-D non-dominated candidates across uniform and irregular hypertrees (`h_top <= 16`, ~4.5 s in `tools/optimize.py --four-axis`) yields a sharp structural insight:
-
-1. **When uncached 1-shot signing is included as a 4th axis** `(bytes, cached sign, uncached 1-shot sign, verify)`, **no arbitrary cap on `h_top` is needed — the optimizer automatically stops at `h_top = 6..8` (`2–8 KiB` cache, `0.2–1.5 ms` rebuild)!** Doubling `h_top` past 10 doubles uncached 1-shot cost exponentially while trimming cached signing only modestly.
-2. **When cached signing dominates (daemons/servers, or 1-shot signers with an optional stateless disk cache)**, a taller top tree shrinks signature size, cached signing time, and verification time **all at once** (`--max-top-height 15` = 1 MiB cache):
-   - $L_\infty$ minimax ratio drops from `7,440 B / 1.24 ms / 23.5 µs` to **`6,844 B / 0.70 ms / 20.9 µs`** (`h=36 (15+5+4×4)`, rebuild `127 ms` 1-core / `38 ms` 8-core).
-   - Weighted $L_2$ `w = (16, 1, 1)` drops from `5,048 B / 3.88 ms / 24.3 µs` to **`4,868 B / 1.90 ms / 19.6 µs`** (`h=33 (15+3×6)`, rebuild `190 ms` 1-core / `57 ms` 8-core).
-   - Compact unknown-cutoffs (`max 7,856 B`) drops from `4,804 B / 5.91 ms / 20.5 µs` to **`4,548 B / 2.71 ms / 20.3 µs`** (`h=35 (15+2×7+6)`, rebuild `184 ms` 1-core / `55 ms` 8-core).
-   - Even staying **under 4 KiB (`4,084 B`)**, just `h_top = 10` (**32 KiB** cache, `9.3 ms` rebuild) gives `h=34 (10+3×8)`: **`10.28 ms` cached sign, `19.6 ms` uncached 1-shot, `29.0 µs` verify** — faster than `0.1.0` on **all three** timing metrics (cached, 1-shot, and verify) while still fitting inside a 4 KiB page!
-
-#### Head-to-head final candidates table (calibrated Apple M6, 1 core, `2^33` budget, `>= 128` bits)
-
-| Candidate family | Size | Cached sign | Uncached 1-shot | Verify | Rebuild (1c / 8c) | Cache size | Shape & params |
-|---|---:|---:|---:|---:|---:|---:|---|
-| **A. Current `0.1.0` draft *(uniform, <4 KiB)*** | **3,988 B** | 16.22 ms | 20.7 ms | 33.3 µs | 4.4 / 1.3 ms | 16 KiB | `36 (4×9) w=32 v=24` |
-| **B. Nearly-uniform <4 KiB *(Project 11 irregular)*** | **4,084 B** | 10.28 ms | 19.6 ms | 29.0 µs | 9.3 / 2.8 ms | 32 KiB | `34 (10+3×8) w=32 v=25` |
-| **C. Uniform minimax sweet spot *(zero-cache friendly)*** | **5,048 B** | **3.88 ms** | **4.6 ms** | **24.3 µs** | **0.8 / 0.2 ms** | **4 KiB** | `35 (5×7) w=16 v=31` |
-| **D. 4-axis balanced irregular *(8 KiB cache)*** | **5,304 B** | **2.77 ms** | **4.3 ms** | **24.6 µs** | **1.5 / 0.4 ms** | **8 KiB** | `33 (8+7+3×6) w=16 v=31` |
-| **E. Medium irregular cache *(128 KiB cache)*** | **5,240 B** | **1.89 ms** | 25.7 ms | **23.3 µs** | 23.8 / 7.1 ms | 128 KiB | `35 (12+3×6+5) w=16 v=32` |
-| **F. Tall irregular cache *(1 MiB cache, P11 style)*** | **4,868 B** | **1.90 ms** | 191.8 ms | **19.6 µs** | 190 / 57 ms | 1 MiB | `33 (15+3×6) w=16 v=32` |
-| **G. Uniform fast / span-norm $L_2$ *(w=8)*** | **5,928 B** | **2.89 ms** | **3.4 ms** | **17.2 µs** | **0.5 / 0.2 ms** | **4 KiB** | `35 (5×7) w=8 v=42` |
-| **H. Uniform $L_\infty$ minimax ratio *(w=8)*** | **7,440 B** | **1.24 ms** | **1.4 ms** | **23.5 µs** | **0.1 / 0.04 ms** | **1 KiB** | `35 (7×5) w=8 v=42` |
-
-All eight remain strictly smaller, faster to sign (cached), and faster to verify than `SLH-DSA-BLAKE3-128s` (`7,856 B`, `121.7 ms`, `126.6 µs`). BLINCS remains at `0.1.0` (`3,988 B`) while the final pre-1.0 parameter choice is settled.
-
-### Why `m = 103` is not signing-time-bottlenecked in BLINCS (`tools/optimize.py --grinding-sweep`)
+### Why `m = 103` is not signing-time-bottlenecked in BLINCS `0.1.0` (`tools/optimize.py --grinding-sweep`)
 
 In isolation, a PORS+FP merged-set cap of `m = 103` looks aggressive compared to `m = 112` (+144 bytes, 34.6× fewer `PICK` tries). With batched BLAKE3-Servil (`12.6 ns/try` at `GRIND = 2048`), however, `PICK` grinding is only **1.7%** of BLINCS `0.1.0`'s signing time (80% is in the three XMSS hypertree builds and ~9% in the four WOTS+C counter searches):
 
@@ -203,8 +159,8 @@ This table records every hash-based signature technique we evaluated — both th
 
 9. **Irregular hypertrees with a taller cached top tree (`h_top > h_low`)** (Alessandro Baiocchi, Matteo Vena, Matteo Vicari, and Conor Deegan at Project 11: [Companion Guide](https://research.projecteleven.com/articles/sphincs-parameter-explorer-companion-guide), [Raising SPHINCS-like lifetime budgets](https://research.projecteleven.com/articles/raising-sphincs-lifetime-budgets); and Zhen Qin, Siwei Sun, and Fangyu Zheng, ASIACRYPT 2026, [ePrint 2025/2236](https://eprint.iacr.org/2025/2236)):
    - Earlier (without considering a taller cached top tree), irregular heights saved only 0–100 bytes and added complexity for zero gain at 3,988 B.
-   - **Re-evaluated WITH Project 11's top-tree and partial-tree caching insight (§3 above):** putting extra height into the cached top tree improves bytes, cached signing, and verification **simultaneously** (for example `4,868 B / 1.90 ms / 19.6 µs` at `h_top = 15`, or `4,084 B / 4.66 ms / 29.1 µs` at `h_top = 15`), while implementations can smoothly trade cache size from `0 B` through `2 KiB / 8 KiB / 32 KiB / 1 MiB / 65 MiB` with zero wire-format change. Kept open as Candidates B, D, E, F in the Head-to-Head table above.
-10. **Optimizing parameters for signing time rather than minimum bytes** (Conor Deegan's review note): moving from `3,988 B` (`w = 32`) up by ~900–1,060 bytes to `4,868–5,048 B` (`w = 16`) cuts signing time 4–8× and verification 1.4–1.7× while staying 36–38% smaller than `SLH-DSA-128s`. Kept open as Candidates C–F above.
+   - **Re-evaluated WITH Project 11's top-tree and partial-tree caching insight (§3 above):** putting extra height into the cached top tree improves bytes, cached signing, and verification **simultaneously** (for example `6,088 B / 0.84 ms (1T) / 0.31 ms (12T) / 20.8 µs` under Leximin $L_\infty$, or `4,868 B / 1.78 ms (1T) / 0.59 ms (12T) / 19.6 µs` compact at `h_top = 15`), while implementations can smoothly trade cache size from `0 B` through `2 KiB / 8 KiB / 32 KiB / 1 MiB / 65 MiB` with zero wire-format change.
+10. **Optimizing parameters for signing time rather than minimum bytes** (Conor Deegan's review note): moving from `3,988 B` (`w = 32`) up to `6,088 B` (`w = 8`, Leximin $L_\infty$) or `4,868 B` (`w = 16`, compact) cuts single-core signing time **9×–19×** and verification **1.6×** while staying 23–38% smaller than `SLH-DSA-128s` (§3 Table C).
 11. **Optional coarse leaf-parallel multi-core signing** (Conor Deegan's implementation note; measured in [`BENCHMARKS.md`](BENCHMARKS.md) §3): splitting each XMSS tree's leaves across 8 threads speeds up tree building **3.35×** (`4.42 -> 1.32 ms` on M6) using `blake3-servil-core` directly with zero per-step barriers and zero wire-format change. Can be added as an optional opt-in method/feature without complicating the zero-thread default core.
 
 ### Declined (and why)
