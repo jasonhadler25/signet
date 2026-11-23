@@ -33,6 +33,11 @@ jobs:
           rm /tmp/nextest.tar.gz
           cargo nextest --version
 
+      - name: Fetch crates and verify Cargo.lock hashsets (BLAKE3 + SHA-256) before building
+        run: |
+          cargo fetch --locked
+          python3 tools/cargo_lock_hashsets.py
+
       - name: Format and lint
         run: |
           cargo fmt -- --check

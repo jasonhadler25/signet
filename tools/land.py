@@ -84,6 +84,8 @@ def main():
     check_vectors_and_python()
 
     if "--skip-rust" not in args:
+        run("cargo fetch", ["cargo", "fetch", "--locked"])
+        run("Cargo.lock hashsets (BLAKE3 + SHA-256)", [sys.executable, "tools/cargo_lock_hashsets.py"])
         run("rustfmt", ["cargo", "fmt", "--", "--check"])
         run("clippy", ["cargo", "clippy", "--all-targets", "--locked", "--", "-D", "warnings"])
         run("nextest", ["cargo", "nextest", "run", "--locked"])
