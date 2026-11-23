@@ -40,40 +40,68 @@ Changing the budget moves signature size by roughly **7% per factor of 8** in si
 
 ---
 
-## 3. The "minimax" strategy for choosing parameters
+## 3. Quantitative unknown-thresholds model ("minimax")
 
-Stateless hash-based signatures trade off three competing bad dimensions:
+Stateless hash-based signatures trade off three competing costs:
 
-1. **Signature size** (bytes in packets, logs, Git commits, certificates, transactions),
-2. **Signing time** (latency and throughput per core), and
-3. **Verification time** (latency and throughput per core).
+1. **Signature size $B$** (bytes in packets, logs, Git commits, certificates, transactions),
+2. **Signing time $S$** (latency and throughput per core), and
+3. **Verification time $V$** (latency and throughput per core).
 
-Any of those three bad dimensions may have a hard threshold beyond which it excludes the scheme from a real use case — including uses that have not been invented yet (fitting inside a 4 KiB page or record, sustaining 10 signatures/second with headroom on one core, verifying tens of thousands of signatures/second on a server or client). Because we cannot know every future use case's threshold in advance, our strategy is **minimax**:
+Any of those three costs may have a hard threshold beyond which it disqualifies the scheme from some use case — including uses that have not been invented yet. Rather than picking parameters by eye, we formalize this as a reproducible decision model implemented in [`tools/optimize.py`](tools/optimize.py) (standard-library Python, ~1.5 s to run, exact integer retry DP).
 
-> Reduce the extent of every bad dimension as far as possible whenever doing so costs only a little in the other dimensions; refuse the extreme corners of the Pareto frontier where one dimension blows up to squeeze out the last few percent in another.
+### Model: independent log-uniform unknown thresholds
 
-### The measured Pareto ladder ($2^{33}$ signatures, $\ge 128$ bits, plain shapes, single core on Apple M6)
+Suppose an unknown future application $U$ can adopt a parameter set $(B, S, V)$ if and only if all three costs fall below its unknown thresholds $(T_B, T_S, T_V)$:
 
-Searching the full parameter space of WOTS+C + PORS+FP with measured single-core BLAKE3-Servil costs yields this frontier (all four hypertree trees built uncached, as in the parameter-search workload):
+$$B \le T_B \quad \land \quad S \le T_S \quad \land \quad V \le T_V.$$
 
-| Signature | Sign (mean, uncached) | Verify (batched) | Extra bytes to halve sign time | Parameters (`h d v g S b k gf m`) |
-|---:|---:|---:|---:|---|
-| 3,380 B | 71.0 ms | 98 µs | — | `36 4 17 9 1080 17 9 5 95` |
-| 3,700 B | 33.2 ms | 50 µs | +9.5% | `36 4 21 2 849 17 9 5 99` |
-| **3,988 B** | **18.7 ms** *(16.2 ms cached)* | **42 µs** *(33 µs on-core)* | **+7.8%** | **`36 4 24 8 372 15 11 6 103`** |
-| 4,536 B | 7.6 ms | 42 µs | +13.7% | `35 5 25 3 488 15 12 2 108` |
-| 4,984 B | 5.0 ms | 36 µs | +16.9% | `35 5 31 4 233 15 12 2 106` |
-| 5,644 B | 2.5 ms | 42 µs | +13.2% | `36 6 31 4 233 13 15 4 112` |
-| 7,188 B | 1.4 ms | 57 µs | +33.0% | `32 8 31 4 233 13 20 8 145` |
+When a positive threshold's scale is unknown, the scale-invariant (Jeffreys) uninformative prior is **log-uniform**: $\ln T_i \sim \mathrm{Uniform}[\ln L_i, \ln U_i]$, where $U_i$ is the upper usability ceiling past which a scheme is too expensive to consider. For any $x_i \in [L_i, U_i]$, the probability of qualifying in dimension $i$ is $\Pr[T_i \ge x_i] = \ln(U_i / x_i) / \ln(U_i / L_i)$.
 
-*(For reference, plain SPHINCS+ at the same $2^{33}$ budget and $\le 19$ ms signing time requires 5,008 B with 733 µs verification or 5,248 B with 57 µs verification.)*
+Two natural selection rules follow directly:
 
-Why **3,988 bytes** sits at the minimax knee:
+1. **Maximum joint survival probability (Nash bargaining):**
+   $$\arg\max_{(B, S, V)} \Pr[B \le T_B \land S \le T_S \land V \le T_V] = \arg\max_{(B, S, V)} \; \ln\!\left(\frac{U_B}{B}\right) \cdot \ln\!\left(\frac{U_S}{S}\right) \cdot \ln\!\left(\frac{U_V}{V}\right).$$
+   Remarkably, **all three lower bounds $L_i$ cancel out identically** (they enter only as constant denominators) and the rule is completely unit-invariant. Only the upper ceilings $(U_B, U_S, U_V)$ enter. Its first-order optimality condition is
+   $$\frac{dB / B}{\ln(U_B / B)} + \frac{dS / S}{\ln(U_S / S)} + \frac{dV / V}{\ln(U_V / V)} = 0,$$
+   which automatically pays more to shrink whichever cost is closest (in relative headroom) to its ceiling.
 
-- **Under 4,096 bytes:** fits inside a single 4 KiB page/block with 108 bytes to spare.
-- **Fast signing with headroom:** 16.2 ms on one M6 core (~61 signatures/second, over $6\times$ headroom above 10/s) and tight tail latency (99.9% within 22.1 ms even uncached). Going one rung smaller (3,700 B) saves only 7% in size while increasing signing time by 78% and raising worst-case search variance.
-- **Fast verification:** 33 µs on one M6 core (~30,000 verifications/second), achieved at only 0–3% size cost over unrestricted verification time.
-- **Balanced cost of going faster:** below 3,988 B, halving signing time costs ~14–33% more bytes per halving and crosses 4 KiB.
+2. **Minimax conditional exclusion risk:**
+   Conditioning on $T_i \in [x_{i,\min}, U_i]$ (use cases that at least one $2^{33}$ scheme on the frontier can serve), the exclusion risk in dimension $i$ is $e_i(x_i) = \ln(x_i / x_{i,\min}) / \ln(U_i / x_{i,\min})$. Minimizing the worst-case risk across all three dimensions gives:
+   $$\arg\min_{(B, S, V)} \; \max\bigl(e_B(B),\, e_S(S),\, e_V(V)\bigr).$$
+
+### What `tools/optimize.py` produces (Apple M6 single-core cached-top-tree model, $2^{33}$ sigs, $\ge 128$ bits)
+
+Running `python3 tools/optimize.py` evaluates exact integer retry counts and builds the 2,115-point plain-shape Pareto frontier in ~1.5 seconds:
+
+| Ceilings $(U_B, U_S, U_V)$ | Rule | Winner (`bytes`, `sign`, `verify`, `keygen`) | Parameters (`h d v w g S b k gf m`) |
+|---|---|---|---|
+| `(7,856 B [SLH-DSA-128s], 100 ms [10/s], 1,000 µs)` | Max survival | **4,804 B**, 5.77 ms, 20.1 µs, kg 1.42 ms | `32 4 31 16 4 270 15 14 5 127` |
+| `(7,856 B [SLH-DSA-128s], 100 ms [10/s], 1,000 µs)` | Minimax risk | **4,536 B**, 5.43 ms, 40.9 µs, kg 1.14 ms | `35 5 25 32 3 387 14 14 0 106` |
+| `(7,856 B, 100 ms, 127 µs [SLH-DSA-B-128s])` | Max survival | **4,804 B**, 6.11 ms, 18.8 µs, kg 1.42 ms | `32 4 31 16 4 287 15 14 5 127` |
+| `(7,856 B, 100 ms, 127 µs [SLH-DSA-B-128s])` | Minimax risk | **4,740 B**, 6.31 ms, 22.2 µs, kg 1.38 ms | `32 4 30 16 8 225 15 14 5 127` |
+| `(5,000 B [compact], 100 ms, 1,000 µs)` | Max survival | **3,940 B**, 16.81 ms, 31.5 µs, kg 4.37 ms | `36 4 24 32 8 382 15 11 6 100` |
+| Zero-parameter frontier `[3,284..8,020 B, ...]` | Minimax risk | **4,616 B**, 5.74 ms, 31.9 µs, kg 1.14 ms | `35 5 25 32 3 488 14 14 0 111` |
+| Current draft BLINCS `0.1.0` *(for comparison)* | — | **3,988 B**, 16.22 ms *(meas.)*, 33.3 µs *(meas.)*, kg 4.43 ms | `36 4 24 32 8 372 15 11 6 103` |
+
+*(With `3×` multithreaded signing, `--sign-speedup 3.0`, the `(7,856 B, 100 ms, 1,000 µs)` max-survival winner shifts down to `4,468 B` / 3.27 ms / 18.5 µs because extra signing headroom shifts marginal value toward smaller signatures.)*
+
+**Honest note on `0.1.0`'s 3,988-byte set:** our initial `0.1.0` parameters (`3,988 B`, 16.2 ms sign, 33.3 µs verify) were chosen to stay under a single 4 KiB page (4,096 B) while keeping > 6× headroom above 10 signatures/second, which corresponds quantitatively to a compact size ceiling around $U_B \approx 5{,}000$ B (under `U = (5,000 B, 100 ms, 1,000 µs)`, `3,988 B` achieves 97.3% of the optimal survival score). Under the broader FIPS 205 ceiling `U = (7,856 B, 100 ms, 1,000 µs)` — or zero-parameter frontier log-minimax — the quantitative model prefers the **`4,536–4,804 B`** neighborhood (+14–20% bytes for **~3× faster signing** and **~1.6× faster verification**). Because BLINCS is pre-1.0, both options are kept explicitly visible in `tools/optimize.py`.
+
+### Why `m = 103` is not signing-time-bottlenecked in BLINCS (`tools/optimize.py --grinding-sweep`)
+
+In isolation, a PORS+FP merged-set cap of `m = 103` looks aggressive compared to `m = 112` (+144 bytes, 34.6× fewer `PICK` tries). With batched BLAKE3-Servil (`12.6 ns/try` at `GRIND = 2048`), however, `PICK` grinding is only **1.7%** of BLINCS's signing time (80% is in the three XMSS hypertree builds and ~9% in the four WOTS+C counter searches):
+
+| `m` | Signature bytes | Mean `PICK` tries | Reduction vs. `m = 103` | `PICK` time (M6) | Share of total sign time |
+|---:|---:|---:|---:|---:|---:|
+| 95 | 3,860 B | 1,114,019 | — | 14.04 ms | 46.8% |
+| 98 | 3,908 B | 236,222 | — | 2.98 ms | 15.7% |
+| 100 | 3,940 B | 88,058 | — | 1.11 ms | 6.5% |
+| **103** | **3,988 B** | **21,642** | **1.0×** | **0.27 ms** | **1.7%** |
+| 108 | 4,068 B | 2,631 | 8.2× | 0.03 ms | 0.2% |
+| 112 | 4,132 B | 626 | 34.6× | 0.008 ms | 0.05% |
+
+Pushing `m` below 100 blows up signing time and tail latency; relaxing `m` from 103 to 112 buys only 0.26 ms (-1.6% total signing time) at the cost of +144 bytes (crossing 4,096 B). On a slower scalar hash (such as SHAKE256 or unbatched SHA-256), `m = 103` would cost noticeably more and `tools/optimize.py --ns-grind ...` shifts `m` upward automatically.
 
 ---
 

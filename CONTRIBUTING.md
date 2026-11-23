@@ -7,6 +7,7 @@ BLINCS is a stateless hash-based signature scheme on BLAKE3 implemented in Rust 
 ```text
 SPEC.md                 Normative byte-level specification
 DESIGN.md               Rationale for every design decision (including minimax)
+BENCHMARKS.md           SLH-DSA-B reproduction, BLINCS comparison, clocks & MT
 QUALITY.md              Verification layers, reproduction commands, and known gaps
 SECURITY.md             Threat model, operational boundaries, and reporting
 src/
@@ -27,6 +28,7 @@ test_vectors/           Checked-in reference signature (SHA-256 + BLAKE3 recorde
 tools/
   require_nextest.rs    Sentinel test failing plain `cargo test`
   controls.py           16 planted-fault controls
+  optimize.py           Reproducible parameter optimizer (unknown-thresholds model)
   mutants/              cargo-mutants runner and known-survivors list
   land.py               Exact-commit landing gate
 bench/                  Standalone benchmark crate using bench-hashes' `clocks`

@@ -11,7 +11,8 @@ Stateless hash-based signatures built on [BLAKE3](https://github.com/servil-soft
 ## Documents
 
 - [`SPEC.md`](SPEC.md) — normative byte-level specification
-- [`DESIGN.md`](DESIGN.md) — rationale for every design choice (including the minimax parameter strategy, crash-only lifecycle, and no-`fsync` analysis)
+- [`DESIGN.md`](DESIGN.md) — rationale for every design choice (including the quantitative unknown-thresholds "minimax" model and `tools/optimize.py`)
+- [`BENCHMARKS.md`](BENCHMARKS.md) — Project 11 SLH-DSA-B reproduction, BLINCS comparison, `clocks` wall/cycle tables, and multithreading results
 - [`QUALITY.md`](QUALITY.md) — verification layers, planted-fault controls, mutation testing, and known gaps
 - [`SECURITY.md`](SECURITY.md) — operational boundaries, threat model, and vulnerability reporting
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — repository layout and landing gates

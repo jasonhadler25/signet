@@ -183,7 +183,7 @@ g = u256_le(Keyed(K_pub, tweak(PICK, 0, 0, 0, 0, 0) || D || u32_le(counter)))
 For sorted distinct `indices` in a perfect binary tree of height `FEW_HEIGHT = 15`:
 
 - Set `known = indices`.
-- For `height` in `0..15`:
+- For `height` in `0..15` (heights 0 through 14; height 15 is the root):
   - Initialize `parents = []` and `i = 0`.
   - While `i < len(known)`:
     - Let `index = known[i]`.

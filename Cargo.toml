@@ -5,7 +5,7 @@ edition = "2024"
 description = "Stateless hash-based signatures on BLAKE3 (WOTS+C + PORS+FP, 3,988-byte signatures, salted streaming content hash)"
 license = "MIT OR Apache-2.0 OR TGPPL-1.0" # OR BOSL-1.0, see LICENSE-BOSL.txt
 readme = "README.md"
-include = ["/src", "/reference", "/test_vectors", "/SPEC.md", "/DESIGN.md", "/README.md", "/QUALITY.md", "/SECURITY.md", "/CHANGELOG.md", "/LICENSE-*", "/tools/require_nextest.rs"]
+include = ["/src", "/reference", "/test_vectors", "/SPEC.md", "/DESIGN.md", "/BENCHMARKS.md", "/README.md", "/QUALITY.md", "/SECURITY.md", "/CHANGELOG.md", "/LICENSE-*", "/tools/require_nextest.rs"]
 
 [dependencies]
 blake3-servil-core = "=0.10.0"

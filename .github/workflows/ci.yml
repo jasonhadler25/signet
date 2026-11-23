@@ -43,9 +43,10 @@ jobs:
           cargo nextest run --locked
           cargo test --doc --locked
 
-      - name: Python reference and vector digests (SHA-256 + BLAKE3)
+      - name: Python reference, optimizer self-check, and vector digests (SHA-256 + BLAKE3)
         run: |
           python3 reference/blake3.py
+          python3 tools/optimize.py --check
           python3 tools/land.py --skip-clean-check --skip-rust
 
       - name: Planted-fault controls

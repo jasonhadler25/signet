@@ -80,6 +80,7 @@ def main():
         print(f"Landing gate on exact commit: {sha}")
 
     run("BLAKE3 official test vectors (Python)", [sys.executable, "reference/blake3.py"])
+    run("Parameter optimizer self-check", [sys.executable, "tools/optimize.py", "--check"])
     check_vectors_and_python()
 
     if "--skip-rust" not in args:
