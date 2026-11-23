@@ -51,9 +51,16 @@ Measured on a quiet machine (`clocks::load` reported zero busy windows, 0% E-cor
 | `sign` 16 MiB | 20.96 ms | 92.66M | 209.54M | 2.26 | 4,422 MHz | 800 MB/s |
 | `Randomness::initialize` | 23.1 µs | 104.6k | 452.7k | 4.33 | 4,536 MHz | — |
 
-## 3. Multithreading experiment (`blake3-servil = "=0.10.0"`)
+## 3. `blake3-servil` API audit and multithreading experiment (`0.10.0`)
 
-Tested on a quiet Apple M6 using `clocks` (wall time and process CPU time together) on BLINCS's exact batch and chunk shapes:
+We audited every public API of both `blake3-servil-core = "=0.10.0"` (`convenience::{hash, hash_with, hash_xof, Hasher}`, `throughput::{hash, hash_many, hash_each, update_each, finalize_each, Batch, Packed, Block, TreeHasher, Cv, LastCv}`) and `blake3-servil = "=0.10.0"` (`initialize_multithreaded`, `throughput::{hash_multithreaded, update_multithreaded, hash_many_multithreaded, hash_each_multithreaded, Pipeline}`):
+
+- **Best single-threaded APIs for BLINCS (`blake3-servil-core`):**
+  - `throughput::hash_many` with `Batch` + `Prepared::part` beats `Packed<16|32>` on Apple M6 (`11.2` vs. `19.5 ns/op` including copy-back, because `Packed` currently expands into stack blocks internally).
+  - `TreeHasher::new(Mode::Keyed(&public)).on_this_core()` beats default SME2 dispatch by **1.8×** on verification's small batches (`n <= 24`, keeping the P-core at ~4.6–4.8 GHz instead of downclocking into SME2).
+  - `throughput::hash` (on aligned `Vec<Block>`) for streaming chunks and `TreeHasher::hash` for unaligned `&[u8]` slices.
+  - `hash_each` / `update_each` / `Pipeline` target heterogeneous lengths or independent parallel streams, not BLINCS's uniform tree layers or sequentially chained content chunks.
+- **Multithreading (`blake3-servil`, `MIN_SPLIT_LEN = 512 KiB`):** tested on a quiet Apple M6 using `clocks` (wall time and process CPU time together) on BLINCS's exact batch and chunk shapes:
 
 | Workload | Single-threaded (`blake3-servil-core`) | Multithreaded | CPU used | Speedup |
 |---|---:|---:|---:|---:|
@@ -65,7 +72,22 @@ Tested on a quiet Apple M6 using `clocks` (wall time and process CPU time togeth
 
 Observations:
 
-1. Calling `blake3_servil::throughput::hash_many_multithreaded` inside each of the 31 sequential chain steps speeds up an XMSS tree by only **1.46×** (`4.42 → 3.02 ms`), because 31 pool barriers plus the single-threaded 12,288-element copy-back loop dominate.
-2. Parallelizing across the **512 independent leaves** of an XMSS tree (so each thread runs all 31 steps + copy-back + `ONE_TIME_KEY` with zero barriers, while `blake3-servil-core`'s `Sme2Turn` lets one thread use SME2 and the rest run NEON concurrently) reaches **1.32 ms per XMSS tree** (**3.35× faster**) even with fresh thread spawns — projecting **~4.5–5 ms total signing** on 8 cores.
-3. For 256 KiB content chunks, `blake3_servil::throughput::hash_multithreaded` stays single-threaded (its multithreading threshold is above 256 KiB; at 1 MiB chunks it speeds up 100 MiB two-pass hashing from 27.6 ms to 18.5 ms).
+1. `blake3-servil` enforces `MIN_SPLIT_LEN = 512 KiB` for `hash_multithreaded`, `update_multithreaded`, `hash_many_multithreaded`, and `hash_each_multithreaded`:
+   - Below 512 KiB total batch bytes (`8,192` one-block messages), `hash_many_multithreaded` runs single-threaded. Thus it engages on BLINCS `0.1.0`'s large trees (`12,288` chains = 768 KiB; `32,768` leaves = 2 MiB) and on `GRIND >= 8192`, but stays single-threaded on smaller candidate trees (such as `hp = 5, v = 42` = 86 KiB).
+   - On 256 KiB content chunks, `hash_multithreaded` stays single-threaded (31.11 vs. 31.11 ms); at 1 MiB chunks it drops 100 MiB two-pass hashing from 27.6 to 18.5 ms (1.49×).
+2. Calling `hash_many_multithreaded` inside each of the 31 sequential chain steps speeds up an XMSS tree by only **1.46×** (`4.42 → 3.02 ms`), because 31 pool barriers plus the single-threaded 12,288-element copy-back loop dominate.
+3. Parallelizing across the **512 independent leaves** of an XMSS tree (so each thread runs all 31 steps + copy-back + `ONE_TIME_KEY` with zero barriers, while `blake3-servil-core`'s `Sme2Turn` lets one thread use SME2 and the rest run NEON concurrently) reaches **1.32 ms per XMSS tree** (**3.35× faster**) even with fresh thread spawns — projecting **~4.5–5 ms total signing** on 8 cores.
 4. The core `blincs` crate stays single-threaded (`blake3-servil-core`, zero threads, zero locks); coarse leaf parallelism belongs in an optional feature or companion multithreaded API if needed.
+
+## 4. Measured calibration of candidate parameter sets (Apple M6, 1 core, cached top tree)
+
+Direct `clocks` measurements of `blake3-servil-core 0.10.0` workloads across candidate shapes (confirming `tools/optimize.py`'s calibrated cost model):
+
+| Candidate | Bytes | Keygen (1 tree) | Sign (cached top) | Verify (on-core batched) |
+|---|---:|---:|---:|---:|
+| BLINCS `0.1.0` (`h=36 d=4 v=24 w=32`) | 3,988 B | 4.46 ms | 16.13 ms *(real crate: 16.22 ms)* | 29.1 µs *(real crate: 33.3 µs)* |
+| `U=7856` minimax (`h=35 d=5 v=25 w=32`) | 4,536 B | 1.26 ms | 5.91 ms | 36.7 µs |
+| `U=7856` max survival (`h=32 d=4 v=31 w=16`) | 4,804 B | 1.47 ms | 5.83 ms | 18.2 µs |
+| Span-normalized $L_2$ (`h=35 d=5 v=31 w=16`) | 5,160 B | 0.77 ms | 3.57 ms | 21.7 µs |
+| Pure $L_\infty$ / squared excess (`h=35 d=7 v=42 w=8`) | 7,440–7,632 B | 0.14 ms | 1.10–1.24 ms | 21.4–23.5 µs |
+| Plain `B*S*V` (`h=32 d=8 v=42 w=8`) | 9,428 B | 0.07 ms | 0.72 ms | 28.6 µs |

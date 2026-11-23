@@ -40,7 +40,7 @@ Changing the budget moves signature size by roughly **7% per factor of 8** in si
 
 ---
 
-## 3. Quantitative unknown-thresholds model ("minimax")
+## 3. Quantitative tradeoff models ("minimax" and scale-free log-regret)
 
 Stateless hash-based signatures trade off three competing costs:
 
@@ -48,49 +48,71 @@ Stateless hash-based signatures trade off three competing costs:
 2. **Signing time $S$** (latency and throughput per core), and
 3. **Verification time $V$** (latency and throughput per core).
 
-Any of those three costs may have a hard threshold beyond which it disqualifies the scheme from some use case — including uses that have not been invented yet. Rather than picking parameters by eye, we formalize this as a reproducible decision model implemented in [`tools/optimize.py`](tools/optimize.py) (standard-library Python, ~1.5 s to run, exact integer retry DP).
+Any of those three costs may have a hard threshold beyond which it disqualifies the scheme from some use case — including uses that have not been invented yet. Rather than choosing parameters by eye, we formalize the tradeoff in [`tools/optimize.py`](tools/optimize.py) (standard-library Python, ~3.4 s to run, exact integer retry DPs, calibrated to within 1% of our measured Apple M6 `blake3-servil-core 0.10.0` numbers).
 
-### Model: independent log-uniform unknown thresholds
+### Model A: Scale-free sum of squares of log-ratios above the achievable minimum
 
-Suppose an unknown future application $U$ can adopt a parameter set $(B, S, V)$ if and only if all three costs fall below its unknown thresholds $(T_B, T_S, T_V)$:
+A simple, scale-free preference is: *accept an $X\%$ improvement in one dimension for a $Y\%$ worsening in other dimensions whenever $Y \ll X$, without letting any single dimension blow up relative to its achievable best.*
 
-$$B \le T_B \quad \land \quad S \le T_S \quad \land \quad V \le T_V.$$
+Let $(B_{\min}, S_{\min}, V_{\min})$ be the best achievable value of each dimension on the $2^{33}$ Pareto frontier, and define each dimension's **log-regret** (multiplicative distance above its achievable minimum):
 
-When a positive threshold's scale is unknown, the scale-invariant (Jeffreys) uninformative prior is **log-uniform**: $\ln T_i \sim \mathrm{Uniform}[\ln L_i, \ln U_i]$, where $U_i$ is the upper usability ceiling past which a scheme is too expensive to consider. For any $x_i \in [L_i, U_i]$, the probability of qualifying in dimension $i$ is $\Pr[T_i \ge x_i] = \ln(U_i / x_i) / \ln(U_i / L_i)$.
+$$r_i = \ln\!\left(\frac{x_i}{x_{i,\min}}\right) \ge 0.$$
 
-Two natural selection rules follow directly:
+Minimize the **sum of squares** (Euclidean $L_2$ distance in log-space from the utopia point):
+
+$$\mathcal{L}_2(B, S, V) = \left(\ln \frac{B}{B_{\min}}\right)^2 + \left(\ln \frac{S}{S_{\min}}\right)^2 + \left(\ln \frac{V}{V_{\min}}\right)^2.$$
+
+Why this captures the preference cleanly:
+
+- **100% scale-free, zero arbitrary ceilings or weights:** switching bytes $\leftrightarrow$ KiB or µs $\leftrightarrow$ ms cancels out of $x_i / x_{i,\min}$.
+- **Its differential is an automatic "$Y \ll X$" rule:**
+  $$d\mathcal{L}_2 = 2\!\left(r_B \frac{dB}{B} + r_S \frac{dS}{S} + r_V \frac{dV}{V}\right) = 0.$$
+  Trading an $X\%$ gain in dimension $i$ for a $Y\%$ cost in dimension $j$ is accepted if and only if
+  $$\frac{Y}{X} < \frac{\ln(x_i / x_{i,\min})}{\ln(x_j / x_{j,\min})}.$$
+  When dimension $i$ is far from its minimum (say $30\times$ above min, $\ln 30 = 3.4$) while $j$ is near its minimum ($1.2\times$, $\ln 1.2 = 0.18$), the rule accepts any trade better than ~19:1 ($Y \ll X$). Unlike plain unsquared $\sum \ln x_i = \ln(B \cdot S \cdot V)$ (which trades 49% for 50% forever), **squaring** creates a rising wall that stops once every dimension sits at roughly the same multiple of its minimum.
+- **Closely related zero-knob variants:** the $L_\infty$ limit minimizes the worst ratio $\max(x_i / x_{i,\min})$; squared percentage excess minimizes $\sum (x_i / x_{i,\min} - 1)^2$; span-normalized $L_2$ divides each $r_i$ by $\ln(x_{i,\max} / x_{i,\min})$; and weighted $L_2$ ($\sum w_i r_i^2$) makes any explicit size preference $w_B > 1$ (bytes are stored and replicated forever while signing runs once) completely transparent.
+
+### Model B: Independent log-uniform unknown thresholds
+
+Suppose an unknown future application $U$ qualifies if and only if $B \le T_B \land S \le T_S \land V \le T_V$, where each threshold has the scale-invariant (Jeffreys) log-uniform prior $\ln T_i \sim \mathrm{Uniform}[\ln L_i, \ln U_i]$ up to a usability ceiling $U_i$:
 
 1. **Maximum joint survival probability (Nash bargaining):**
    $$\arg\max_{(B, S, V)} \Pr[B \le T_B \land S \le T_S \land V \le T_V] = \arg\max_{(B, S, V)} \; \ln\!\left(\frac{U_B}{B}\right) \cdot \ln\!\left(\frac{U_S}{S}\right) \cdot \ln\!\left(\frac{U_V}{V}\right).$$
-   Remarkably, **all three lower bounds $L_i$ cancel out identically** (they enter only as constant denominators) and the rule is completely unit-invariant. Only the upper ceilings $(U_B, U_S, U_V)$ enter. Its first-order optimality condition is
-   $$\frac{dB / B}{\ln(U_B / B)} + \frac{dS / S}{\ln(U_S / S)} + \frac{dV / V}{\ln(U_V / V)} = 0,$$
-   which automatically pays more to shrink whichever cost is closest (in relative headroom) to its ceiling.
-
+   **All three lower bounds $L_i$ cancel out identically**; only the ceilings $(U_B, U_S, U_V)$ enter, and the rule is unit-invariant.
 2. **Minimax conditional exclusion risk:**
-   Conditioning on $T_i \in [x_{i,\min}, U_i]$ (use cases that at least one $2^{33}$ scheme on the frontier can serve), the exclusion risk in dimension $i$ is $e_i(x_i) = \ln(x_i / x_{i,\min}) / \ln(U_i / x_{i,\min})$. Minimizing the worst-case risk across all three dimensions gives:
-   $$\arg\min_{(B, S, V)} \; \max\bigl(e_B(B),\, e_S(S),\, e_V(V)\bigr).$$
+   Conditioning on $T_i \in [x_{i,\min}, U_i]$, minimize the worst-case exclusion probability across all three dimensions:
+   $$\arg\min_{(B, S, V)} \; \max_{i \in \{B, S, V\}} \frac{\ln(x_i / x_{i,\min})}{\ln(U_i / x_{i,\min})}.$$
 
-### What `tools/optimize.py` produces (Apple M6 single-core cached-top-tree model, $2^{33}$ sigs, $\ge 128$ bits)
+### Calibrated optimization results (`python3 tools/optimize.py`) vs. SLH-DSA-B
 
-Running `python3 tools/optimize.py` evaluates exact integer retry counts and builds the 2,115-point plain-shape Pareto frontier in ~1.5 seconds:
+Using our concrete Apple M6 measurements of `blake3-servil-core = "=0.10.0"` (`xmss = 11.1 + 3.8 \cdot 1024/(c + 1024)` ns/comp, `pors = 10.0 + 4.8 \cdot 2048/(t + 2048)` ns/comp, `grind = 12.6` ns/try, `verify = 18.5` ns/batched + `45` ns/scalar; predicts BLINCS `0.1.0` to within 1%: `16.33` vs. `16.22 ms` sign, `33.1` vs. `33.3 µs` verify, `4.53` vs. `4.43 ms` keygen), the full $2^{33}$ plain-shape Pareto frontier (`d = 2..12`, `w = 4..256`, `sign <= 100 ms`) has **3,095** points with minima **$B_{\min} = 3{,}284\text{ B}$, $S_{\min} = 0.51\text{ ms}$, $V_{\min} = 9.6\text{ µs}$**:
 
-| Ceilings $(U_B, U_S, U_V)$ | Rule | Winner (`bytes`, `sign`, `verify`, `keygen`) | Parameters (`h d v w g S b k gf m`) |
-|---|---|---|---|
-| `(7,856 B [SLH-DSA-128s], 100 ms [10/s], 1,000 µs)` | Max survival | **4,804 B**, 5.77 ms, 20.1 µs, kg 1.42 ms | `32 4 31 16 4 270 15 14 5 127` |
-| `(7,856 B [SLH-DSA-128s], 100 ms [10/s], 1,000 µs)` | Minimax risk | **4,536 B**, 5.43 ms, 40.9 µs, kg 1.14 ms | `35 5 25 32 3 387 14 14 0 106` |
-| `(7,856 B, 100 ms, 127 µs [SLH-DSA-B-128s])` | Max survival | **4,804 B**, 6.11 ms, 18.8 µs, kg 1.42 ms | `32 4 31 16 4 287 15 14 5 127` |
-| `(7,856 B, 100 ms, 127 µs [SLH-DSA-B-128s])` | Minimax risk | **4,740 B**, 6.31 ms, 22.2 µs, kg 1.38 ms | `32 4 30 16 8 225 15 14 5 127` |
-| `(5,000 B [compact], 100 ms, 1,000 µs)` | Max survival | **3,940 B**, 16.81 ms, 31.5 µs, kg 4.37 ms | `36 4 24 32 8 382 15 11 6 100` |
-| Zero-parameter frontier `[3,284..8,020 B, ...]` | Minimax risk | **4,616 B**, 5.74 ms, 31.9 µs, kg 1.14 ms | `35 5 25 32 3 488 14 14 0 111` |
-| Current draft BLINCS `0.1.0` *(for comparison)* | — | **3,988 B**, 16.22 ms *(meas.)*, 33.3 µs *(meas.)*, kg 4.43 ms | `36 4 24 32 8 372 15 11 6 103` |
+| Rule / reference scheme | Bytes | Sign (1 core) | Verify (1 core) | Keygen | Ratios to `(Bmin, Smin, Vmin)` | Parameters (`h d v w g S b k gf m`) |
+|---|---:|---:|---:|---:|---|---|
+| **Scale-free $L_\infty$ minimax ratio** $\max(x/x_{\min})$ | **7,440 B** | **1.24 ms** | **23.5 µs** | 0.14 ms | **(2.27×, 2.43×, 2.44×)** | `35 7 42 8 2 176 13 16 4 116` |
+| **Squared % excess** $\sum(x/x_{\min} - 1)^2$ | **7,488 B** | **1.22 ms** | **23.6 µs** | 0.14 ms | **(2.28×, 2.39×, 2.45×)** | `35 7 42 8 2 176 13 16 4 119` |
+| **Scale-free $L_2$ log-regret** $\sum(\ln(x/x_{\min}))^2$ | **9,840 B** | **1.01 ms** | **19.6 µs** | 0.11 ms | **(3.00×, 1.97×, 2.03×)** | `35 7 63 4 2 114 13 16 4 119` |
+| **Span-normalized $L_2$** | **5,928 B** | **2.89 ms** | **17.2 µs** | 0.52 ms | (1.81×, 5.64×, 1.79×) | `35 5 42 8 2 183 14 14 0 108` |
+| **Weighted $L_2$**, $w = (16, 1, 1)$ | **5,048 B** | **3.88 ms** | **24.3 µs** | 0.77 ms | (1.54×, 7.59×, 2.52×) | `35 5 31 16 4 270 14 14 0 108` |
+| **Unknown thresholds**, $U = (7{,}856\text{ B}, 100\text{ ms}, 1\text{ ms})$ survival | **4,804 B** | **5.91 ms** | **20.5 µs** | 1.49 ms | (1.46×, 11.6×, 2.13×) | `32 4 31 16 4 270 15 14 5 127` |
+| **Unknown thresholds**, $U = (7{,}856\text{ B}, 100\text{ ms}, 1\text{ ms})$ minimax | **4,536 B** | **5.83 ms** | **41.9 µs** | 1.24 ms | (1.38×, 11.4×, 4.34×) | `35 5 25 32 3 387 14 14 0 106` |
+| **Unknown thresholds**, $U = (5{,}000\text{ B}, 100\text{ ms}, 1\text{ ms})$ survival | **3,940 B** | **17.21 ms** | **32.3 µs** | 4.53 ms | (1.20×, 33.7×, 3.35×) | `36 4 24 32 8 382 15 11 6 100` |
+| **BLINCS `0.1.0` *(implemented, measured)*** | **3,988 B** | **16.22 ms** | **33.3 µs** | **4.43 ms** | (1.21×, 31.7×, 3.46×) | `36 4 24 32 8 372 15 11 6 103` |
+| *SLH-DSA-BLAKE3-128s* ($2^{64}$, FIPS 205, measured M6) | *7,856 B* | *121.7 ms* | *126.6 µs* | — | *(2.39×, 238×, 13.1×)* | *`h=63 d=7 w=16 (35 ch) FORS k=14 a=12`* |
+| *SLH-DSA-BLAKE3-128f* ($2^{64}$, FIPS 205, measured M6) | *17,088 B* | *5.81 ms* | *353.7 µs* | — | *(5.20×, 11.4×, 36.7×)* | *`h=66 d=22 w=16 (35 ch) FORS k=33 a=6`* |
 
-*(With `3×` multithreaded signing, `--sign-speedup 3.0`, the `(7,856 B, 100 ms, 1,000 µs)` max-survival winner shifts down to `4,468 B` / 3.27 ms / 18.5 µs because extra signing headroom shifts marginal value toward smaller signatures.)*
+*(With `3×` multithreaded signing via `--sign-speedup 3.0`, $L_2$ log-regret shifts to `8,764 B` / 0.42 ms / 18.2 µs, span-normalized $L_2$ to `5,540 B` / 1.44 ms / 14.9 µs, and `U = (7,856 B, 100 ms, 1 ms)` survival to `4,468 B` / 3.35 ms / 19.0 µs.)*
 
-**Honest note on `0.1.0`'s 3,988-byte set:** our initial `0.1.0` parameters (`3,988 B`, 16.2 ms sign, 33.3 µs verify) were chosen to stay under a single 4 KiB page (4,096 B) while keeping > 6× headroom above 10 signatures/second, which corresponds quantitatively to a compact size ceiling around $U_B \approx 5{,}000$ B (under `U = (5,000 B, 100 ms, 1,000 µs)`, `3,988 B` achieves 97.3% of the optimal survival score). Under the broader FIPS 205 ceiling `U = (7,856 B, 100 ms, 1,000 µs)` — or zero-parameter frontier log-minimax — the quantitative model prefers the **`4,536–4,804 B`** neighborhood (+14–20% bytes for **~3× faster signing** and **~1.6× faster verification**). Because BLINCS is pre-1.0, both options are kept explicitly visible in `tools/optimize.py`.
+### What this comparison reveals
+
+1. **Versus SLH-DSA-B's proposed parameters:** SLH-DSA-B preserves FIPS 205's exact `128s` and `128f` parameter sets (plain WOTS+ with 3 checksum chains, plain FORS with $k$ trees, $2^{64}$ signing budget) and swaps only the hash to BLAKE3. Because BLINCS trades the $2^{64}$ budget down to $2^{33}$, adopts WOTS+C and PORS+FP, and batches hashes on `blake3-servil-core`:
+   - Every candidate from **`3,988 B`** to **`7,440 B`** strictly beats `SLH-DSA-BLAKE3-128s` on **all three** dimensions simultaneously (smaller signatures, 7–98× faster signing, 3.8–6.2× faster verification).
+   - The **`4,804 B`**, **`5,048 B`**, and **`7,440 B`** candidates also match or beat `SLH-DSA-BLAKE3-128f`'s 5.81 ms signing time while being **2.3–3.6× smaller** and **15–17× faster to verify**.
+2. **Why equal-ratio rules pick ~7.4–9.8 KB while `0.1.0` sits at 3,988 B:** the hash-based frontier is highly asymmetric — signature size only spans **4.6×** across the full search space (`3.3–15.1 KB`), whereas signing spans **190×** (`0.51–98 ms`). Treating a 2× worsening in size as equally costly as a 2× worsening in signing time lands at **`7,440 B` (1.24 ms, 23.5 µs)** under $L_\infty$/squared-excess or **`9,840 B` (1.01 ms, 19.6 µs)** under $L_2$ log-regret. Staying under 4 KiB (`3,988 B`) corresponds to weighting size roughly 64–100× heavier than signing in squared log-regret (or imposing a ~5 KiB ceiling $U_B$), while the intermediate **`4,804–5,048 B`** sets sit at `w_B ≈ 16` or the SLH-DSA-128s ceiling `U_B = 7,856 B` (+20–26% bytes over `0.1.0` for **3–4× faster signing** and **1.4–1.6× faster verification**). Because BLINCS is pre-1.0, `tools/optimize.py` keeps the full tradeoff reproducible for any choice of preference.
 
 ### Why `m = 103` is not signing-time-bottlenecked in BLINCS (`tools/optimize.py --grinding-sweep`)
 
-In isolation, a PORS+FP merged-set cap of `m = 103` looks aggressive compared to `m = 112` (+144 bytes, 34.6× fewer `PICK` tries). With batched BLAKE3-Servil (`12.6 ns/try` at `GRIND = 2048`), however, `PICK` grinding is only **1.7%** of BLINCS's signing time (80% is in the three XMSS hypertree builds and ~9% in the four WOTS+C counter searches):
+In isolation, a PORS+FP merged-set cap of `m = 103` looks aggressive compared to `m = 112` (+144 bytes, 34.6× fewer `PICK` tries). With batched BLAKE3-Servil (`12.6 ns/try` at `GRIND = 2048`), however, `PICK` grinding is only **1.7%** of BLINCS `0.1.0`'s signing time (80% is in the three XMSS hypertree builds and ~9% in the four WOTS+C counter searches):
 
 | `m` | Signature bytes | Mean `PICK` tries | Reduction vs. `m = 103` | `PICK` time (M6) | Share of total sign time |
 |---:|---:|---:|---:|---:|---:|
