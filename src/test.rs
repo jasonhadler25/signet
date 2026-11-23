@@ -7,7 +7,7 @@ use crate::params::{
     AUTH_NODES, CHAIN_STEPS, CHAINS, CHUNK_LEN, DIGIT_SUM, FEW_HEIGHT, FEW_LEN, HYPER_BITS, LAYER_LEN, LAYERS, N, OPENED, SIGNATURE_LEN, THRESHOLD_BITS,
     TREE_HEIGHT,
 };
-use crate::randomness::{STATE_LEN, mix};
+use crate::randomness::{STATE_LEN, mix, read_exact_or_reject, read_monotonic_clock};
 use crate::{Randomness, SEED_LEN, Signature, SigningKey, VERIFYING_KEY_LEN, VerifyingKey};
 use std::fs;
 use std::io::{self, Cursor, ErrorKind, Read};
@@ -42,15 +42,25 @@ struct FragmentedReader<'a> {
     step: usize,
     interrupt_every: usize,
     calls: usize,
+    saw_eof: bool,
+}
+
+impl<'a> FragmentedReader<'a> {
+    fn new(data: &'a [u8], step: usize, interrupt_every: usize) -> Self {
+        Self { data, pos: 0, step, interrupt_every, calls: 0, saw_eof: false }
+    }
 }
 
 impl<'a> Read for FragmentedReader<'a> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        assert!(!buf.is_empty(), "read() called with empty buffer");
+        assert!(!self.saw_eof, "read() called again after EOF");
         self.calls += 1;
         if self.interrupt_every > 0 && self.calls.is_multiple_of(self.interrupt_every) {
             return Err(io::Error::new(ErrorKind::Interrupted, "simulated EINTR"));
         }
         if self.pos >= self.data.len() {
+            self.saw_eof = true;
             return Ok(0);
         }
         let n = (self.data.len() - self.pos).min(self.step).min(buf.len());
@@ -224,7 +234,8 @@ fn advance_chains_handles_zero_partial_and_full_lengths() {
     let mut batched = initial;
     let mut b32 = blake3_servil_core::throughput::Batch::new(32, CHAINS);
     let mut out = [[0u8; 32]; CHAINS];
-    advance_chains(&public, Pos { layer: 2, tree: 17, leaf: 9 }, &mut batched, &starts, &ends, &mut b32, &mut out);
+    let pub_core = blake3_servil_core::throughput::TreeHasher::new(blake3_servil_core::Mode::Keyed(&public)).on_this_core();
+    advance_chains(&pub_core, Pos { layer: 2, tree: 17, leaf: 9 }, &mut batched, &starts, &ends, &mut b32, &mut out);
 
     // Compare against scalar one-step-at-a-time computation.
     for c in 0..CHAINS {
@@ -237,7 +248,7 @@ fn advance_chains_handles_zero_partial_and_full_lengths() {
 
     // All-zero lengths leave every value unchanged.
     let mut noop = initial;
-    advance_chains(&public, Pos { layer: 0, tree: 0, leaf: 0 }, &mut noop, &[5u8; CHAINS], &[5u8; CHAINS], &mut b32, &mut out);
+    advance_chains(&pub_core, Pos { layer: 0, tree: 0, leaf: 0 }, &mut noop, &[5u8; CHAINS], &[5u8; CHAINS], &mut b32, &mut out);
     assert_eq!(noop, initial);
 }
 
@@ -246,6 +257,7 @@ fn every_signature_region_and_unused_padding_is_checked() {
     let seed: [u8; SEED_LEN] = core::array::from_fn(|i| i as u8);
     let sk = SigningKey::from_seed(&seed);
     let vk = sk.verifying_key();
+    let pub_core = blake3_servil_core::throughput::TreeHasher::new(blake3_servil_core::Mode::Keyed(&vk.public)).on_this_core();
     let msg = b"hello, BLINCS";
 
     // Find a signature with spare auth slots (< 103) so we exercise the trailing zero-padding check too.
@@ -255,9 +267,9 @@ fn every_signature_region_and_unused_padding_is_checked() {
             let salt: [u8; N] = sig.as_bytes()[..N].try_into().unwrap();
             let rand: [u8; N] = sig.as_bytes()[N..2 * N].try_into().unwrap();
             let short = content_from_slice(&vk.content_key, &salt, msg);
-            let digest = vk.message_digest(&rand, &short);
+            let digest = vk.message_digest(&pub_core, &rand, &short);
             let fts_counter = u32::from_le_bytes(sig.as_bytes()[32..36].try_into().unwrap());
-            let picked = pick(&vk.public, &digest, fts_counter).unwrap();
+            let picked = pick(&pub_core, &digest, fts_counter).unwrap();
             (picked.merged_len < AUTH_NODES).then_some((sig, picked))
         })
         .expect("found signature with spare auth slots");
@@ -266,7 +278,7 @@ fn every_signature_region_and_unused_padding_is_checked() {
     let salt: [u8; N] = base.as_bytes()[..N].try_into().unwrap();
     let rand: [u8; N] = base.as_bytes()[N..2 * N].try_into().unwrap();
     let short = content_from_slice(&vk.content_key, &salt, msg);
-    let digest = vk.message_digest(&rand, &short);
+    let digest = vk.message_digest(&pub_core, &rand, &short);
 
     let flip = |offset: usize| -> bool {
         let mut raw = *base.as_bytes();
@@ -293,14 +305,14 @@ fn every_signature_region_and_unused_padding_is_checked() {
     let mut tree = picked.tree;
     let mut leaf = picked.leaf;
     let mut node = crate::workspace::with_verify_workspace(|ws| {
-        crate::few_time::few_time_verify(&vk.public, &digest, &base.as_bytes()[2 * N..2 * N + FEW_LEN], ws).unwrap().2
+        crate::few_time::few_time_verify(&pub_core, &digest, &base.as_bytes()[2 * N..2 * N + FEW_LEN], ws).unwrap().2
     });
     for layer in 0..LAYERS {
         let pos = Pos { layer: layer as u8, tree, leaf };
         let at = 2 * N + FEW_LEN + layer * LAYER_LEN;
         assert!(!flip(at), "accepted flip in layer {layer} counter");
         let counter = u32::from_le_bytes(base.as_bytes()[at..at + 4].try_into().unwrap());
-        let d = digits(&vk.public, pos, &node, counter).unwrap();
+        let d = digits(&pub_core, pos, &node, counter).unwrap();
         // Flip every chain value in this layer.
         for (c, &dc) in d.iter().enumerate() {
             assert!(!flip(at + 4 + N * c), "accepted flip in layer {layer} chain {c} (d={dc})");
@@ -308,7 +320,7 @@ fn every_signature_region_and_unused_padding_is_checked() {
         assert!(!flip(at + 4 + N * CHAINS), "accepted flip in layer {layer} path 0");
         assert!(!flip(at + 4 + N * (CHAINS + TREE_HEIGHT - 1)), "accepted flip in layer {layer} path 8");
         node = crate::workspace::with_verify_workspace(|ws| {
-            crate::one_time::verify_layer(&vk.public, pos, &node, &base.as_bytes()[at..at + LAYER_LEN], ws).unwrap()
+            crate::one_time::verify_layer(&pub_core, pos, &node, &base.as_bytes()[at..at + LAYER_LEN], ws).unwrap()
         });
         leaf = (tree & ((1u64 << TREE_HEIGHT) - 1)) as u16;
         tree >>= TREE_HEIGHT;
@@ -341,11 +353,11 @@ fn chunk_boundaries_and_fragmented_readers_match_slices() {
         let sig = sk.sign_with_draw(&draw, &msg);
         assert!(vk.verify(&msg, &sig), "slice verify failed for len {len}");
 
-        let frag_sign = FragmentedReader { data: &msg, pos: 0, step: 7717, interrupt_every: 5, calls: 0 };
+        let frag_sign = FragmentedReader::new(&msg, 7717, 5);
         let sig_reader = sk.sign_reader_with_draw(&draw, frag_sign).unwrap();
         assert_eq!(sig_reader, sig, "reader signature differed for len {len}");
 
-        let frag_ver = FragmentedReader { data: &msg, pos: 0, step: 11113, interrupt_every: 3, calls: 0 };
+        let frag_ver = FragmentedReader::new(&msg, 11113, 3);
         assert!(vk.verify_reader(frag_ver, &sig).unwrap(), "reader verify failed for len {len}");
 
         // Length change and content flip must fail.
@@ -401,13 +413,23 @@ fn randomness_create_and_initialize_lifecycle_and_rejection() {
     assert!(!path.exists());
 
     // Explicit create makes a 48-byte file with count = 0 and refuses to overwrite.
+    assert_eq!(STATE_LEN, 48);
     Randomness::create(&path).unwrap();
     let initial = fs::read(&path).unwrap();
-    assert_eq!(initial.len(), STATE_LEN);
+    assert_eq!(initial.len(), 48);
     assert_eq!(&initial[..8], b"BLINCSr1");
     assert_eq!(u64::from_le_bytes(initial[8..16].try_into().unwrap()), 0);
+    assert_ne!(&initial[16..48], &[0u8; 32]);
+    assert_ne!(&initial[16..48], &[1u8; 32]);
     assert_eq!(Randomness::create(&path).unwrap_err().kind(), ErrorKind::AlreadyExists);
     assert_eq!(fs::read(&path).unwrap(), initial);
+
+    // A second independent create gets fresh OS randomness.
+    let path_other = temp_state_path("lifecycle-other");
+    Randomness::create(&path_other).unwrap();
+    let other_initial = fs::read(&path_other).unwrap();
+    assert_ne!(&initial[16..48], &other_initial[16..48]);
+    let _ = fs::remove_dir_all(path_other.parent().unwrap());
 
     #[cfg(unix)]
     {
@@ -448,7 +470,8 @@ fn randomness_create_and_initialize_lifecycle_and_rejection() {
     for (name, bad) in [
         ("empty", vec![]),
         ("short", b"BLINCSr1short".to_vec()),
-        ("long", vec![b'x'; STATE_LEN + 1]),
+        ("long", vec![b'x'; 49]),
+        ("long-valid-magic", [b"BLINCSr1".as_slice(), &[0u8; 41]].concat()),
         ("wrong-magic", [b"NOTBLINC".as_slice(), &[0u8; 40]].concat()),
         ("exhausted", [b"BLINCSr1".as_slice(), &u64::MAX.to_le_bytes(), &[9u8; 32]].concat()),
     ] {
@@ -459,7 +482,38 @@ fn randomness_create_and_initialize_lifecycle_and_rejection() {
         let _ = fs::remove_dir_all(p.parent().unwrap());
     }
 
+    // State-file reader handles EINTR, short reads, non-EINTR errors, and exact-length checks.
+    let valid_raw = [b"BLINCSr1".as_slice(), &7u64.to_le_bytes(), &[0x55u8; 32]].concat();
+    let mut frag = FragmentedReader::new(&valid_raw, 5, 2);
+    assert_eq!(read_exact_or_reject(&mut frag).unwrap().as_slice(), valid_raw.as_slice());
+    let long_raw = [valid_raw.as_slice(), &[0u8]].concat();
+    let mut frag_long = FragmentedReader::new(&long_raw, 7, 3);
+    assert_eq!(read_exact_or_reject(&mut frag_long).unwrap_err().kind(), ErrorKind::InvalidData);
+    assert_eq!(read_exact_or_reject(&mut FailingReader).unwrap_err().kind(), ErrorKind::BrokenPipe);
+
     let _ = fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[test]
+fn monotonic_clock_advances_and_is_nontrivial() {
+    let c1 = read_monotonic_clock();
+    assert!(c1.len() >= 8 && c1 != [0] && c1 != [1]);
+    thread::sleep(std::time::Duration::from_millis(2));
+    let c2 = read_monotonic_clock();
+    assert_eq!(c1.len(), c2.len());
+    assert_ne!(c1, c2);
+}
+
+#[test]
+fn create_works_with_bare_relative_filename() {
+    // Safe because cargo-nextest runs every test in its own process.
+    let dir = std::env::temp_dir().join(format!("blincs-rel-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    std::env::set_current_dir(&dir).unwrap();
+    Randomness::create("state.bin").unwrap();
+    assert_eq!(fs::read("state.bin").unwrap().len(), 48);
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -471,8 +525,7 @@ fn debug_redacts_secrets() {
     assert!(s.contains(&to_hex(sk.verifying_key().as_bytes())));
 
     let rng = Randomness::from_run_key_at([0xcdu8; 32], 0);
-    let r = format!("{rng:?}");
-    assert!(!r.contains("cdcdcdcd"), "Randomness Debug leaked run_key: {r}");
+    assert_eq!(format!("{rng:?}"), "Randomness { .. }");
 
     let sig = sk.sign_with_draw(&[1u8; 32], b"dbg");
     let sd = format!("{sig:?}");
@@ -502,4 +555,106 @@ fn initialize_alone_initializes_blake3_in_fresh_process() {
 fn signing_key_alone_initializes_blake3_in_fresh_process() {
     let sk = SigningKey::from_seed(&[3u8; SEED_LEN]);
     assert_eq!(sk.verifying_key().as_bytes().len(), VERIFYING_KEY_LEN);
+}
+
+#[test]
+fn reader_never_sees_previous_callers_bytes() {
+    struct SnoopingReader {
+        data: &'static [u8],
+        pos: usize,
+        saw_nonzero: bool,
+    }
+    impl Read for SnoopingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.pos == 0 && buf.iter().any(|&b| b != 0) {
+                self.saw_nonzero = true;
+            }
+            if self.pos >= self.data.len() {
+                return Ok(0);
+            }
+            let n = (self.data.len() - self.pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+    struct DirtyThenFail;
+    impl Read for DirtyThenFail {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            buf.fill(0xBB);
+            Err(io::Error::new(ErrorKind::BrokenPipe, "fail after dirtying buffer"))
+        }
+    }
+
+    let sk = SigningKey::from_seed(&[0x33u8; SEED_LEN]);
+    let vk = sk.verifying_key();
+    let secret_msg = vec![0xAAu8; CHUNK_LEN];
+
+    // Sign a full 0xAA chunk, then ensure a subsequent signing reader sees all zeros.
+    let sig = sk.sign_reader_with_draw(&[1u8; 32], Cursor::new(&secret_msg)).unwrap();
+    let mut snoop_sign = SnoopingReader { data: b"second", pos: 0, saw_nonzero: false };
+    let sig2 = sk.sign_reader_with_draw(&[2u8; 32], &mut snoop_sign).unwrap();
+    assert!(!snoop_sign.saw_nonzero, "second sign_reader observed previous caller's bytes");
+    assert!(vk.verify(b"second", &sig2));
+
+    // Verify a full 0xAA chunk, then fail a reader that dirtied the buffer, then ensure next reader sees zeros.
+    assert!(vk.verify_reader(Cursor::new(&secret_msg), &sig).unwrap());
+    assert!(vk.verify_reader(DirtyThenFail, &sig).is_err());
+    let mut snoop_ver = SnoopingReader { data: b"second", pos: 0, saw_nonzero: false };
+    assert!(vk.verify_reader(&mut snoop_ver, &sig2).unwrap());
+    assert!(!snoop_ver.saw_nonzero, "second verify_reader observed previous caller's bytes");
+
+    // Confirm ChunkLease returns the zeroed buffer to the thread-local pool for reuse.
+    {
+        let _lease = crate::workspace::ChunkLease::take();
+        assert!(!crate::workspace::ChunkLease::pool_has_buffer(), "pool should be empty while leased");
+    }
+    assert!(crate::workspace::ChunkLease::pool_has_buffer(), "ChunkLease::drop did not return buffer to pool");
+}
+
+#[test]
+fn reentrant_reader_can_sign_and_verify_without_borrowing_panic() {
+    let sk = SigningKey::from_seed(&[0x44u8; SEED_LEN]);
+    let vk = sk.verifying_key();
+    let inner_sig = sk.sign_with_draw(&[9u8; 32], b"inner");
+
+    struct ReentrantReader<'a> {
+        sk: &'a SigningKey,
+        vk: VerifyingKey,
+        inner_sig: &'a Signature,
+        done: bool,
+    }
+    impl Read for ReentrantReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.done {
+                return Ok(0);
+            }
+            self.done = true;
+            // Nested sign, sign_reader, verify, and verify_reader on the same thread.
+            let nested = self.sk.sign_reader_with_draw(&[8u8; 32], Cursor::new(b"nested")).unwrap();
+            assert!(self.vk.verify_reader(Cursor::new(b"nested"), &nested).unwrap());
+            assert!(self.vk.verify(b"inner", self.inner_sig));
+            let msg = b"outer";
+            buf[..msg.len()].copy_from_slice(msg);
+            Ok(msg.len())
+        }
+    }
+
+    let outer = sk.sign_reader_with_draw(&[7u8; 32], ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, done: false }).unwrap();
+    assert!(vk.verify(b"outer", &outer));
+    assert!(vk.verify_reader(ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, done: false }, &outer).unwrap());
+}
+
+#[test]
+fn throughput_hash_ignores_dirty_block_tail() {
+    blake3_servil_core::initialize();
+    let key = [0x77u8; 32];
+    let salt = [0x88u8; N];
+    let mut blocks = vec![blake3_servil_core::throughput::Block::ZERO; CHUNK_LEN / 64];
+    // Deliberately fill the entire aligned buffer with 0xFF before reading a short 19-byte message.
+    blake3_servil_core::throughput::Block::bytes_mut(&mut blocks).fill(0xFF);
+    let msg = b"short-with-dirty-tl";
+    let (_, short_dirty) = content_from_reader(&key, Ok(salt), Cursor::new(msg), &mut blocks).unwrap();
+    let short_clean = content_from_slice(&key, &salt, msg);
+    assert_eq!(short_dirty, short_clean);
 }

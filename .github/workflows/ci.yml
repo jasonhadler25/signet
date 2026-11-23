@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Install cargo-nextest (SHA-256 verified)
+        run: |
+          set -euo pipefail
+          URL="https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.152/cargo-nextest-0.9.152-x86_64-unknown-linux-gnu.tar.gz"
+          EXPECTED="d039b43c3e0958441b6ad0a39c8884d018b3d2e8fb9928f209074b1100b5e17a"
+          curl -fsSL "$URL" -o /tmp/nextest.tar.gz
+          echo "$EXPECTED  /tmp/nextest.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.cargo/bin"
+          tar xzf /tmp/nextest.tar.gz -C "$HOME/.cargo/bin"
+          rm /tmp/nextest.tar.gz
+          cargo nextest --version
+
+      - name: Format and lint
+        run: |
+          cargo fmt -- --check
+          cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Unit, integration, and doc tests
+        run: |
+          cargo nextest run --locked
+          cargo test --doc --locked
+
+      - name: Python reference and vector digests (SHA-256 + BLAKE3)
+        run: |
+          python3 reference/blake3.py
+          python3 tools/land.py --skip-clean-check --skip-rust
+
+      - name: Planted-fault controls
+        run: python3 tools/controls.py

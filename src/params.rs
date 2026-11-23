@@ -89,6 +89,7 @@ pub(crate) fn first_n(full: &[u8; 32]) -> [u8; N] {
     out
 }
 
+#[cfg(test)]
 #[inline]
 pub(crate) fn short_hash(key: &[u8; 32], t: [u8; 16], data: &[u8]) -> [u8; N] {
     let mut buf = [0u8; 64];

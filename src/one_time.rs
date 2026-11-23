@@ -1,18 +1,18 @@
 use crate::params::{
     CHAIN_STEPS, CHAINS, DIGIT_SUM, KIND_CHAIN, KIND_CHAIN_SECRET, KIND_NODE, KIND_ONE_TIME_KEY, KIND_ONE_TIME_MESSAGE, LAYER_LEN, N, TOP_NODES, TREE_HEIGHT,
-    TREE_LEAVES, ZERO_BITS, first_n, keyed, short_hash, tweak,
+    TREE_LEAVES, ZERO_BITS, first_n, tweak,
 };
 use crate::workspace::{GRIND, SignWorkspace, VerifyWorkspace};
 use blake3_servil_core::Mode;
-use blake3_servil_core::throughput::{self, Batch, Prepared};
+use blake3_servil_core::throughput::{self, Batch, Prepared, TreeHasher};
 
 /// Check a 16-byte `ONE_TIME_MESSAGE` digest: low 8 bits zero and 24 five-bit digits summing to 372.
+#[inline]
 pub(crate) fn parse_digits(digest: &[u8; 32]) -> Option<[u8; CHAINS]> {
-    let mut x = u128::from_le_bytes(digest[..N].try_into().unwrap());
-    if (x & ((1u128 << ZERO_BITS) - 1)) != 0 {
+    if digest[0] != 0 {
         return None;
     }
-    x >>= ZERO_BITS;
+    let mut x = u128::from_le_bytes(digest[..N].try_into().unwrap()) >> ZERO_BITS;
     let mut out = [0u8; CHAINS];
     let mut sum = 0u32;
     for slot in &mut out {
@@ -33,43 +33,41 @@ pub(crate) struct Pos {
 }
 
 /// Evaluate `ONE_TIME_MESSAGE` for one `(pos, node, counter)`.
-pub(crate) fn digits(public: &[u8; 32], pos: Pos, node: &[u8; N], counter: u32) -> Option<[u8; CHAINS]> {
+pub(crate) fn digits(public: &TreeHasher, pos: Pos, node: &[u8; N], counter: u32) -> Option<[u8; CHAINS]> {
     let mut input = [0u8; 36];
     input[..16].copy_from_slice(&tweak(KIND_ONE_TIME_MESSAGE, pos.layer, pos.tree, pos.leaf, 0, 0));
     input[16..32].copy_from_slice(node);
     input[32..36].copy_from_slice(&counter.to_le_bytes());
-    parse_digits(&keyed(public, &input))
+    parse_digits(public.hash(&input).as_bytes())
 }
 
 /// Find the smallest `counter` in `0..=u32::MAX` that passes `ONE_TIME_MESSAGE`.
 fn search_wots(public: &[u8; 32], pos: Pos, node: &[u8; N], ws: &mut SignWorkspace) -> (u32, [u8; CHAINS]) {
+    const { assert!((1u64 << 32).is_multiple_of(GRIND as u64)) };
     let t = tweak(KIND_ONE_TIME_MESSAGE, pos.layer, pos.tree, pos.leaf, 0, 0);
     for i in 0..GRIND {
         let m = ws.b_wmsg.message_mut(i);
         m[..16].copy_from_slice(&t);
         m[16..32].copy_from_slice(node);
     }
-    let mut base = 0u64;
-    loop {
-        let count = (u32::MAX as u64 + 1 - base).min(GRIND as u64) as usize;
-        assert!(count > 0, "one-time counter search exhausted 2^32 tries");
-        for i in 0..count {
+    for base in (0u64..=u32::MAX as u64).step_by(GRIND) {
+        for i in 0..GRIND {
             ws.b_wmsg.message_mut(i)[32..36].copy_from_slice(&((base + i as u64) as u32).to_le_bytes());
         }
-        throughput::hash_many(Mode::Keyed(public), &ws.b_wmsg.part(0..count), &mut ws.out[..count]);
-        for (i, digest) in ws.out.iter().enumerate().take(count) {
+        throughput::hash_many(Mode::Keyed(public), &ws.b_wmsg, &mut ws.out[..GRIND]);
+        for (i, digest) in ws.out.iter().enumerate().take(GRIND) {
             if let Some(d) = parse_digits(digest) {
                 return ((base + i as u64) as u32, d);
             }
         }
-        base += count as u64;
     }
+    panic!("one-time counter search exhausted 2^32 tries");
 }
 
 /// Advance each of 24 chains in place from `starts[c]` to `ends[c]`, batching active chains at each step.
 /// Shared by layer-3 signing (using the cached top tree) and by signature verification.
 pub(crate) fn advance_chains(
-    public: &[u8; 32],
+    public: &TreeHasher,
     pos: Pos,
     values: &mut [[u8; N]; CHAINS],
     starts: &[u8; CHAINS],
@@ -95,7 +93,7 @@ pub(crate) fn advance_chains(
     }
     let mut step = 0u8;
     while active > 0 {
-        throughput::hash_many(Mode::Keyed(public), &b32.part(0..active), &mut out[..active]);
+        public.hash_many(&b32.part(0..active), &mut out[..active]);
         step += 1;
         for (slot, &(rem, c)) in order[..active].iter().enumerate() {
             if step < rem {
@@ -162,10 +160,10 @@ pub(crate) fn build_tree(
         }
         if step + 1 < CHAIN_STEPS {
             let next_bytes = (step + 1).to_le_bytes();
-            for j in 0..total_chains {
+            for (j, digest) in ws.out[..total_chains].iter().enumerate() {
                 let m = ws.b32.message_mut(j);
                 m[12..16].copy_from_slice(&next_bytes);
-                m[16..32].copy_from_slice(&ws.out[j][..N]);
+                m[16..32].copy_from_slice(&digest[..N]);
             }
         }
     }
@@ -237,7 +235,8 @@ pub(crate) fn sign_top_layer(
     for c in 0..CHAINS {
         values[c] = first_n(&ws.out[c]);
     }
-    advance_chains(public, pos, &mut values, &[0u8; CHAINS], &d, &mut ws.b32, &mut ws.out[..CHAINS]);
+    let pub_core = TreeHasher::new(Mode::Keyed(public)).on_this_core();
+    advance_chains(&pub_core, pos, &mut values, &[0u8; CHAINS], &d, &mut ws.b32, &mut ws.out[..CHAINS]);
     for c in 0..CHAINS {
         sig_part[4 + N * c..4 + N * (c + 1)].copy_from_slice(&values[c]);
     }
@@ -250,7 +249,7 @@ pub(crate) fn sign_top_layer(
 }
 
 /// Verify one hypertree layer in `sig_part` (`LAYER_LEN` bytes), returning the recovered tree root.
-pub(crate) fn verify_layer(public: &[u8; 32], pos: Pos, node: &[u8; N], sig_part: &[u8], ws: &mut VerifyWorkspace) -> Option<[u8; N]> {
+pub(crate) fn verify_layer(public: &TreeHasher, pos: Pos, node: &[u8; N], sig_part: &[u8], ws: &mut VerifyWorkspace) -> Option<[u8; N]> {
     debug_assert_eq!(sig_part.len(), LAYER_LEN);
     let counter = u32::from_le_bytes(sig_part[0..4].try_into().unwrap());
     let d = digits(public, pos, node, counter)?;
@@ -266,21 +265,22 @@ pub(crate) fn verify_layer(public: &[u8; 32], pos: Pos, node: &[u8; N], sig_part
     for c in 0..CHAINS {
         pk_in[16 + N * c..16 + N * (c + 1)].copy_from_slice(&values[c]);
     }
-    let mut cur = first_n(&keyed(public, &pk_in));
+    let mut cur = first_n(public.hash(&pk_in).as_bytes());
 
     let path = &sig_part[4 + N * CHAINS..];
-    let mut pair = [0u8; 2 * N];
+    let mut buf = [0u8; 16 + 2 * N];
     for height in 0..TREE_HEIGHT {
         let sibling = &path[N * height..N * (height + 1)];
         let index = (pos.leaf as usize) >> height;
+        buf[..16].copy_from_slice(&tweak(KIND_NODE, pos.layer, pos.tree, 0, height as u16 + 1, (index >> 1) as u32));
         if index & 1 == 0 {
-            pair[..N].copy_from_slice(&cur);
-            pair[N..].copy_from_slice(sibling);
+            buf[16..32].copy_from_slice(&cur);
+            buf[32..48].copy_from_slice(sibling);
         } else {
-            pair[..N].copy_from_slice(sibling);
-            pair[N..].copy_from_slice(&cur);
+            buf[16..32].copy_from_slice(sibling);
+            buf[32..48].copy_from_slice(&cur);
         }
-        cur = short_hash(public, tweak(KIND_NODE, pos.layer, pos.tree, 0, height as u16 + 1, (index >> 1) as u32), &pair);
+        cur = first_n(public.hash(&buf).as_bytes());
     }
     Some(cur)
 }

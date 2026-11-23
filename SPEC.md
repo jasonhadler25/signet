@@ -2,15 +2,15 @@
 
 *Status: provisional design under active development (0.1.0, pre-1.0 formats and context strings may still change). Written by an AI assistant at the direction of this repository's owner; no independent cryptographic review or security audit has been performed.*
 
-BLINCS is a stateless hash-based signature scheme built on BLAKE3. A signature is 3,988 bytes, a verifying key is 32 bytes, and a signing key is a 32-byte seed. Its parameters give at least 128 bits of security up to $2^{33}$ signatures (8,589,934,592: ten signatures a second for 27 years) under the SPHINCS+ hypertree and PORS+FP cover-probability model.
+BLINCS is a stateless hash-based signature scheme built on BLAKE3. A signature is 3,988 bytes, a verifying key is 32 bytes, and a signing key is a 32-byte seed. Its parameters are chosen for a **design target** of at least 128 bits of classical security up to $2^{33}$ signatures per signing key (8,589,934,592: ten signatures a second for 27 years) under the SPHINCS+ hypertree and PORS+FP cover-probability model, pending independent cryptographic analysis.
 
-Messages are hashed in 256 KiB chunks under a salt the signer picks after seeing the first chunk, reading each chunk twice. Signing and verifying take the message itself — as bytes or a stream — with no pre-hash entry point. Pre-hashing a message before signing makes users vulnerable to collision attacks on the pre-hash; feeding the message or stream to BLINCS relies on second-preimage resistance and hashes at BLAKE3 speed.
+Messages are read once from the source in 256 KiB chunks and hashed in two keyed passes per chunk under a salt the signer picks after reading the first chunk (so the first chunk undergoes three keyed hashes during signing and two during verification). Signing and verifying take the message itself — as bytes or a stream — with no pre-hash entry point. Pre-hashing a message before signing makes users vulnerable to collision attacks on the pre-hash; feeding the message or stream directly to BLINCS avoids that exposure.
 
-All fixed-width integers are unsigned and encoded in little-endian byte order. Concatenation is written `||`, byte slicing `x[a..b]` takes bytes `a` through `b - 1`, and `x[..n]` takes the first `n` bytes.
+All fixed-width integers are unsigned and encoded in little-endian byte order. Ranges written `a..b` are half-open `[a, b)` and `a..=b` are closed `[a, b]`. Concatenation is written `||`, byte slicing `x[a..b]` takes bytes `a` through `b - 1`, and `x[..n]` takes the first `n` bytes. Maximum message length is $2^{64} - 1$ bytes.
 
 ## Hash primitive
 
-BLINCS uses the three 32-byte modes of BLAKE3:
+BLINCS uses two 32-byte modes of BLAKE3:
 
 - `Keyed(K, M)`: BLAKE3 keyed hash with 32-byte key `K` over byte string `M` (32-byte output).
 - `Derive(ctx, M)`: BLAKE3 key derivation with UTF-8 context string `ctx` over input `M` (32-byte output).
@@ -19,7 +19,7 @@ BLINCS uses the three 32-byte modes of BLAKE3:
 
 | Symbol | Value | Meaning |
 |---|---:|---|
-| `N` | 16 | Byte length of every internal hash value, node, salt, and randomizer |
+| `N` | 16 | Byte length of truncated tree, chain, salt, and randomizer values (`x_i`, `D`, `g`, and derived keys are 32 bytes) |
 | `LAYERS` | 4 | Layers of the hypertree (`d`) |
 | `TREE_HEIGHT` | 9 | Height of each hypertree tree (`h / d`; total height `HYPER_BITS = 36`, $2^9 = 512$ leaves per tree) |
 | `CHAINS` | 24 | WOTS+C chains per one-time signature (`v`) |
@@ -183,14 +183,18 @@ g = u256_le(Keyed(K_pub, tweak(PICK, 0, 0, 0, 0, 0) || D || u32_le(counter)))
 For sorted distinct `indices` in a perfect binary tree of height `FEW_HEIGHT = 15`:
 
 - Set `known = indices`.
-- For `height = 0..15`:
-  - Walk `known` left to right with index `i`:
-    - If `known[i]` is even and `i + 1 < len(known)` and `known[i + 1] == known[i] + 1`, both children of `known[i] >> 1` are known; advance `i += 2`.
-    - Otherwise, record `(height, known[i] ^ 1)` as the next required authentication node; advance `i += 1`.
-    - Append `known[i] >> 1` to `parents`.
+- For `height` in `0..15`:
+  - Initialize `parents = []` and `i = 0`.
+  - While `i < len(known)`:
+    - Let `index = known[i]`.
+    - If `index` is even and `i + 1 < len(known)` and `known[i + 1] == index + 1`, both children of `index >> 1` are known; advance `i += 2`.
+    - Otherwise, record `(height, index ^ 1)` as the next required authentication node; advance `i += 1`.
+    - Append `index >> 1` to `parents`.
   - Set `known = parents`.
 
 The recorded `(height, index)` pairs, in that order (bottom level first, left to right within each level), are the merged authentication set.
+
+Note on verifier vs. signer counter checks: the signer searches counters from `0` upward and emits the smallest valid `counter`; the verifier checks only that the supplied `counter` satisfies all validity predicates (it does not re-search smaller counters).
 
 ### Few-time tree
 
@@ -232,9 +236,9 @@ Offset   Length  Field
   Total: 3988 bytes
 ```
 
-## Signer randomness
+## Signer randomness (local policy)
 
-The signer needs one fresh 32-byte `draw` per signature without making a system call or waiting on storage on each signature.
+The wire format and verification rules above depend only on `e`, not on how the signer chose `draw`. The Rust crate implements the following local randomness policy so signing needs no per-signature disk write or clock read.
 
 A persistent state file is exactly 48 bytes:
 
@@ -245,15 +249,17 @@ Offset  Length  Field
     16      32  seed    32 bytes
 ```
 
-- **Creation (`create`)**: creates a new file (refusing to overwrite an existing file), writes `BLINCSr1 || u64_le(0) || os_bytes(32)` where `os_bytes` comes from `/dev/urandom`, and syncs the file and its parent directory once.
-- **Startup (`initialize`)**: opens an existing state file, takes an exclusive advisory lock, checks exact length 48 and magic `BLINCSr1`, reads `(count, seed)`, checks `new_count = count + 1` does not overflow, reads 32 bytes from `/dev/urandom` and a single reading of the system's monotonic clock, and computes:
+- **Creation (`create`)**: creates a new file (refusing to overwrite an existing file; mode `0600` on Unix, subject to umask), writes `BLINCSr1 || u64_le(0) || os_bytes(32)` where `os_bytes` comes from `/dev/urandom`, and syncs the file and its parent directory once. Provision the file before starting signers; do not race `create` against `initialize`.
+- **Startup (`initialize`)**: opens an existing state file in a private local directory owned by the signer, takes an exclusive advisory lock (`flock`), checks exact length 48 and magic `BLINCSr1`, reads `(count, seed)`, checks `new_count = count + 1` does not overflow, reads 32 bytes from `/dev/urandom` and opaque local diversification bytes `clock_bytes` from the system's monotonic clock (`Instant::hash` in Rust; not a portable time encoding), and computes:
   ```text
   pool      = Derive(MIX,       seed || u64_le(new_count) || os_bytes || clock_bytes)
   next_seed = Derive(NEXT_SEED, pool)
   run_key   = Derive(RUN_KEY,   pool)
   ```
   It overwrites bytes `8..48` (`u64_le(new_count) || next_seed`) in place without calling `fsync`, releases the lock, and keeps `(run_key, sig_count = 0)` in memory.
-- **Per signature (`draw`)**: atomically fetches and increments `sig_count` (stopping the program if it would overflow `u64::MAX`) and returns `Keyed(run_key, u64_le(n))`.
+- **Per signature (`draw`)**: atomically fetches and increments `sig_count` (`0..u64::MAX`, panicking if exhausted so it never wraps) and returns `Keyed(run_key, u64_le(n))`.
+- **Fork and live snapshots**: `Randomness` ensures distinct draws within one process instance. After `fork()` or restoring a live process or VM snapshot, call `initialize` again so cloned images do not repeat `(run_key, sig_count)`.
+- **Path trust boundary**: `initialize` follows symlinks and relies on cooperating writers using compatible advisory locks on a local filesystem. Keep the state file in a private trusted directory.
 
 The signing key itself is supplied by the caller and is mixed into `e = Keyed(Keyed(K_salt, draw), M_0)[..16]` on every signature. Even if the state file, `/dev/urandom`, and the monotonic clock are all rolled back together so `draw` repeats:
 
@@ -261,9 +267,16 @@ The signing key itself is supplied by the caller and is mixed into `e = Keyed(Ke
 - Single-chunk messages ($\le$ 256 KiB) still rely on second-preimage resistance (`e` depends on `M_0` under secret `K_salt`).
 - For multi-chunk messages ($>$ 256 KiB), an attacker who probes a 256 KiB prefix `M_0` and then forces a state reset learns `e` and `chunk_key_1` before submitting a second message with the same `M_0`, reducing chunk 1+ to known-key collision resistance of the two-pass function `Keyed(Keyed(k, m), m)` (still 128 bits generically over its 256-bit output).
 
-## Security assumptions and limits
+## Security target, model, and limits
 
-- BLAKE3 in keyed and key-derivation modes behaves as a PRF and target-collision-resistant hash at 128-bit security.
-- A signing key should make at most $2^{33}$ signatures (at $2^{33}$, the PORS+FP cover-probability bound gives 128.4 bits; at $2^{34}$, 124.5 bits; at $2^{36}$, 114.8 bits).
-- Signing time depends on how many counter tries the public digest needs (expected 21,642 for `PICK` and 29,209 per hypertree layer for `ONE_TIME_MESSAGE`). Those counters depend on public inputs (`D`, subtree roots), not secret chain values.
-- The library does not wipe secret keys from memory on drop (its dependency `blake3-servil-core` does not wipe intermediate state either).
+- **PORS+FP cover-probability bound (design target, classical ROM):** modeling `PICK` as a random oracle over $q$ signatures with hypertree height $h = 36$, $t = 2^{15}$, $k = 11$, and $g_f = 6$ threshold bits, a single adversary query to `PICK` succeeds only if the $g_f$ threshold bits are zero, all $k$ indices are distinct, they are covered by the at most $k r$ leaves revealed across the $r$ signatures that hit that hypertree leaf, **and** `merged_len <= 103`. By Abri & Katz (eprint 2025/2069, Theorem 1), dropping the `merged_len <= 103` filter only increases the adversary's success probability (the filter rejects candidates and never helps cover an unrevealed leaf), giving per-query bound:
+  $$P(q) \le 2^{-g_f} \sum_{r=0}^{q} \binom{q}{r} 2^{-hr} \left(1 - 2^{-h}\right)^{q-r} \frac{\binom{\min(t, k r)}{k}}{\binom{t}{k}}.$$
+  Evaluating $-\log_2 P(q)$ gives **128.4 bits** at $q = 2^{33}$, 124.5 at $2^{34}$, 120.0 at $2^{35}$, and 114.8 at $2^{36}$. This bound covers the few-time cover event under the ROM model; a complete concrete proof accounting for every hash term, multi-key targets, quantum queries, and the BLAKE3 tweakable-hash instantiation has not been independently audited.
+- **Exact mean counter tries (ideal-hash model):**
+  - WOTS+C: $256 \cdot 32^{24} / [z^{372}](1 + z + \dots + z^{31})^{24} = 256 \cdot 32^{24} / 11{,}649{,}843{,}293{,}402{,}856{,}602{,}335{,}808{,}320{,}281{,}824 \approx 29{,}209.18$ tries per layer.
+  - PORS+FP: $64 \cdot (2^{15})^{11} / (11! \cdot A) \approx 21{,}642.50$ tries, where $A = 3{,}464{,}703{,}884{,}785{,}508{,}537{,}826{,}703{,}938{,}971{,}763{,}834{,}880$ is the number of 11-leaf subsets of a $2^{15}$-leaf tree with merged authentication set at most 103.
+- **Operational signing budget:** the $2^{33}$ per-signing-key budget is an operational requirement not enforced by the library (the state-file counter counts startups, and `Randomness` counts draws in one instance, not total signatures across copies of a seed).
+- **Counter exhaustion:** searching all $2^{32}$ counters without finding a valid counter causes signing to panic (under the ideal-hash model the probability is $< 2^{-200{,}000}$).
+- **Timing:** signing time varies with the number of counter tries on public digests (`D` and subtree roots), not on secret chain values.
+- **Memory retention:** `SigningKey` retains its 32-byte seed and derived keys, and each signing thread keeps a reusable workspace (`SignWorkspace`) whose buffers retain intermediate few-time leaf secrets for the thread's lifetime. Neither BLINCS nor `blake3-servil-core` wipes secret key memory on drop. Streaming reader chunk buffers (`ChunkLease`) are zeroed on drop before being returned to the thread-local slot so later readers on the same thread never observe earlier callers' message bytes.
+- **Self-check on signing:** in Rust, `SigningKey::sign` / `sign_reader` runs `VerifyingKey::verify_short` over the assembled signature before returning it, independently recomputing the few-time and hypertree paths against `vk.root` (it does not re-read external streams).

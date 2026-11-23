@@ -4,6 +4,9 @@ It follows SPEC.md section by section and favours the shortest correct statement
 it builds every tree whole, searches every counter from zero, and finds the merged authentication set by
 walking the tree. It shares no code with the Rust implementation, and its BLAKE3 is `blake3.py` beside it.
 
+The command-line interface is a deterministic test-vector tool (passing seeds on the command line and
+reading whole files into memory), not a production signer:
+
     python3 reference/blincs.py verify <verifying key, hex> <message file> <signature file>
     python3 reference/blincs.py sign <seed, hex> <draw, hex> <message file> <signature file>
     python3 reference/blincs.py verifying-key <seed, hex>
@@ -143,9 +146,16 @@ def pick(public, digest, counter):
 
 
 # --- Keys (SPEC.md, "Keys") -----------------------------------------------------------------------------
+def _exact_bytes(value, length, name):
+    frozen = bytes(value)
+    if len(frozen) != length:
+        raise ValueError(f"{name} must be {length} bytes, got {len(frozen)}")
+    return frozen
+
+
 class VerifyingKey:
     def __init__(self, key_bytes):
-        assert len(key_bytes) == 2 * N
+        key_bytes = _exact_bytes(key_bytes, 2 * N, "verifying key")
         self.bytes = key_bytes
         self.root = key_bytes[N:]
         self.public = blake3.key_words(blake3.derive_key(PUBLIC_HASH, key_bytes[:N]))
@@ -155,6 +165,8 @@ class VerifyingKey:
         return blake3.keyed_words(self.public, tweak(MESSAGE) + randomizer + self.root + short)
 
     def verify(self, message, signature):
+        message = bytes(message)
+        signature = bytes(signature)
         if len(signature) != SIGNATURE_LEN:
             return False
         public = self.public
@@ -191,7 +203,7 @@ class VerifyingKey:
 
 class SigningKey:
     def __init__(self, seed):
-        assert len(seed) == 32
+        seed = _exact_bytes(seed, 32, "signing key seed")
         self.secret = blake3.key_words(blake3.derive_key(SECRET_VALUES, seed))
         self.salt_key = blake3.derive_key(CONTENT_SALT, seed)
         self.randomizer_key = blake3.derive_key(RANDOMIZER, seed)
@@ -217,7 +229,8 @@ class SigningKey:
 
     def sign(self, draw, message):
         """The signature of `message` with `draw`, the 32 bytes the signer's randomness gives this signature."""
-        assert len(draw) == 32
+        draw = _exact_bytes(draw, 32, "draw")
+        message = bytes(message)
         public, vk = self.public, self.verifying_key
         chunks = chunks_of(message)
         salt = blake3.keyed_hash(blake3.keyed_hash(self.salt_key, draw), chunks[0])[:N]
@@ -251,30 +264,44 @@ class SigningKey:
             signature += b"".join(levels[height][(leaf >> height) ^ 1] for height in range(TREE_HEIGHT))
             node = levels[TREE_HEIGHT][0]
             tree, leaf = tree >> TREE_HEIGHT, tree % (1 << TREE_HEIGHT)
-        assert len(signature) == SIGNATURE_LEN and node == vk.root
+        if len(signature) != SIGNATURE_LEN or node != vk.root:
+            raise RuntimeError("internal signing invariant failed")
         return signature
 
 
 # --- The signer's randomness (SPEC.md, "The signer's randomness") --------------------------------------
 def mix(seed, count, system, clock):
     """One start of a signer: the seed to keep in the file and the key of this run."""
+    seed = _exact_bytes(seed, 32, "seed")
+    system = _exact_bytes(system, 32, "system randomness")
+    clock = bytes(clock)
     pool = blake3.derive_key(MIX, seed + count.to_bytes(8, "little") + system + clock)
     return blake3.derive_key(NEXT_SEED, pool), blake3.derive_key(RUN_KEY, pool)
 
 
 def draw(run_key, number):
+    run_key = _exact_bytes(run_key, 32, "run key")
     return blake3.keyed_hash(run_key, number.to_bytes(8, "little"))
 
 
 def main(args):
     if len(args) == 4 and args[0] == "verify":
-        key, message, signature = VerifyingKey(bytes.fromhex(args[1])), open(args[2], "rb").read(), open(args[3], "rb").read()
+        key = VerifyingKey(bytes.fromhex(args[1]))
+        with open(args[2], "rb") as f:
+            message = f.read()
+        with open(args[3], "rb") as f:
+            signature = f.read()
         ok = key.verify(message, signature)
         print("valid" if ok else "INVALID")
         return 0 if ok else 1
     if len(args) == 5 and args[0] == "sign":
         key = SigningKey(bytes.fromhex(args[1]))
-        open(args[4], "wb").write(key.sign(bytes.fromhex(args[2]), open(args[3], "rb").read()))
+        draw_bytes = bytes.fromhex(args[2])
+        with open(args[3], "rb") as f:
+            message = f.read()
+        signature = key.sign(draw_bytes, message)
+        with open(args[4], "wb") as f:
+            f.write(signature)
         return 0
     if len(args) == 2 and args[0] == "verifying-key":
         print(SigningKey(bytes.fromhex(args[1])).verifying_key.bytes.hex())

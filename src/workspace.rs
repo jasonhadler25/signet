@@ -1,10 +1,11 @@
-use crate::params::{CHAINS, CHUNK_LEN, FEW_LEAVES, N, TREE_LEAVES};
+use crate::params::{CHAINS, CHUNK_LEN, FEW_LEAVES, N, OPENED, TREE_LEAVES};
 use blake3_servil_core::throughput::{Batch, Block};
 use std::cell::RefCell;
 
-pub(crate) const GRIND: usize = 256;
+pub(crate) const GRIND: usize = 2048;
 
 /// Reusable buffers for signing, kept once per thread for the life of the process.
+/// Note: `b32` and `out` hold intermediate few-time leaf secrets and are not wiped on drop.
 pub(crate) struct SignWorkspace {
     pub b16: Batch<'static>,
     pub b32: Batch<'static>,
@@ -13,7 +14,6 @@ pub(crate) struct SignWorkspace {
     pub b_pick: Batch<'static>,
     pub b_wmsg: Batch<'static>,
     pub out: Vec<[u8; 32]>,
-    pub chunk: Vec<Block>,
 }
 
 impl SignWorkspace {
@@ -26,7 +26,6 @@ impl SignWorkspace {
             b_pick: Batch::new(52, GRIND),
             b_wmsg: Batch::new(36, GRIND),
             out: vec![[0u8; 32]; FEW_LEAVES],
-            chunk: vec![Block::ZERO; CHUNK_LEN / 64],
         }
     }
 }
@@ -34,26 +33,60 @@ impl SignWorkspace {
 /// Reusable buffers for verifying, kept once per thread.
 pub(crate) struct VerifyWorkspace {
     pub b32: Batch<'static>,
+    pub b48: Batch<'static>,
     pub out: [[u8; 32]; CHAINS],
-    pub chunk: Vec<Block>,
 }
 
 impl VerifyWorkspace {
     fn new() -> Self {
-        Self { b32: Batch::new(32, CHAINS), out: [[0u8; 32]; CHAINS], chunk: Vec::new() }
+        Self { b32: Batch::new(32, CHAINS), b48: Batch::new(48, OPENED), out: [[0u8; 32]; CHAINS] }
+    }
+}
+
+/// An owned, zero-initialized 256 KiB aligned chunk buffer leased for one streaming operation.
+///
+/// Releasing the thread-local borrow immediately allows re-entrant `Read` callbacks to call back into
+/// BLINCS without panicking, and `Drop` zeroes the entire buffer before returning it to the thread-local
+/// slot so a later reader on the same thread never observes bytes from an earlier caller.
+pub(crate) struct ChunkLease {
+    buf: Option<Vec<Block>>,
+}
+
+impl ChunkLease {
+    pub fn take() -> Self {
+        let reused = CHUNK_POOL.with(|cell| cell.borrow_mut().take());
+        let buf = reused.unwrap_or_else(|| vec![Block::ZERO; CHUNK_LEN / 64]);
+        Self { buf: Some(buf) }
     }
 
-    pub fn chunk_buf(&mut self) -> &mut [Block] {
-        if self.chunk.is_empty() {
-            self.chunk = vec![Block::ZERO; CHUNK_LEN / 64];
+    pub fn blocks_mut(&mut self) -> &mut [Block] {
+        self.buf.as_mut().unwrap()
+    }
+
+    #[cfg(test)]
+    pub fn pool_has_buffer() -> bool {
+        CHUNK_POOL.with(|cell| cell.borrow().is_some())
+    }
+}
+
+impl Drop for ChunkLease {
+    fn drop(&mut self) {
+        if let Some(mut buf) = self.buf.take() {
+            Block::bytes_mut(&mut buf).fill(0);
+            let _ = CHUNK_POOL.try_with(|cell| {
+                let mut slot = cell.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(buf);
+                }
+            });
         }
-        &mut self.chunk
     }
 }
 
 thread_local! {
     static SIGN_WS: RefCell<SignWorkspace> = RefCell::new(SignWorkspace::new());
     static VERIFY_WS: RefCell<VerifyWorkspace> = RefCell::new(VerifyWorkspace::new());
+    static CHUNK_POOL: RefCell<Option<Vec<Block>>> = const { RefCell::new(None) };
 }
 
 pub(crate) fn with_sign_workspace<R>(f: impl FnOnce(&mut SignWorkspace) -> R) -> R {

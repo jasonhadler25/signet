@@ -1,10 +1,10 @@
 use crate::params::{
     AUTH_NODES, FEW_HEIGHT, FEW_LEAVES, FEW_LEN, HYPER_BITS, KIND_FEW_LEAF, KIND_FEW_NODE, KIND_FEW_SECRET, KIND_PICK, N, OPENED, THRESHOLD_BITS, TREE_HEIGHT,
-    first_n, keyed, short_hash, tweak,
+    first_n, tweak,
 };
 use crate::workspace::{GRIND, SignWorkspace, VerifyWorkspace};
 use blake3_servil_core::Mode;
-use blake3_servil_core::throughput::{self, Prepared};
+use blake3_servil_core::throughput::{self, Prepared, TreeHasher};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Picked {
@@ -98,37 +98,35 @@ pub(crate) fn merged_set(indices: &[u16; OPENED]) -> Vec<(u8, u16)> {
 }
 
 /// Evaluate `PICK` for one `(digest, counter)` pair.
-pub(crate) fn pick(public: &[u8; 32], digest: &[u8; 32], counter: u32) -> Option<Picked> {
+pub(crate) fn pick(public: &TreeHasher, digest: &[u8; 32], counter: u32) -> Option<Picked> {
     let mut input = [0u8; 52];
     input[..16].copy_from_slice(&tweak(KIND_PICK, 0, 0, 0, 0, 0));
     input[16..48].copy_from_slice(digest);
     input[48..52].copy_from_slice(&counter.to_le_bytes());
-    parse_pick(&keyed(public, &input))
+    parse_pick(public.hash(&input).as_bytes())
 }
 
 /// Find the smallest `counter` in `0..=u32::MAX` that passes `PICK`, batching `GRIND` counters at a time.
 fn search_pick(public: &[u8; 32], digest: &[u8; 32], ws: &mut SignWorkspace) -> (u32, Picked) {
+    const { assert!((1u64 << 32).is_multiple_of(GRIND as u64)) };
     let t = tweak(KIND_PICK, 0, 0, 0, 0, 0);
     for i in 0..GRIND {
         let m = ws.b_pick.message_mut(i);
         m[..16].copy_from_slice(&t);
         m[16..48].copy_from_slice(digest);
     }
-    let mut base = 0u64;
-    loop {
-        let count = (u32::MAX as u64 + 1 - base).min(GRIND as u64) as usize;
-        assert!(count > 0, "few-time counter search exhausted 2^32 tries");
-        for i in 0..count {
+    for base in (0u64..=u32::MAX as u64).step_by(GRIND) {
+        for i in 0..GRIND {
             ws.b_pick.message_mut(i)[48..52].copy_from_slice(&((base + i as u64) as u32).to_le_bytes());
         }
-        throughput::hash_many(Mode::Keyed(public), &ws.b_pick.part(0..count), &mut ws.out[..count]);
-        for (i, digest) in ws.out.iter().enumerate().take(count) {
-            if let Some(picked) = parse_pick(digest) {
+        throughput::hash_many(Mode::Keyed(public), &ws.b_pick, &mut ws.out[..GRIND]);
+        for (i, out) in ws.out.iter().enumerate().take(GRIND) {
+            if let Some(picked) = parse_pick(out) {
                 return ((base + i as u64) as u32, picked);
             }
         }
-        base += count as u64;
     }
+    panic!("few-time counter search exhausted 2^32 tries");
 }
 
 /// Build the few-time signature into `sig_part` (`FEW_LEN` bytes) and return `(tree, leaf, few_time_root)`.
@@ -183,14 +181,13 @@ pub(crate) fn few_time_sign(secret: &[u8; 32], public: &[u8; 32], digest: &[u8; 
 }
 
 /// Verify the few-time signature in `sig_part` (`FEW_LEN` bytes), returning `(tree, leaf, few_time_root)`.
-pub(crate) fn few_time_verify(public: &[u8; 32], digest: &[u8; 32], sig_part: &[u8], ws: &mut VerifyWorkspace) -> Option<(u64, u16, [u8; N])> {
+pub(crate) fn few_time_verify(public: &TreeHasher, digest: &[u8; 32], sig_part: &[u8], ws: &mut VerifyWorkspace) -> Option<(u64, u16, [u8; N])> {
     debug_assert_eq!(sig_part.len(), FEW_LEN);
     let counter = u32::from_le_bytes(sig_part[0..4].try_into().unwrap());
     let picked = pick(public, digest, counter)?;
     let (tree, leaf) = (picked.tree, picked.leaf);
 
-    let secrets = &sig_part[4..4 + N * OPENED];
-    let auth = &sig_part[4 + N * OPENED..];
+    let (secrets, auth) = sig_part[4..].split_at(N * OPENED);
 
     // Check trailing unused auth slots are zero.
     if auth[N * picked.merged_len..].iter().any(|&b| b != 0) {
@@ -203,7 +200,7 @@ pub(crate) fn few_time_verify(public: &[u8; 32], digest: &[u8; 32], sig_part: &[
         m[..16].copy_from_slice(&tweak(KIND_FEW_LEAF, 0, tree, leaf, 0, idx as u32));
         m[16..32].copy_from_slice(&secrets[N * j..N * (j + 1)]);
     }
-    throughput::hash_many(Mode::Keyed(public), &ws.b32.part(0..OPENED), &mut ws.out[..OPENED]);
+    public.hash_many(&ws.b32.part(0..OPENED), &mut ws.out[..OPENED]);
 
     let mut known: [(u16, [u8; N]); OPENED] = [(0, [0u8; N]); OPENED];
     for j in 0..OPENED {
@@ -212,33 +209,43 @@ pub(crate) fn few_time_verify(public: &[u8; 32], digest: &[u8; 32], sig_part: &[
 
     let mut len = OPENED;
     let mut used = 0usize;
-    let mut pair = [0u8; 2 * N];
+    let mut parent_indices = [0u16; OPENED];
     for height in 0..FEW_HEIGHT {
         let mut next_len = 0;
         let mut i = 0;
         while i < len {
             let (index, value) = known[i];
+            let parent_idx = index >> 1;
+            let m = ws.b48.message_mut(next_len);
+            m[..16].copy_from_slice(&tweak(KIND_FEW_NODE, 0, tree, leaf, height as u16 + 1, parent_idx as u32));
             if index & 1 == 0 && i + 1 < len && known[i + 1].0 == index + 1 {
-                pair[..N].copy_from_slice(&value);
-                pair[N..].copy_from_slice(&known[i + 1].1);
+                m[16..32].copy_from_slice(&value);
+                m[32..48].copy_from_slice(&known[i + 1].1);
                 i += 2;
             } else {
                 assert!(used < AUTH_NODES);
                 let other = &auth[N * used..N * (used + 1)];
                 used += 1;
                 if index & 1 == 0 {
-                    pair[..N].copy_from_slice(&value);
-                    pair[N..].copy_from_slice(other);
+                    m[16..32].copy_from_slice(&value);
+                    m[32..48].copy_from_slice(other);
                 } else {
-                    pair[..N].copy_from_slice(other);
-                    pair[N..].copy_from_slice(&value);
+                    m[16..32].copy_from_slice(other);
+                    m[32..48].copy_from_slice(&value);
                 }
                 i += 1;
             }
-            let parent_idx = index >> 1;
-            let parent_val = short_hash(public, tweak(KIND_FEW_NODE, 0, tree, leaf, height as u16 + 1, parent_idx as u32), &pair);
-            known[next_len] = (parent_idx, parent_val);
+            parent_indices[next_len] = parent_idx;
             next_len += 1;
+        }
+        if next_len >= 2 {
+            public.hash_many(&ws.b48.part(0..next_len), &mut ws.out[..next_len]);
+            for j in 0..next_len {
+                known[j] = (parent_indices[j], first_n(&ws.out[j]));
+            }
+        } else {
+            let h = public.hash(ws.b48.message_mut(0));
+            known[0] = (parent_indices[0], first_n(h.as_bytes()));
         }
         len = next_len;
     }

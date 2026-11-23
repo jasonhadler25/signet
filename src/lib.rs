@@ -8,6 +8,7 @@
 //! ```
 //! use blincs::{Randomness, SigningKey, VerifyingKey};
 //!
+//! # // In production, store the state file in a private directory owned by the signer.
 //! let dir = std::env::temp_dir().join(format!("blincs-doc-{}", std::process::id()));
 //! std::fs::create_dir_all(&dir).unwrap();
 //! let state = dir.join("state.bin");
@@ -38,6 +39,8 @@ mod workspace;
 pub use params::{CHUNK_LEN, SEED_LEN, SIGNATURE_LEN, VERIFYING_KEY_LEN};
 pub use randomness::Randomness;
 
+use blake3_servil_core::Mode;
+use blake3_servil_core::throughput::TreeHasher;
 use content::{content_from_reader, content_from_slice, derive_salt_slice};
 use few_time::{few_time_sign, few_time_verify};
 use one_time::{Pos, build_tree, sign_layer, sign_top_layer, verify_layer};
@@ -48,18 +51,18 @@ use params::{
 use std::array::TryFromSliceError;
 use std::fmt;
 use std::io::{self, Read};
-use workspace::{SignWorkspace, with_sign_workspace, with_verify_workspace};
+use workspace::{ChunkLease, SignWorkspace, with_sign_workspace, with_verify_workspace};
 
 /// A 3,988-byte BLINCS signature.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Signature {
-    bytes: Box<[u8; SIGNATURE_LEN]>,
+    bytes: [u8; SIGNATURE_LEN],
 }
 
 impl Signature {
     /// Wrap a 3,988-byte array as a signature.
     pub fn from_bytes(bytes: &[u8; SIGNATURE_LEN]) -> Self {
-        Self { bytes: Box::new(*bytes) }
+        Self { bytes: *bytes }
     }
 
     /// Borrow the 3,988 signature bytes.
@@ -113,27 +116,28 @@ impl VerifyingKey {
         &self.bytes[N..]
     }
 
-    fn message_digest(&self, randomizer: &[u8; N], short: &[u8; SHORT_LEN]) -> [u8; 32] {
+    pub(crate) fn message_digest(&self, public: &TreeHasher, randomizer: &[u8; N], short: &[u8; SHORT_LEN]) -> [u8; 32] {
         let mut input = [0u8; 16 + N + N + SHORT_LEN];
         input[..16].copy_from_slice(&tweak(KIND_MESSAGE, 0, 0, 0, 0, 0));
         input[16..16 + N].copy_from_slice(randomizer);
         input[16 + N..16 + 2 * N].copy_from_slice(self.root());
         input[16 + 2 * N..].copy_from_slice(short);
-        keyed(&self.public, &input)
+        *public.hash(&input).as_bytes()
     }
 
     pub(crate) fn verify_short(&self, short: &[u8; SHORT_LEN], signature: &Signature) -> bool {
         let sig = signature.as_bytes();
         let randomizer: [u8; N] = sig[N..2 * N].try_into().unwrap();
-        let digest = self.message_digest(&randomizer, short);
+        let pub_core = TreeHasher::new(Mode::Keyed(&self.public)).on_this_core();
+        let digest = self.message_digest(&pub_core, &randomizer, short);
         with_verify_workspace(|ws| {
-            let Some((mut tree, mut leaf, mut node)) = few_time_verify(&self.public, &digest, &sig[2 * N..2 * N + FEW_LEN], ws) else {
+            let Some((mut tree, mut leaf, mut node)) = few_time_verify(&pub_core, &digest, &sig[2 * N..2 * N + FEW_LEN], ws) else {
                 return false;
             };
             let mut at = 2 * N + FEW_LEN;
             for layer in 0..LAYERS {
                 let pos = Pos { layer: layer as u8, tree, leaf };
-                let Some(next) = verify_layer(&self.public, pos, &node, &sig[at..at + LAYER_LEN], ws) else {
+                let Some(next) = verify_layer(&pub_core, pos, &node, &sig[at..at + LAYER_LEN], ws) else {
                     return false;
                 };
                 node = next;
@@ -155,7 +159,10 @@ impl VerifyingKey {
     /// Verify `signature` over a streaming `reader`, hashing in 256 KiB chunks.
     pub fn verify_reader(&self, reader: impl Read, signature: &Signature) -> io::Result<bool> {
         let salt: [u8; N] = signature.as_bytes()[..N].try_into().unwrap();
-        let (_, short) = with_verify_workspace(|ws| content_from_reader(&self.content_key, Ok(salt), reader, ws.chunk_buf()))?;
+        let (_, short) = {
+            let mut lease = ChunkLease::take();
+            content_from_reader(&self.content_key, Ok(salt), reader, lease.blocks_mut())?
+        };
         Ok(self.verify_short(&short, signature))
     }
 }
@@ -219,27 +226,25 @@ impl SigningKey {
 
     fn finish_signature(&self, salt: &[u8; N], short: &[u8; SHORT_LEN], ws: &mut SignWorkspace) -> Signature {
         let randomizer = first_n(&keyed(&self.randomizer_key, short));
-        let digest = self.verifying_key.message_digest(&randomizer, short);
+        let pub_hasher = TreeHasher::new(Mode::Keyed(&self.verifying_key.public));
+        let digest = self.verifying_key.message_digest(&pub_hasher, &randomizer, short);
 
-        let mut bytes = Box::new([0u8; SIGNATURE_LEN]);
+        let mut bytes = [0u8; SIGNATURE_LEN];
         bytes[..N].copy_from_slice(salt);
         bytes[N..2 * N].copy_from_slice(&randomizer);
 
         let (mut tree, mut leaf, mut node) = few_time_sign(&self.secret, &self.verifying_key.public, &digest, &mut bytes[2 * N..2 * N + FEW_LEN], ws);
 
         let mut at = 2 * N + FEW_LEN;
-        for layer in 0..LAYERS {
+        for layer in 0..LAYERS - 1 {
             let pos = Pos { layer: layer as u8, tree, leaf };
-            let part = &mut bytes[at..at + LAYER_LEN];
-            node = if layer == LAYERS - 1 {
-                sign_top_layer(&self.secret, &self.verifying_key.public, pos, &node, &self.top, part, ws)
-            } else {
-                sign_layer(&self.secret, &self.verifying_key.public, pos, &node, part, ws)
-            };
+            node = sign_layer(&self.secret, &self.verifying_key.public, pos, &node, &mut bytes[at..at + LAYER_LEN], ws);
             leaf = (tree & ((1u64 << TREE_HEIGHT) - 1)) as u16;
             tree >>= TREE_HEIGHT;
             at += LAYER_LEN;
         }
+        let top_pos = Pos { layer: (LAYERS - 1) as u8, tree: 0, leaf };
+        node = sign_top_layer(&self.secret, &self.verifying_key.public, top_pos, &node, &self.top, &mut bytes[at..at + LAYER_LEN], ws);
         assert_eq!(node, self.verifying_key.root(), "computed hypertree root differs from verifying key");
         let sig = Signature { bytes };
         assert!(self.verifying_key.verify_short(short, &sig), "produced signature failed self-verification");
@@ -254,10 +259,11 @@ impl SigningKey {
     }
 
     pub(crate) fn sign_reader_with_draw(&self, draw: &[u8; 32], reader: impl Read) -> io::Result<Signature> {
-        with_sign_workspace(|ws| {
-            let (salt, short) = content_from_reader(&self.verifying_key.content_key, Err((&self.salt_key, draw)), reader, &mut ws.chunk)?;
-            Ok(self.finish_signature(&salt, &short, ws))
-        })
+        let (salt, short) = {
+            let mut lease = ChunkLease::take();
+            content_from_reader(&self.verifying_key.content_key, Err((&self.salt_key, draw)), reader, lease.blocks_mut())?
+        };
+        Ok(with_sign_workspace(|ws| self.finish_signature(&salt, &short, ws)))
     }
 
     /// Sign an in-memory `message`, drawing fresh per-signature randomness from `randomness`.

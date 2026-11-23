@@ -30,7 +30,7 @@ fn read_os_randomness() -> io::Result<[u8; 32]> {
 
 /// Capture the bytes `Instant::now()` feeds to `Hash` (raw seconds and nanoseconds of the system monotonic
 /// clock, without unsafe code or external dependencies).
-fn read_monotonic_clock() -> Vec<u8> {
+pub(crate) fn read_monotonic_clock() -> Vec<u8> {
     struct Collect(Vec<u8>);
     impl Hasher for Collect {
         fn write(&mut self, bytes: &[u8]) {
@@ -46,11 +46,11 @@ fn read_monotonic_clock() -> Vec<u8> {
     c.0
 }
 
-fn read_exact_or_reject(file: &mut File) -> io::Result<[u8; STATE_LEN]> {
+pub(crate) fn read_exact_or_reject(reader: &mut impl Read) -> io::Result<[u8; STATE_LEN]> {
     let mut buf = [0u8; STATE_LEN + 1];
     let mut filled = 0;
     while filled < buf.len() {
-        match file.read(&mut buf[filled..]) {
+        match reader.read(&mut buf[filled..]) {
             Ok(0) => break,
             Ok(n) => filled += n,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -67,8 +67,13 @@ fn read_exact_or_reject(file: &mut File) -> io::Result<[u8; STATE_LEN]> {
 
 /// Per-process signer randomness, backed by a 48-byte persistent state file updated once at startup.
 ///
-/// After [`Randomness::initialize`] returns, drawing per-signature randomness touches memory alone: no
-/// system calls, no disk writes, and no clock reads.
+/// After [`Randomness::initialize`] returns, drawing per-signature randomness computes a keyed BLAKE3 hash
+/// over an in-memory counter (no disk writes, no clock reads, and no system calls by BLINCS itself).
+///
+/// Keep the state file in a private local directory owned by the signer on a filesystem that supports
+/// advisory file locks (`flock`). Provision the file once with [`Randomness::create`] before starting
+/// signers. After `fork()` or restoring a live process or VM snapshot, call [`Randomness::initialize`]
+/// again so cloned process images do not share the same `(run_key, count)` sequence.
 pub struct Randomness {
     run_key: [u8; 32],
     count: AtomicU64,
@@ -85,7 +90,6 @@ impl Randomness {
     ///
     /// Fails if `path` already exists, so an existing state file or another file is never overwritten.
     pub fn create(path: impl AsRef<Path>) -> io::Result<()> {
-        blake3_servil_core::initialize();
         let path = path.as_ref();
         let os_bytes = read_os_randomness()?;
         let mut opts = OpenOptions::new();
