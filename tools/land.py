@@ -81,6 +81,7 @@ def main():
 
     run("BLAKE3 official test vectors (Python)", [sys.executable, "reference/blake3.py"])
     run("Parameter optimizer self-check", [sys.executable, "tools/optimize.py", "--check"])
+    run("Shipped-code safety counts", [sys.executable, "tools/counts.py"])
     check_vectors_and_python()
 
     if "--skip-rust" not in args:

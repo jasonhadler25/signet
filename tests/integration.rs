@@ -37,7 +37,7 @@ fn public_api_round_trip_and_python_reference_cross_check() {
     let py = concat!(env!("CARGO_MANIFEST_DIR"), "/reference/blincs.py");
 
     for (name, len) in [("empty", 0usize), ("small", 43), ("64k", 64 * 1024), ("512k-plus", 512 * 1024 + 123)] {
-        let msg: Vec<u8> = (0..len).map(|i| ((i * 73 + 11) & 0xff) as u8).collect();
+        let msg: Vec<u8> = (0..len).map(|i| u8::try_from((i * 73 + 11) & 0xff).unwrap()).collect();
         let sig = sk.sign(&rng, &msg);
         assert!(vk.verify(&msg, &sig));
         assert!(vk.verify_reader(Cursor::new(&msg), &sig).unwrap());
@@ -73,7 +73,7 @@ fn public_api_round_trip_and_python_reference_cross_check() {
 fn reference_vector_verifies_via_public_api() {
     let raw = fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/test_vectors/reference-signature-1.bin")).unwrap();
     let sig = Signature::try_from(raw.as_slice()).unwrap();
-    let seed: [u8; SEED_LEN] = core::array::from_fn(|i| i as u8);
+    let seed: [u8; SEED_LEN] = core::array::from_fn(|i| u8::try_from(i).unwrap());
     let vk = SigningKey::from_seed(&seed).verifying_key();
     assert!(vk.verify(b"hello, BLINCS", &sig));
     assert!(!vk.verify(b"hello, blincs", &sig));

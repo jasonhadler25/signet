@@ -25,3 +25,15 @@ overflow-checks = true
 [profile.mutants]
 inherits = "release"
 incremental = true
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+unreachable_patterns = "deny"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"

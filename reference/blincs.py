@@ -5,6 +5,7 @@ Self-contained except for reference/blake3.py (BLAKE3 from its spec).
 """
 
 import concurrent.futures
+import hmac
 import os
 import sys
 
@@ -37,10 +38,14 @@ KIND_FEW_SECRET, KIND_FEW_LEAF, KIND_FEW_NODE, KIND_FEW_ROOT = 5, 6, 7, 8
 KIND_MESSAGE = 9
 
 
-def _check_len(name, value, expected):
+def _to_bytes(name, value):
     if not isinstance(value, (bytes, bytearray, memoryview)):
         raise TypeError(f"{name} must be bytes-like")
-    out = bytes(value)
+    return bytes(value)
+
+
+def _check_len(name, value, expected):
+    out = _to_bytes(name, value)
     if len(out) != expected:
         raise ValueError(f"{name} must be {expected} bytes, got {len(out)}")
     return out
@@ -147,6 +152,8 @@ class VerifyingKey:
         self.content_key = blake3.derive_key(CTX_CONTENT, self.bytes)
 
     def verify(self, message, signature):
+        message = _to_bytes("message", message)
+        signature = _to_bytes("signature", signature)
         if len(signature) != SIGNATURE_LEN:
             return False
         salt, randomizer, at = signature[:N], signature[N : 2 * N], 2 * N
@@ -192,7 +199,7 @@ class VerifyingKey:
                 cur = H(self.public, tweak(KIND_NODE, layer, tree, 0, level, idx), pair)
             node = cur
             addr = tree
-        return at == SIGNATURE_LEN and node == self.root
+        return at == SIGNATURE_LEN and hmac.compare_digest(node, self.root)
 
 
 class SigningKey:
@@ -217,6 +224,7 @@ class SigningKey:
         self.verifying_key = VerifyingKey(public_seed + self.top_levels[-1][0])
 
     def sign(self, message, draw_bytes):
+        message = _to_bytes("message", message)
         draw_bytes = _check_len("draw", draw_bytes, 32)
         public, vk = self.public, self.verifying_key
         salt = blake3.keyed_hash(self.salt_key, draw_bytes)[:N]
@@ -260,7 +268,8 @@ class SigningKey:
             node = levels[-1][0]
             addr = tree
 
-        assert len(out) == SIGNATURE_LEN
+        if len(out) != SIGNATURE_LEN or not hmac.compare_digest(node, vk.root):
+            raise RuntimeError("internal error: generated signature failed self-check")
         return bytes(out)
 
 

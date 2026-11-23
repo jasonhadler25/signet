@@ -34,18 +34,14 @@ mod test;
 pub use params::{SEED_LEN, SIGNATURE_LEN, VERIFYING_KEY_LEN};
 pub use randomness::Randomness;
 
-use blake3_servil::Mode;
-use blake3_servil::throughput::TreeHasher;
-use content::{content_from_reader, content_from_slice, derive_salt};
+use content::{content_from_reader, content_from_slice};
 use few_time::{fors_root, fors_verify, parse_digest};
 use one_time::{KeyPair, Pos, build_merkle_heap, verify_layer, write_layer_signature};
-use params::{
-    CTX_CONTENT, CTX_CONTENT_SALT, CTX_PUBLIC_HASH, CTX_PUBLIC_SEED, CTX_RANDOMIZER, CTX_SECRET_VALUES, FORS_LEN, FORS_TREES, KIND_MESSAGE, LAYERS,
-    LOWER_HEIGHT, LOWER_LAYER_LEN, N, SHORT_LEN, TOP_HEIGHT, TOP_LAYER_LEN, derive_key, ensure_init, first_n, keyed, tweak,
-};
+use params::{ContentKey, FORS_LEN, FORS_TREES, Layer, N, PublicKey, RandomizerKey, SHORT_LEN, SaltKey, SecretKey, TreeIndex, TweakKind, ensure_init, tweak};
 use pool::{build_top_leaves_parallel, run_sign_wave};
 use std::array::TryFromSliceError;
 use std::fmt;
+use std::hint::black_box;
 use std::io::{self, Read};
 use workspace::{with_caller_scratch, with_verify_workspace};
 
@@ -54,7 +50,7 @@ fn ct_eq_n(a: &[u8; N], b: &[u8; N]) -> bool {
     for i in 0..N {
         diff |= a[i] ^ b[i];
     }
-    diff == 0
+    black_box(diff) == 0
 }
 
 /// A 5,616-byte BLINCS signature.
@@ -71,6 +67,23 @@ impl Signature {
     pub fn as_bytes(&self) -> &[u8; SIGNATURE_LEN] {
         &self.0
     }
+
+    fn salt(&self) -> &[u8; N] {
+        self.0[..N].try_into().unwrap()
+    }
+
+    fn randomizer(&self) -> &[u8; N] {
+        self.0[N..2 * N].try_into().unwrap()
+    }
+
+    fn fors(&self) -> &[u8; FORS_LEN] {
+        self.0[2 * N..2 * N + FORS_LEN].try_into().unwrap()
+    }
+
+    fn layer(&self, layer: Layer) -> &[u8] {
+        let off = layer.sig_offset();
+        &self.0[off..off + layer.sig_len()]
+    }
 }
 
 impl TryFrom<&[u8]> for Signature {
@@ -84,7 +97,7 @@ impl TryFrom<&[u8]> for Signature {
 impl fmt::Debug for Signature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Signature({SIGNATURE_LEN} bytes, salt=")?;
-        for &b in &self.0[..N] {
+        for &b in self.salt() {
             write!(f, "{b:02x}")?;
         }
         f.write_str(")")
@@ -95,8 +108,17 @@ impl fmt::Debug for Signature {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct VerifyingKey {
     bytes: [u8; VERIFYING_KEY_LEN],
-    public_key: [u8; 32],
-    content_key: [u8; 32],
+    public_key: PublicKey,
+    content_key: ContentKey,
+}
+
+impl TryFrom<&[u8]> for VerifyingKey {
+    type Error = TryFromSliceError;
+
+    fn try_from(slice: &[u8]) -> Result<Self, Self::Error> {
+        let arr: &[u8; VERIFYING_KEY_LEN] = slice.try_into()?;
+        Ok(Self::from_bytes(arr))
+    }
 }
 
 impl fmt::Debug for VerifyingKey {
@@ -113,8 +135,9 @@ impl VerifyingKey {
     /// Construct a verifying key from its 32-byte wire encoding (`public_seed || top_root`).
     pub fn from_bytes(bytes: &[u8; VERIFYING_KEY_LEN]) -> Self {
         ensure_init();
-        let public_key = derive_key(CTX_PUBLIC_HASH, &bytes[..N]);
-        let content_key = derive_key(CTX_CONTENT, bytes);
+        let public_seed: &[u8; N] = bytes[..N].try_into().unwrap();
+        let public_key = PublicKey::from_public_seed(public_seed);
+        let content_key = ContentKey::from_vk_bytes(bytes);
         Self { bytes: *bytes, public_key, content_key }
     }
 
@@ -129,57 +152,45 @@ impl VerifyingKey {
 
     /// Verify `signature` over an in-memory `message` slice.
     pub fn verify(&self, message: &[u8], signature: &Signature) -> bool {
-        let salt: [u8; N] = signature.as_bytes()[..N].try_into().unwrap();
-        let short = content_from_slice(&self.content_key, &salt, message);
+        let short = content_from_slice(&self.content_key, signature.salt(), message);
         self.verify_short(&short, signature)
     }
 
     /// Verify `signature` over a streaming `reader` in one salted pass.
     pub fn verify_reader(&self, reader: impl Read, signature: &Signature) -> io::Result<bool> {
-        let salt: [u8; N] = signature.as_bytes()[..N].try_into().unwrap();
-        let short = content_from_reader(&self.content_key, &salt, reader)?;
+        let short = content_from_reader(&self.content_key, signature.salt(), reader)?;
         Ok(self.verify_short(&short, signature))
     }
 
     fn verify_short(&self, short: &[u8; SHORT_LEN], signature: &Signature) -> bool {
-        let sig = signature.as_bytes();
-        let randomizer = &sig[N..2 * N];
         let mut msg_in = [0u8; 16 + N + N + SHORT_LEN];
-        msg_in[..16].copy_from_slice(&tweak(KIND_MESSAGE, 0, 0, 0, 0, 0));
-        msg_in[16..32].copy_from_slice(randomizer);
+        msg_in[..16].copy_from_slice(&tweak(TweakKind::Message, 0, TreeIndex::ZERO, 0, 0, 0));
+        msg_in[16..32].copy_from_slice(signature.randomizer());
         msg_in[32..48].copy_from_slice(self.root());
         msg_in[48..].copy_from_slice(short);
 
-        let public = TreeHasher::new(Mode::Keyed(&self.public_key)).on_this_core();
+        let public = self.public_key.tree_hasher(false);
         let digest = *public.hash(&msg_in).as_bytes();
         let (fors_indices, leaf_addr) = parse_digest(&digest);
+        let coords = leaf_addr.split_layers();
 
         with_verify_workspace(|ws| {
-            let mut at = 2 * N;
-            let mut node = fors_verify(&public, leaf_addr, &fors_indices, &sig[at..at + FORS_LEN], ws);
-            at += FORS_LEN;
-
-            let mut addr = leaf_addr;
-            for layer in 0..LAYERS {
-                let (height, layer_len) = if layer + 1 == LAYERS { (TOP_HEIGHT, TOP_LAYER_LEN) } else { (LOWER_HEIGHT, LOWER_LAYER_LEN) };
-                let leaf = (addr & ((1u64 << height) - 1)) as u16;
-                let tree = addr >> height;
-                node = verify_layer(&public, Pos { layer: layer as u8, tree, leaf }, height, &node, &sig[at..at + layer_len], ws);
-                at += layer_len;
-                addr = tree;
+            let mut node = fors_verify(&public, leaf_addr, &fors_indices, signature.fors(), ws);
+            for layer in Layer::ALL {
+                let (tree, leaf) = coords[layer.index()];
+                node = verify_layer(&public, Pos::new(layer, tree, leaf), &node, signature.layer(layer), ws);
             }
-            debug_assert_eq!(at, SIGNATURE_LEN);
             ct_eq_n(&node, self.root())
         })
     }
 }
 
-/// A BLINCS signing key derived from a 32-byte seed, caching the 1 MiB top hypertree in memory.
+/// A BLINCS signing key derived from a 32-byte seed, holding the 128 KiB top hypertree in memory.
 pub struct SigningKey {
     seed: [u8; SEED_LEN],
-    secret_key: [u8; 32],
-    salt_key: [u8; 32],
-    randomizer_key: [u8; 32],
+    secret_key: SecretKey,
+    salt_key: SaltKey,
+    randomizer_key: RandomizerKey,
     verifying_key: VerifyingKey,
     top_tree: Vec<[u8; N]>,
 }
@@ -194,19 +205,18 @@ impl SigningKey {
     /// Derive a signing key from a 32-byte `seed`, building the 128 KiB top hypertree across all CPU cores.
     pub fn from_seed(seed: &[u8; SEED_LEN]) -> Self {
         ensure_init();
-        let secret_key = derive_key(CTX_SECRET_VALUES, seed);
-        let salt_key = derive_key(CTX_CONTENT_SALT, seed);
-        let randomizer_key = derive_key(CTX_RANDOMIZER, seed);
-        let public_seed = first_n(&derive_key(CTX_PUBLIC_SEED, seed));
-        let public_key = derive_key(CTX_PUBLIC_HASH, &public_seed);
+        let secret_key = SecretKey::derive(seed);
+        let salt_key = SaltKey::derive(seed);
+        let randomizer_key = RandomizerKey::derive(seed);
+        let (public_seed, public_key) = PublicKey::derive_seed_and_key(seed);
 
         let top_leaves = build_top_leaves_parallel(&secret_key, &public_key);
-        let top_tree = with_caller_scratch(|ws| build_merkle_heap(&public_key, (LAYERS - 1) as u8, 0, TOP_HEIGHT, &top_leaves, ws));
+        let top_tree = with_caller_scratch(|ws| build_merkle_heap(&public_key, Layer::TOP, TreeIndex::ZERO, &top_leaves, ws));
 
         let mut vk_bytes = [0u8; VERIFYING_KEY_LEN];
         vk_bytes[..N].copy_from_slice(&public_seed);
         vk_bytes[N..].copy_from_slice(&top_tree[1]);
-        let content_key = derive_key(CTX_CONTENT, &vk_bytes);
+        let content_key = ContentKey::from_vk_bytes(&vk_bytes);
         let verifying_key = VerifyingKey { bytes: vk_bytes, public_key, content_key };
         Self { seed: *seed, secret_key, salt_key, randomizer_key, verifying_key, top_tree }
     }
@@ -223,20 +233,22 @@ impl SigningKey {
 
     fn finish_signature(&self, salt: &[u8; N], short: &[u8; SHORT_LEN]) -> Signature {
         let mut sig = [0u8; SIGNATURE_LEN];
-        let randomizer = first_n(&keyed(&self.randomizer_key, short));
+        let randomizer = self.randomizer_key.derive_randomizer(short);
         sig[..N].copy_from_slice(salt);
         sig[N..2 * N].copy_from_slice(&randomizer);
 
         let mut msg_in = [0u8; 16 + N + N + SHORT_LEN];
-        msg_in[..16].copy_from_slice(&tweak(KIND_MESSAGE, 0, 0, 0, 0, 0));
+        msg_in[..16].copy_from_slice(&tweak(TweakKind::Message, 0, TreeIndex::ZERO, 0, 0, 0));
         msg_in[16..32].copy_from_slice(&randomizer);
         msg_in[32..48].copy_from_slice(self.verifying_key.root());
         msg_in[48..].copy_from_slice(short);
-        let digest = keyed(&self.verifying_key.public_key, &msg_in);
+        let digest = self.verifying_key.public_key.keyed(&msg_in);
         let (fors_indices, leaf_addr) = parse_digest(&digest);
+        let coords = leaf_addr.split_layers();
+        let lower_trees = [coords[0].0, coords[1].0, coords[2].0];
 
         // One parallel wave builds all 3 lower XMSS leaf sets (384 WOTS+ leaves) and all 16 FORS trees.
-        let (lower_leaves, fors_trees) = run_sign_wave(&self.secret_key, &self.verifying_key.public_key, leaf_addr, fors_indices);
+        let (lower_leaves, fors_trees) = run_sign_wave(&self.secret_key, &self.verifying_key.public_key, leaf_addr, lower_trees, fors_indices);
 
         // Pack FORS signature and compute FORS root.
         let mut at = 2 * N;
@@ -250,33 +262,24 @@ impl SigningKey {
             }
             fors_roots[t] = tree.root;
         }
-        let pub_h = TreeHasher::new(Mode::Keyed(&self.verifying_key.public_key)).on_this_core();
+        let pub_h = self.verifying_key.public_key.tree_hasher(false);
         let mut node = fors_root(&pub_h, leaf_addr, &fors_roots);
 
         // Finish the 3 lower Merkle heaps (128 leaves each) and sign all 4 hypertree layers.
         let keys = KeyPair { secret: &self.secret_key, public: &self.verifying_key.public_key };
         with_caller_scratch(|ws| {
-            let mut addr = leaf_addr;
-            for (layer, leaves) in lower_leaves.iter().enumerate() {
-                let leaf = (addr & ((1u64 << LOWER_HEIGHT) - 1)) as u16;
-                let tree = addr >> LOWER_HEIGHT;
-                let heap = build_merkle_heap(&self.verifying_key.public_key, layer as u8, tree, LOWER_HEIGHT, leaves, ws);
-                write_layer_signature(keys, Pos { layer: layer as u8, tree, leaf }, LOWER_HEIGHT, &node, &heap, ws, &mut sig[at..at + LOWER_LAYER_LEN]);
+            for layer in Layer::LOWER {
+                let l = layer.index();
+                let (tree, leaf) = coords[l];
+                let off = layer.sig_offset();
+                let heap = build_merkle_heap(&self.verifying_key.public_key, layer, tree, &lower_leaves[l], ws);
+                write_layer_signature(keys, Pos::new(layer, tree, leaf), &node, &heap, ws, &mut sig[off..off + layer.sig_len()]);
                 node = heap[1];
-                at += LOWER_LAYER_LEN;
-                addr = tree;
             }
-            let top_leaf = (addr & ((1u64 << TOP_HEIGHT) - 1)) as u16;
-            write_layer_signature(
-                keys,
-                Pos { layer: (LAYERS - 1) as u8, tree: 0, leaf: top_leaf },
-                TOP_HEIGHT,
-                &node,
-                &self.top_tree,
-                ws,
-                &mut sig[at..at + TOP_LAYER_LEN],
-            );
-            debug_assert_eq!(at + TOP_LAYER_LEN, SIGNATURE_LEN);
+            let top = Layer::TOP;
+            let (top_tree_idx, top_leaf) = coords[top.index()];
+            let off = top.sig_offset();
+            write_layer_signature(keys, Pos::new(top, top_tree_idx, top_leaf), &node, &self.top_tree, ws, &mut sig[off..off + top.sig_len()]);
         });
         let signature = Signature(sig);
         assert!(self.verifying_key.verify_short(short, &signature), "internal error: generated signature failed self-verification");
@@ -284,13 +287,13 @@ impl SigningKey {
     }
 
     pub(crate) fn sign_with_draw(&self, draw: &[u8; 32], message: &[u8]) -> Signature {
-        let salt = derive_salt(&self.salt_key, draw);
+        let salt = self.salt_key.derive_salt(draw);
         let short = content_from_slice(&self.verifying_key.content_key, &salt, message);
         self.finish_signature(&salt, &short)
     }
 
     pub(crate) fn sign_reader_with_draw(&self, draw: &[u8; 32], reader: impl Read) -> io::Result<Signature> {
-        let salt = derive_salt(&self.salt_key, draw);
+        let salt = self.salt_key.derive_salt(draw);
         let short = content_from_reader(&self.verifying_key.content_key, &salt, reader)?;
         Ok(self.finish_signature(&salt, &short))
     }

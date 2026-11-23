@@ -85,6 +85,30 @@ def security_bits(q, h, b, k, gf):
     return -(log_sum / math.log(2.0)) + gf
 
 
+def fors_security_bits(q, h, a, k):
+    """-log2 of per-query cover probability P(q) for textbook FIPS 205 FORS (k trees of 2^a leaves, hypertree height h)."""
+    lam = q / (1 << h)
+    log_p = -h * math.log(2.0)
+    log_1mp = math.log1p(-math.ldexp(1.0, -h))
+    log_q_fact = math.lgamma(q + 1)
+    log_miss_1 = math.log1p(-math.ldexp(1.0, -a))
+
+    r_center = int(lam)
+    spread = max(40, int(14 * math.sqrt(max(lam, 1.0))) + 40)
+    r_lo = max(1, r_center - spread)
+    r_hi = min(q, r_center + spread)
+
+    log_terms = []
+    for r in range(r_lo, r_hi + 1):
+        log_bin = log_q_fact - math.lgamma(r + 1) - math.lgamma(q - r + 1) + r * log_p + (q - r) * log_1mp
+        # 1 - (1 - 2^-a)^r = -expm1(r * log(1 - 2^-a))
+        log_cov = k * math.log(-math.expm1(r * log_miss_1))
+        log_terms.append(log_bin + log_cov)
+    m = max(log_terms)
+    log_sum = m + math.log(sum(math.exp(x - m) for x in log_terms))
+    return -(log_sum / math.log(2.0))
+
+
 # --- Exact integer DPs for WOTS+C digit sums and PORS+FP merged authentication-set sizes --------------
 def wots_sum_counts(v, width):
     w = 1 << width
@@ -437,6 +461,18 @@ def run_check():
     bits = security_bits(1 << 33, 36, 15, 11, 6)
     assert abs(bits - 128.4433) < 1e-3, bits
 
+    # Verify adopted BLINCS (12 + 3x7, h=33, w=16 v=35, FORS 16 x 2^10) signature size & security curve.
+    sig_bytes = (2 + 16 * (1 + 10) + 3 * (35 + 7) + (35 + 12)) * N
+    assert sig_bytes == 5616, sig_bytes
+    f32 = fors_security_bits(1 << 32, 33, 10, 16)
+    f33 = fors_security_bits(1 << 33, 33, 10, 16)
+    f34 = fors_security_bits(1 << 34, 33, 10, 16)
+    f35 = fors_security_bits(1 << 35, 33, 10, 16)
+    assert abs(f32 - 133.1701) < 1e-3, f32
+    assert abs(f33 - 126.7908) < 1e-3, f33
+    assert abs(f34 - 119.3346) < 1e-3, f34
+    assert abs(f35 - 110.6233) < 1e-3, f35
+
     # Verify M6 calibration against our direct blake3-servil 0.10.0 measurements:
     # 1) 3x h=6 w=16 v=32: measured 1.18 ms (1T) / 0.31 ms (12T)
     leaf_32_16 = 32 + 32 * 15 + 9
@@ -448,10 +484,10 @@ def run_check():
     ver_us = ((4 * 372 + 11 + 113) * NS_VER_BATCH + (4 * (7 + 1 + 9) + 4) * NS_VER_SCALAR) / 1e3
     assert abs(ver_us - 33.3) < 1.5, ver_us
     print(
-        f"CHECK PASSED: WOTS+C tries={((1<<128)/w_dp[372]):.2f}, PORS+FP tries={tries_103:.2f}, "
-        f"security={bits:.2f} bits | M6 b3-servil 0.10.0 calibration: "
-        f"h_top=15 kg 1T={tm_6['kg_1t']:.1f}ms (meas 177.1), 12T={tm_6['kg_12t']:.1f}ms (meas 42.6), "
-        f"0.1.0 ver={ver_us:.1f}us (meas 33.3)."
+        f"CHECK PASSED: adopted BLINCS 12+3x7 ({sig_bytes} B) FORS security={f32:.1f}/{f33:.1f}/{f34:.1f}/{f35:.1f} bits "
+        f"(2^32..2^35) | historical 0.1.0 WOTS+C tries={((1<<128)/w_dp[372]):.2f}, PORS+FP tries={tries_103:.2f}, "
+        f"security={bits:.2f} bits | M6 calibration: h_top=15 kg 1T={tm_6['kg_1t']:.1f}ms (meas 177.1), "
+        f"12T={tm_6['kg_12t']:.1f}ms (meas 42.6), 0.1.0 ver={ver_us:.1f}us (meas 33.3)."
     )
 
 

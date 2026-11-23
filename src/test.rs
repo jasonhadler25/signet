@@ -4,15 +4,14 @@ use crate::content::content_from_reader;
 use crate::few_time::parse_digest;
 use crate::one_time::{Pos, advance_chains, digits, lower_tree_len_check};
 use crate::params::{
-    CHAIN_STEPS, CHAINS, FORS_HEIGHT, FORS_LEN, FORS_TREES, HYPER_BITS, LAYERS, LOWER_HEIGHT, LOWER_LAYER_LEN, MSG_CHAINS, N, SIGNATURE_LEN, TOP_HEIGHT,
-    TOP_LAYER_LEN, ensure_init,
+    CHAIN_STEPS, CHAINS, ContentKey, FORS_HEIGHT, FORS_TREES, HYPER_BITS, Layer, MSG_CHAINS, N, PublicKey, SIGNATURE_LEN, TreeIndex, TweakKind, ensure_init,
 };
 use crate::randomness::{STATE_LEN, mix, read_exact_or_reject, read_monotonic_clock};
 use crate::{Randomness, SEED_LEN, Signature, SigningKey, VERIFYING_KEY_LEN, VerifyingKey};
-use blake3_servil::Mode;
-use blake3_servil::throughput::{Batch, TreeHasher};
+use blake3_servil::throughput::Batch;
 use std::fs;
 use std::io::{self, Cursor, ErrorKind, Read};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -107,7 +106,7 @@ impl Read for FailAfterReader {
 
 #[test]
 fn reference_vector_matches_python_byte_for_byte() {
-    let seed: [u8; SEED_LEN] = core::array::from_fn(|i| i as u8);
+    let seed: [u8; SEED_LEN] = core::array::from_fn(|i| u8::try_from(i).unwrap());
     let draw = [7u8; 32];
     let msg = b"hello, BLINCS";
 
@@ -126,7 +125,10 @@ fn reference_vector_matches_python_byte_for_byte() {
     let reader_sig = sk.sign_reader_with_draw(&draw, Cursor::new(msg)).unwrap();
     assert_eq!(reader_sig, rust_sig);
 
-    let vk = VerifyingKey::from_bytes(sk.verifying_key().as_bytes());
+    let vk = VerifyingKey::try_from(sk.verifying_key().as_bytes().as_slice()).unwrap();
+    assert_eq!(vk, VerifyingKey::from_bytes(sk.verifying_key().as_bytes()));
+    assert!(VerifyingKey::try_from(&vk.as_bytes()[..VERIFYING_KEY_LEN - 1]).is_err());
+    assert!(VerifyingKey::try_from([vk.as_bytes().as_slice(), &[0u8]].concat().as_slice()).is_err());
     assert!(vk.verify(msg, &ref_sig));
     assert!(vk.verify_reader(Cursor::new(msg), &ref_sig).unwrap());
     assert!(!vk.verify(b"hello, BLINCS!", &ref_sig));
@@ -160,13 +162,17 @@ fn wots_digits_and_checksum_boundaries() {
     assert_eq!(&d1[MSG_CHAINS..], &[15, 13, 1]);
 
     // Mixed nibbles: verify little-endian nibble ordering and exact checksum.
-    let node: [u8; N] = core::array::from_fn(|i| ((i as u8) << 4) | ((15 - i) as u8));
+    let node: [u8; N] = core::array::from_fn(|i| {
+        let hi = u8::try_from(i).unwrap();
+        let lo = u8::try_from(15 - i).unwrap();
+        (hi << 4) | lo
+    });
     let dm = digits(&node);
     for i in 0..N {
-        assert_eq!(dm[2 * i], (15 - i) as u8);
-        assert_eq!(dm[2 * i + 1], i as u8);
+        assert_eq!(dm[2 * i], u8::try_from(15 - i).unwrap());
+        assert_eq!(dm[2 * i + 1], u8::try_from(i).unwrap());
     }
-    let expected_csum: u16 = dm[..MSG_CHAINS].iter().map(|&v| 15 - v as u16).sum();
+    let expected_csum: u16 = dm[..MSG_CHAINS].iter().map(|&v| 15 - u16::from(v)).sum();
     assert_eq!(expected_csum, 240); // 0x0f0 -> [0, 15, 0]
     assert_eq!(&dm[MSG_CHAINS..], &[0, 15, 0]);
 }
@@ -175,11 +181,11 @@ fn wots_digits_and_checksum_boundaries() {
 fn parse_digest_extracts_all_fors_indices_and_33bit_leaf_addr() {
     let mut d = [0u8; 32];
     // Pack known distinct 10-bit values into bytes 0..20 (4 values per 5 bytes).
-    let expected_idx: [u16; FORS_TREES] = core::array::from_fn(|t| ((t * 67 + 13) & 0x3ff) as u16);
+    let expected_idx: [u16; FORS_TREES] = core::array::from_fn(|t| u16::try_from((t * 67 + 13) & 0x3ff).unwrap());
     for group in 0..4 {
         let mut bits = 0u64;
         for j in 0..4 {
-            bits |= (expected_idx[group * 4 + j] as u64) << (10 * j);
+            bits |= u64::from(expected_idx[group * 4 + j]) << (10 * j);
         }
         let le = bits.to_le_bytes();
         d[group * 5..group * 5 + 5].copy_from_slice(&le[..5]);
@@ -190,45 +196,49 @@ fn parse_digest_extracts_all_fors_indices_and_33bit_leaf_addr() {
     d[20..28].copy_from_slice(&raw_addr.to_le_bytes());
 
     let (indices, addr) = parse_digest(&d);
-    assert_eq!(indices, expected_idx);
-    assert_eq!(addr, expected_addr);
+    let got_idx: [u16; FORS_TREES] = indices.map(|x| x.as_u16());
+    assert_eq!(got_idx, expected_idx);
+    assert_eq!(addr.as_u64(), expected_addr);
 }
 
 #[test]
 fn advance_chains_handles_zero_partial_and_full_lengths() {
     ensure_init();
-    let public = [0x33u8; 32];
-    let starts: [u8; CHAINS] = core::array::from_fn(|i| (i % 5) as u8);
-    let ends: [u8; CHAINS] = core::array::from_fn(|i| if i % 6 == 0 { starts[i] } else { CHAIN_STEPS as u8 - (i % 4) as u8 });
-    let initial: [[u8; N]; CHAINS] = core::array::from_fn(|i| [i as u8; N]);
+    let public = PublicKey::from_public_seed(&[0x33u8; N]);
+    let starts: [u8; CHAINS] = core::array::from_fn(|i| u8::try_from(i % 5).unwrap());
+    let ends: [u8; CHAINS] = core::array::from_fn(|i| if i % 6 == 0 { starts[i] } else { CHAIN_STEPS - u8::try_from(i % 4).unwrap() });
+    let initial: [[u8; N]; CHAINS] = core::array::from_fn(|i| [u8::try_from(i).unwrap(); N]);
 
     let mut batched = initial;
     let mut b32 = Batch::new(32, CHAINS);
     let mut out = [[0u8; 32]; CHAINS];
-    let pub_core = TreeHasher::new(Mode::Keyed(&public)).on_this_core();
-    advance_chains(&pub_core, Pos { layer: 2, tree: 17, leaf: 9 }, &mut batched, &starts, &ends, &mut b32, &mut out);
+    let pub_core = public.tree_hasher(false);
+    let pos2 = Pos::new(Layer::L2, TreeIndex::new(17), 9);
+    advance_chains(&pub_core, pos2, &mut batched, &starts, &ends, &mut b32, &mut out);
 
     for c in 0..CHAINS {
         let mut expected = initial[c];
         for step in starts[c]..ends[c] {
-            expected = crate::params::short_hash(&public, crate::params::tweak(crate::params::KIND_CHAIN, 2, 17, 9, c as u16, step as u32), &expected);
+            let t = crate::params::tweak(TweakKind::Chain, Layer::L2.as_u8(), TreeIndex::new(17), 9, u16::try_from(c).unwrap(), u32::from(step));
+            expected = crate::params::short_hash(&public, t, &expected);
         }
         assert_eq!(batched[c], expected, "chain {c}");
     }
 
     let mut noop = initial;
-    advance_chains(&pub_core, Pos { layer: 0, tree: 0, leaf: 0 }, &mut noop, &[5u8; CHAINS], &[5u8; CHAINS], &mut b32, &mut out);
+    advance_chains(&pub_core, Pos::new(Layer::L0, TreeIndex::ZERO, 0), &mut noop, &[5u8; CHAINS], &[5u8; CHAINS], &mut b32, &mut out);
     assert_eq!(noop, initial);
 
     // Early-finish case: every chain finishes by step 4 (< CHAIN_STEPS).
     let mut short = initial;
     let short_starts = [2u8; CHAINS];
-    let short_ends: [u8; CHAINS] = core::array::from_fn(|i| 2 + (i % 5) as u8);
-    advance_chains(&pub_core, Pos { layer: 1, tree: 3, leaf: 2 }, &mut short, &short_starts, &short_ends, &mut b32, &mut out);
+    let short_ends: [u8; CHAINS] = core::array::from_fn(|i| 2 + u8::try_from(i % 5).unwrap());
+    advance_chains(&pub_core, Pos::new(Layer::L1, TreeIndex::new(3), 2), &mut short, &short_starts, &short_ends, &mut b32, &mut out);
     for c in 0..CHAINS {
         let mut expected = initial[c];
         for step in short_starts[c]..short_ends[c] {
-            expected = crate::params::short_hash(&public, crate::params::tweak(crate::params::KIND_CHAIN, 1, 3, 2, c as u16, step as u32), &expected);
+            let t = crate::params::tweak(TweakKind::Chain, Layer::L1.as_u8(), TreeIndex::new(3), 2, u16::try_from(c).unwrap(), u32::from(step));
+            expected = crate::params::short_hash(&public, t, &expected);
         }
         assert_eq!(short[c], expected, "short chain {c}");
     }
@@ -236,7 +246,7 @@ fn advance_chains_handles_zero_partial_and_full_lengths() {
 
 #[test]
 fn every_signature_region_is_checked() {
-    let seed: [u8; SEED_LEN] = core::array::from_fn(|i| i as u8);
+    let seed: [u8; SEED_LEN] = core::array::from_fn(|i| u8::try_from(i).unwrap());
     let sk = SigningKey::from_seed(&seed);
     let vk = sk.verifying_key();
     let msg = b"hello, BLINCS";
@@ -264,17 +274,16 @@ fn every_signature_region_is_checked() {
     }
 
     // Every hypertree layer: every chain value, first auth node, and last auth node.
-    let mut at = 2 * N + FORS_LEN;
-    for layer in 0..LAYERS {
-        let (height, layer_len) = if layer + 1 == LAYERS { (TOP_HEIGHT, TOP_LAYER_LEN) } else { (LOWER_HEIGHT, LOWER_LAYER_LEN) };
+    for layer in Layer::ALL {
+        let at = layer.sig_offset();
+        let height = layer.height();
         for c in 0..CHAINS {
-            assert!(!flip(at + c * N), "accepted flip in layer {layer} chain {c}");
+            assert!(!flip(at + c * N), "accepted flip in layer {} chain {c}", layer.as_u8());
         }
-        assert!(!flip(at + CHAINS * N), "accepted flip in layer {layer} auth 0");
-        assert!(!flip(at + (CHAINS + height - 1) * N), "accepted flip in layer {layer} last auth");
-        at += layer_len;
+        assert!(!flip(at + CHAINS * N), "accepted flip in layer {} auth 0", layer.as_u8());
+        assert!(!flip(at + (CHAINS + height - 1) * N), "accepted flip in layer {} last auth", layer.as_u8());
     }
-    assert_eq!(at, SIGNATURE_LEN);
+    assert_eq!(Layer::TOP.sig_offset() + Layer::TOP.sig_len(), SIGNATURE_LEN);
 
     // Wrong verifying key (public_seed byte 0, root byte 31).
     let mut bad_vk = *vk.as_bytes();
@@ -298,10 +307,10 @@ fn streaming_boundaries_and_fragmented_readers_match_slices() {
     let vk = sk.verifying_key();
     let draw = [0x22u8; 32];
 
-    // Covers small (< 64 KiB on-core path), exact 64 KiB boundary, Pipeline path (> 64 KiB),
+    // Covers small (< 16 KiB on-core path), exact 16 KiB and 64 KiB boundaries, Pipeline path (> 16 KiB),
     // and multithreaded slice threshold (>= 512 KiB).
-    for &len in &[0usize, 1, 63, 64, 65, 1024, 65_535, 65_536, 65_537, 256 * 1024, 512 * 1024, 1024 * 1024 + 19] {
-        let msg: Vec<u8> = (0..len).map(|i| ((i.wrapping_mul(37) ^ (i >> 8)) & 0xff) as u8).collect();
+    for &len in &[0usize, 1, 63, 64, 65, 1024, 16_383, 16_384, 16_385, 65_535, 65_536, 65_537, 256 * 1024, 512 * 1024, 1024 * 1024 + 19] {
+        let msg: Vec<u8> = (0..len).map(|i| u8::try_from((i.wrapping_mul(37) ^ (i >> 8)) & 0xff).unwrap()).collect();
         let sig = sk.sign_with_draw(&draw, &msg);
         assert!(vk.verify(&msg, &sig), "slice verify failed for len {len}");
 
@@ -322,15 +331,16 @@ fn streaming_boundaries_and_fragmented_readers_match_slices() {
         }
     }
 
+    let ck = ContentKey::from_vk_bytes(vk.as_bytes());
     // Immediate I/O errors propagate cleanly.
-    let err = content_from_reader(&[0u8; 32], &[0u8; N], FailingReader::default()).unwrap_err();
+    let err = content_from_reader(&ck, &[0u8; N], FailingReader::default()).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::BrokenPipe);
     assert_eq!(sk.sign_reader_with_draw(&draw, FailingReader::default()).unwrap_err().kind(), ErrorKind::BrokenPipe);
     let sig = sk.sign_with_draw(&draw, b"x");
     assert_eq!(vk.verify_reader(FailingReader::default(), &sig).unwrap_err().kind(), ErrorKind::BrokenPipe);
 
-    // Mid-stream I/O error AFTER 64 KiB cleanly aborts the Pipeline without panicking.
-    let err_mid = content_from_reader(&[0u8; 32], &[0u8; N], FailAfterReader { remaining: 90_000, failed: false }).unwrap_err();
+    // Mid-stream I/O error AFTER 16 KiB cleanly aborts the Pipeline without panicking.
+    let err_mid = content_from_reader(&ck, &[0u8; N], FailAfterReader { remaining: 90_000, failed: false }).unwrap_err();
     assert_eq!(err_mid.kind(), ErrorKind::BrokenPipe);
 }
 
@@ -349,7 +359,7 @@ fn concurrent_signing_threads_produce_identical_signatures() {
     for (i, h) in handles.into_iter().enumerate() {
         let sig = h.join().unwrap();
         assert_eq!(sig, expected[i]);
-        assert!(vk.verify(&[i as u8; 128], &sig));
+        assert!(vk.verify(&[u8::try_from(i).unwrap(); 128], &sig));
     }
 }
 
@@ -602,4 +612,124 @@ fn reentrant_reader_can_sign_and_verify_without_borrowing_panic() {
     let outer = sk.sign_reader_with_draw(&[7u8; 32], ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, done: false }).unwrap();
     assert!(vk.verify(b"outer", &outer));
     assert!(vk.verify_reader(ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, done: false }, &outer).unwrap());
+}
+
+#[test]
+fn checked_constructors_reject_out_of_range_values() {
+    let max_tree = TreeIndex::new((1u64 << 48) - 1);
+    assert_eq!(max_tree.to_le_6(), [0xff; 6]);
+    assert!(catch_unwind(|| TreeIndex::new(1u64 << 48)).is_err());
+
+    let _ = Pos::new(Layer::L0, TreeIndex::ZERO, 127);
+    assert!(catch_unwind(|| Pos::new(Layer::L0, TreeIndex::ZERO, 128)).is_err());
+    let _ = Pos::new(Layer::TOP, TreeIndex::ZERO, 4095);
+    assert!(catch_unwind(|| Pos::new(Layer::TOP, TreeIndex::ZERO, 4096)).is_err());
+}
+
+#[test]
+fn hostile_filesystem_and_non_regular_state_paths_are_rejected() {
+    let dir = std::env::temp_dir().join(format!("blincs-hostile-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    // Directory is not a regular state file.
+    assert!(Randomness::initialize(&dir).is_err());
+
+    // Dangling symlink must never be followed by create().
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let target = dir.join("never-created.bin");
+        let link = dir.join("dangling.state");
+        symlink(&target, &link).unwrap();
+        assert_eq!(Randomness::create(&link).unwrap_err().kind(), ErrorKind::AlreadyExists);
+        assert!(!target.exists());
+    }
+
+    // Special device (/dev/null) is not a regular file and must be rejected cleanly with InvalidInput.
+    #[cfg(unix)]
+    {
+        let err = Randomness::initialize("/dev/null").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn oversized_read_return_and_caught_panic_are_handled_cleanly() {
+    struct OversizedReader {
+        prefix: usize,
+    }
+    impl Read for OversizedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.prefix > 0 {
+                let n = self.prefix.min(buf.len());
+                buf[..n].fill(0x11);
+                self.prefix -= n;
+                return Ok(n);
+            }
+            Ok(buf.len() + 1)
+        }
+    }
+    struct PanickingAfterReader {
+        prefix: usize,
+    }
+    impl Read for PanickingAfterReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.prefix > 0 {
+                let n = self.prefix.min(buf.len());
+                buf[..n].fill(0x22);
+                self.prefix -= n;
+                return Ok(n);
+            }
+            panic!("simulated reader panic mid-stream");
+        }
+    }
+
+    let sk = SigningKey::from_seed(&[0x66u8; SEED_LEN]);
+    let vk = sk.verifying_key();
+    let ck = ContentKey::from_vk_bytes(vk.as_bytes());
+
+    // Oversized Read return panics fail-stop in small path, Pipeline path, and state reader.
+    assert!(catch_unwind(|| content_from_reader(&ck, &[0u8; N], OversizedReader { prefix: 0 })).is_err());
+    assert!(catch_unwind(|| content_from_reader(&ck, &[0u8; N], OversizedReader { prefix: 32_768 })).is_err());
+    assert!(catch_unwind(|| read_exact_or_reject(&mut OversizedReader { prefix: 0 })).is_err());
+
+    // Caught panic mid-Pipeline leaves sign_reader / verify_reader completely reusable.
+    let res_sign = catch_unwind(AssertUnwindSafe(|| sk.sign_reader_with_draw(&[3u8; 32], PanickingAfterReader { prefix: 40_000 })));
+    assert!(res_sign.is_err());
+    let sig = sk.sign_reader_with_draw(&[4u8; 32], Cursor::new(vec![0x77u8; 90_000])).unwrap();
+    let res_ver = catch_unwind(AssertUnwindSafe(|| vk.verify_reader(PanickingAfterReader { prefix: 40_000 }, &sig)));
+    assert!(res_ver.is_err());
+    assert!(vk.verify_reader(Cursor::new(vec![0x77u8; 90_000]), &sig).unwrap());
+}
+
+#[test]
+fn all_public_operations_fit_within_128kib_stack_budget() {
+    let handle = thread::Builder::new()
+        .name("blincs-stack-budget".to_owned())
+        .stack_size(128 * 1024)
+        .spawn(|| {
+            let state_path = temp_state_path("stack-128k");
+            Randomness::create(&state_path).unwrap();
+            let rng = Randomness::initialize(&state_path).unwrap();
+            let sk = SigningKey::from_seed(&[0x88u8; SEED_LEN]);
+            let vk = VerifyingKey::from_bytes(sk.verifying_key().as_bytes());
+
+            let small = b"bounded stack budget check";
+            let s_small = sk.sign(&rng, small);
+            assert!(vk.verify(small, &s_small));
+            let s_small_r = sk.sign_reader(&rng, Cursor::new(small)).unwrap();
+            assert!(vk.verify_reader(Cursor::new(small), &s_small_r).unwrap());
+
+            let big = vec![0xA5u8; 100 * 1024];
+            let s_big = sk.sign_reader(&rng, Cursor::new(&big)).unwrap();
+            assert!(vk.verify_reader(Cursor::new(&big), &s_big).unwrap());
+            assert!(vk.verify(&big, &s_big));
+
+            let _ = fs::remove_dir_all(state_path.parent().unwrap());
+        })
+        .unwrap();
+    handle.join().unwrap();
 }

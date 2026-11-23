@@ -15,15 +15,15 @@ CONTROLS = [
     (
         "WOTS+ checksum nibbles computed in digits()",
         "src/one_time.rs",
-        "    out[MSG_CHAINS] = (csum & 0x0f) as u8;",
+        "    out[MSG_CHAINS] = u8::try_from(csum & 0x0f).unwrap();",
         "    out[MSG_CHAINS] = 0;",
         "wots_digits_and_checksum_boundaries",
     ),
     (
-        "FORS 33-bit leaf_addr masking in parse_digest()",
-        "src/few_time.rs",
-        "    let leaf_addr = u64::from_le_bytes(digest[20..28].try_into().unwrap()) & ((1u64 << HYPER_BITS) - 1);",
-        "    let leaf_addr = u64::from_le_bytes(digest[20..28].try_into().unwrap());",
+        "FORS 33-bit leaf_addr masking in LeafAddr::from_digest_word()",
+        "src/params.rs",
+        "        Self(word & ((1u64 << HYPER_BITS) - 1))",
+        "        Self(word)",
         "parse_digest_extracts_all_fors_indices_and_33bit_leaf_addr",
     ),
     (
@@ -43,8 +43,8 @@ CONTROLS = [
     (
         "Per-signature salt keyed into content hash (content_from_slice)",
         "src/content.rs",
-        "    let msg_key = keyed(content_key, salt);\n    let message_hash = if message.len() >= MT_SLICE_THRESHOLD {",
-        "    let msg_key = *content_key;\n    let message_hash = if message.len() >= MT_SLICE_THRESHOLD {",
+        "    let msg_key = content_key.message_key(salt);\n    let message_hash = if message.len() >= MT_SLICE_THRESHOLD {",
+        "    let msg_key = content_key.message_key(&[0u8; N]);\n    let message_hash = if message.len() >= MT_SLICE_THRESHOLD {",
         "reference_vector_matches_python_byte_for_byte",
     ),
     (
@@ -60,6 +60,13 @@ CONTROLS = [
         "                    pipe.abort(msg);\n                    while pipe.next_event().is_none() {\n                        block_on(pipe.ready());\n                    }\n                    return Err(e);",
         "                    return Err(e);",
         "streaming_boundaries_and_fragmented_readers_match_slices",
+    ),
+    (
+        "Randomness::initialize rejects non-regular files (/dev/null)",
+        "src/randomness.rs",
+        "        if !file.metadata()?.is_file() {",
+        "        if false {",
+        "hostile_filesystem_and_non_regular_state_paths_are_rejected",
     ),
     (
         "State file magic and exact-48-byte check (read_exact_or_reject)",
