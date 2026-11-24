@@ -4,7 +4,7 @@
 
 **BLINCS** is a general-purpose, post-quantum digital signature library based on [BLAKE3](https://github.com/servil-software-factory/BLAKE3) and SPHINCS.
 
-It gives you a **32-byte signet ID** (verifying key), a **32-byte secret seed**, and a **5.6 KiB imprint** (signature) that signs in under a millisecond, verifies in 25 microseconds, and streams gigabytes per second — all with zero `unsafe` Rust and a single dependency.
+It gives you a **32-byte signet** (secret signing key), a **32-byte signet ID** (verifying key), and a **5.6 KiB imprint** (signature) that signs in under a millisecond, verifies in 25 microseconds, and streams gigabytes per second — all with zero `unsafe` Rust and a single dependency.
 
 ## Why BLINCS exists
 
