@@ -1,4 +1,4 @@
-//! BLINCS — stateless hash-based digital signatures built on BLAKE3.
+//! BLINCS — stateless hash-based digital signatures based on BLAKE3 and SPHINCS.
 //!
 //! **Pre-1.0 experimental software (unsupported):** formats, context strings, and APIs may change
 //! incompatibly before 1.0, and no independent human cryptographic audit has been performed.

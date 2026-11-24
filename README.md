@@ -2,7 +2,7 @@
 
 > **Pre-1.0 — Experimental & Unsupported.** BLINCS (`0.1.0`) is under active development. Wire formats, context strings, and APIs may change incompatibly before 1.0, there is no commitment to bug fixes or security support yet, and **no independent human cryptographic audit has been performed**. Do not rely on it to protect anything of value yet.
 
-**BLINCS** is a general-purpose, post-quantum digital signature library built entirely on [BLAKE3](https://github.com/servil-software-factory/BLAKE3).
+**BLINCS** is a general-purpose, post-quantum digital signature library based on [BLAKE3](https://github.com/servil-software-factory/BLAKE3) and SPHINCS.
 
 It gives you a **32-byte signet ID** (verifying key), a **32-byte secret seed**, and a **5.6 KiB imprint** (signature) that signs in under a millisecond, verifies in 25 microseconds, and streams gigabytes per second — all with zero `unsafe` Rust and a single dependency.
 
