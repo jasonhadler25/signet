@@ -16,12 +16,13 @@ sys.path.insert(0, os.path.join(ROOT, "reference"))
 import blake3  # noqa: E402
 import blincs  # noqa: E402
 
-REF_SIG = os.path.join(ROOT, "test_vectors", "reference-signature-1.bin")
-REF_SHA256 = "7fbc1537b5b516c823542c425f48129fe78d974a1806ae24fe0c8dc382a7436c"
-REF_BLAKE3 = "ab80843efd3f5860ccc87f578b8831a79eaf3bb595ac516954823f2ed6886b23"
+REF_IMP = os.path.join(ROOT, "test_vectors", "reference-imprint-1.bin")
+REF_SHA256 = "f94f0a1f23135a4941ba79b11435cde6e3802894840f2ff306d2026d5e628784"
+REF_BLAKE3 = "53405a42fe874e64f69d9f0e52140c7016226eabf7a59f33e8d5bed61614b94b"
 EDGE_VEC = os.path.join(ROOT, "test_vectors", "edge-vectors.json")
-EDGE_SHA256 = "4be3ee44ca7318bdd15a492e77dd1b749ee8d957124701fe070615a52d4a3437"
-EDGE_BLAKE3 = "ffddb6318d2d4a33974fb3d9062f3ec98c796bb58e1a59c9c8f9ab63232f1efe"
+EDGE_SHA256 = "51dcec9fe12f78d726ffd39ef3748e8c8ff469a0069ab1c8f44c2b7e773a9d71"
+EDGE_BLAKE3 = "a95d39c94d4d253ffdedd70924e84787705f9eb302ef1251cbaca0ffb730cf20"
+REF_SIGNET_ID = "8e15ddf8f53bf3066099aaa8b8c073a0b2955754ebc88c5be38e23f708c8f3e9"
 
 
 def run(label, cmd):
@@ -33,17 +34,17 @@ def run(label, cmd):
 
 
 def check_vectors_and_python():
-    print("==> Checking reference-signature-1.bin digests (SHA-256 + BLAKE3)")
-    raw = open(REF_SIG, "rb").read()
+    print("==> Checking reference-imprint-1.bin digests (SHA-256 + BLAKE3)")
+    raw = open(REF_IMP, "rb").read()
     assert len(raw) == 5616, f"unexpected length {len(raw)}"
     got_sha256 = hashlib.sha256(raw).hexdigest()
     got_blake3 = blake3.hash(raw).hex()
     assert got_sha256 == REF_SHA256, f"SHA-256 mismatch: {got_sha256}"
     assert got_blake3 == REF_BLAKE3, f"BLAKE3 mismatch: {got_blake3}"
 
-    # Verify reference-signature-1.bin and edge-vectors.json with pure Python reference.
-    vk = blincs.VerifyingKey(bytes.fromhex("0ad9c13b8972b912a211f9fd2ba1eec863399e14d2f6c8c3309f9d7e61a53c46"))
-    assert vk.verify(b"hello, BLINCS", raw), "Python reference rejected reference-signature-1.bin"
+    # Verify reference-imprint-1.bin and edge-vectors.json with pure Python reference.
+    sid = blincs.SignetId(bytes.fromhex(REF_SIGNET_ID))
+    assert sid.verify(b"hello, BLINCS", raw), "Python reference rejected reference-imprint-1.bin"
 
     print("==> Checking edge-vectors.json digests (SHA-256 + BLAKE3) and Python verification")
     import json
@@ -58,10 +59,10 @@ def check_vectors_and_python():
         "pipeline-16385-high-leaf": bytes((i * 37 + 5) & 0xFF for i in range(16385)),
     }
     for entry in json.loads(edge_raw.decode("utf-8")):
-        sig = bytes.fromhex(entry["sig_hex"])
-        assert hashlib.sha256(sig).hexdigest() == entry["sig_sha256"]
-        assert blake3.hash(sig).hex() == entry["sig_blake3"]
-        assert vk.verify(edge_msgs[entry["name"]], sig), f"Python reference rejected edge vector {entry['name']}"
+        imp = bytes.fromhex(entry["imprint_hex"])
+        assert hashlib.sha256(imp).hexdigest() == entry["imprint_sha256"]
+        assert blake3.hash(imp).hex() == entry["imprint_blake3"]
+        assert sid.verify(edge_msgs[entry["name"]], imp), f"Python reference rejected edge vector {entry['name']}"
 
     # Verify python3 -O validation (no reliance on assert).
     run(
@@ -72,14 +73,14 @@ def check_vectors_and_python():
             "-c",
             (
                 "import sys; sys.path.insert(0, 'reference'); import blincs\n"
-                "for fn, args in [(blincs.VerifyingKey,(b'x',)),(blincs.SigningKey,(b'x',)),"
+                "for fn, args in [(blincs.SignetId,(b'x',)),(blincs.Signet,(b'x',)),"
                 "(blincs.mix,(b'x',0,b'0'*32,b'')),(blincs.draw,(b'x',0))]:\n"
                 "    try:\n        fn(*args)\n        raise SystemExit(1)\n"
                 "    except ValueError:\n        pass\n"
-                "ba = bytearray(bytes.fromhex('0ad9c13b8972b912a211f9fd2ba1eec863399e14d2f6c8c3309f9d7e61a53c46'))\n"
-                "vk = blincs.VerifyingKey(ba)\n"
+                f"ba = bytearray(bytes.fromhex('{REF_SIGNET_ID}'))\n"
+                "sid = blincs.SignetId(ba)\n"
                 "ba[0] ^= 0xff\n"
-                "if vk.bytes[0] != 0x0a: raise SystemExit(1)\n"
+                "if sid.bytes[0] != 0x8e: raise SystemExit(1)\n"
             ),
         ],
     )

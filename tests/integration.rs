@@ -1,6 +1,6 @@
 include!("../tools/require_nextest.rs");
 
-use blincs::{Randomness, SEED_LEN, Signature, SigningKey, VerifyingKey};
+use blincs::{Imprint, Randomness, SEED_LEN, Signet, SignetId};
 use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -30,15 +30,15 @@ fn public_api_round_trip_and_python_reference_cross_check() {
     let rng = Randomness::initialize(&state).unwrap();
 
     let seed = [0x5au8; SEED_LEN];
-    let sk = SigningKey::from_seed(&seed);
-    let vk = VerifyingKey::from_bytes(sk.verifying_key().as_bytes());
+    let sk = Signet::from_seed(&seed);
+    let vk = SignetId::from_bytes(sk.id().as_bytes());
     let vk_hex = to_hex(vk.as_bytes());
 
     let py = concat!(env!("CARGO_MANIFEST_DIR"), "/reference/blincs.py");
 
     for (name, len) in [("empty", 0usize), ("small", 43), ("64k", 64 * 1024), ("512k-plus", 512 * 1024 + 123)] {
         let msg: Vec<u8> = (0..len).map(|i| u8::try_from((i * 73 + 11) & 0xff).unwrap()).collect();
-        let sig = sk.sign(&rng, &msg);
+        let sig = sk.imprint(&rng, &msg);
         assert!(vk.verify(&msg, &sig));
         assert!(vk.verify_reader(Cursor::new(&msg), &sig).unwrap());
 
@@ -62,8 +62,8 @@ fn public_api_round_trip_and_python_reference_cross_check() {
     }
 
     // Two signatures of the same message have distinct salts (different draws).
-    let s1 = sk.sign(&rng, b"same message");
-    let s2 = sk.sign_reader(&rng, Cursor::new(b"same message")).unwrap();
+    let s1 = sk.imprint(&rng, b"same message");
+    let s2 = sk.imprint_reader(&rng, Cursor::new(b"same message")).unwrap();
     assert_ne!(&s1.as_bytes()[..16], &s2.as_bytes()[..16]);
     assert!(vk.verify(b"same message", &s1));
     assert!(vk.verify(b"same message", &s2));
@@ -73,10 +73,10 @@ fn public_api_round_trip_and_python_reference_cross_check() {
 
 #[test]
 fn reference_vector_verifies_via_public_api() {
-    let raw = fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/test_vectors/reference-signature-1.bin")).unwrap();
-    let sig = Signature::try_from(raw.as_slice()).unwrap();
+    let raw = fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/test_vectors/reference-imprint-1.bin")).unwrap();
+    let sig = Imprint::try_from(raw.as_slice()).unwrap();
     let seed: [u8; SEED_LEN] = core::array::from_fn(|i| u8::try_from(i).unwrap());
-    let vk = SigningKey::from_seed(&seed).verifying_key();
+    let vk = Signet::from_seed(&seed).id();
     assert!(vk.verify(b"hello, BLINCS", &sig));
     assert!(!vk.verify(b"hello, blincs", &sig));
 }

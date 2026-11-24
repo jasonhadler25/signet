@@ -2,7 +2,7 @@ use blake3_servil::throughput::TreeHasher;
 use blake3_servil::{Mode, convenience, initialize_multithreaded};
 
 pub const SEED_LEN: usize = 32;
-pub const VERIFYING_KEY_LEN: usize = 32;
+pub const SIGNET_ID_LEN: usize = 32;
 
 pub(crate) const N: usize = 16;
 pub(crate) const LAYERS: usize = 4;
@@ -26,25 +26,25 @@ pub(crate) const SHORT_LEN: usize = N + 32;
 pub(crate) const FORS_LEN: usize = FORS_TREES * (1 + FORS_HEIGHT) * N;
 pub(crate) const LOWER_LAYER_LEN: usize = (CHAINS + LOWER_HEIGHT) * N;
 pub(crate) const TOP_LAYER_LEN: usize = (CHAINS + TOP_HEIGHT) * N;
-pub const SIGNATURE_LEN: usize = 2 * N + FORS_LEN + (LAYERS - 1) * LOWER_LAYER_LEN + TOP_LAYER_LEN;
+pub const IMPRINT_LEN: usize = 2 * N + FORS_LEN + (LAYERS - 1) * LOWER_LAYER_LEN + TOP_LAYER_LEN;
 
 const _: () = {
     assert!(W == (CHAIN_STEPS as usize) + 1 && CHAINS == 35 && MSG_CHAINS * 4 == N * 8);
     assert!(FORS_TREES * FORS_HEIGHT == 160 && HYPER_BITS == 33 && HYPER_BITS < 48);
     assert!(FORS_TREES * FORS_HEIGHT + HYPER_BITS <= 256);
-    assert!(SIGNATURE_LEN == 5616 && 2 * N + FORS_LEN + 3 * LOWER_LAYER_LEN + TOP_LAYER_LEN == SIGNATURE_LEN);
+    assert!(IMPRINT_LEN == 5616 && 2 * N + FORS_LEN + 3 * LOWER_LAYER_LEN + TOP_LAYER_LEN == IMPRINT_LEN);
 };
 
 // Key-derivation contexts (SPEC.md, "Key-derivation contexts").
-pub(crate) const CTX_SECRET_VALUES: &str = "BLINCS 2026-11-23 signing key: secret values";
-pub(crate) const CTX_CONTENT_SALT: &str = "BLINCS 2026-11-23 signing key: content salt";
-pub(crate) const CTX_RANDOMIZER: &str = "BLINCS 2026-11-23 signing key: randomizer";
-pub(crate) const CTX_PUBLIC_SEED: &str = "BLINCS 2026-11-23 signing key: public seed";
-pub(crate) const CTX_PUBLIC_HASH: &str = "BLINCS 2026-11-23 public hash";
-pub(crate) const CTX_CONTENT: &str = "BLINCS 2026-11-23 content";
-pub(crate) const CTX_MIX: &str = "BLINCS 2026-11-23 randomness: mix";
-pub(crate) const CTX_NEXT_SEED: &str = "BLINCS 2026-11-23 randomness: seed kept in the file";
-pub(crate) const CTX_RUN_KEY: &str = "BLINCS 2026-11-23 randomness: key of this run";
+pub(crate) const CTX_SECRET_VALUES: &str = "BLINCS 2026-11-24 signet: secret values";
+pub(crate) const CTX_CONTENT_SALT: &str = "BLINCS 2026-11-24 signet: content salt";
+pub(crate) const CTX_RANDOMIZER: &str = "BLINCS 2026-11-24 signet: randomizer";
+pub(crate) const CTX_PUBLIC_SEED: &str = "BLINCS 2026-11-24 signet: public seed";
+pub(crate) const CTX_PUBLIC_HASH: &str = "BLINCS 2026-11-24 public hash";
+pub(crate) const CTX_CONTENT: &str = "BLINCS 2026-11-24 content";
+pub(crate) const CTX_MIX: &str = "BLINCS 2026-11-24 randomness: mix";
+pub(crate) const CTX_NEXT_SEED: &str = "BLINCS 2026-11-24 randomness: seed kept in the file";
+pub(crate) const CTX_RUN_KEY: &str = "BLINCS 2026-11-24 randomness: key of this run";
 
 #[inline]
 pub(crate) fn ensure_init() {

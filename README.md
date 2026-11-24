@@ -1,8 +1,10 @@
 # BLINCS
 
+> **Pre-1.0 — Experimental & Unsupported.** BLINCS (`0.1.0`) is under active development. Wire formats, context strings, and APIs may change incompatibly before 1.0, there is no commitment to bug fixes or security support yet, and **no independent human cryptographic audit has been performed**. Do not rely on it to protect anything of value yet.
+
 **BLINCS** is a general-purpose, post-quantum digital signature library built entirely on [BLAKE3](https://github.com/servil-software-factory/BLAKE3).
 
-It gives you a **32-byte verifying key**, a **32-byte signing seed**, and a **5.6 KiB signature** that signs in under a millisecond, verifies in 25 microseconds, and streams gigabytes per second — all with zero `unsafe` Rust and a single dependency.
+It gives you a **32-byte signet ID** (verifying key), a **32-byte secret seed**, and a **5.6 KiB imprint** (signature) that signs in under a millisecond, verifies in 25 microseconds, and streams gigabytes per second — all with zero `unsafe` Rust and a single dependency.
 
 ## Why BLINCS exists
 
@@ -82,21 +84,23 @@ Measured with `bench/` (`bench-hashes`'s `clocks` crate, quiet machine, `blake3-
 
 | Operation | Wall time | Core cycles (main thread) | Throughput |
 |---|---:|---:|---:|
-| `SigningKey::from_seed` (128 KiB top-tree build, 12 cores, no disk cache) | **5.43 ms** | 19.3M cyc | **184 / s** |
-| `SigningKey::sign` (64 B) | **729.7 µs** | 2.57M cyc | **1,370 / s** |
-| `SigningKey::sign_reader` (64 B) | **730.1 µs** | 2.57M cyc | **1,370 / s** |
-| `VerifyingKey::verify` (64 B, 1 core) | **25.3 µs** | 117k cyc | **39,500 / s** |
-| `VerifyingKey::verify_reader` (64 B, 1 core) | **25.7 µs** | 118k cyc | **38,900 / s** |
-| `SigningKey::sign` (16 MiB) | **1.29 ms** | 5.05M cyc | **12,987 MB/s** |
-| `VerifyingKey::verify` (16 MiB) | **595.9 µs** | 2.58M cyc | **28,156 MB/s** |
-| `SigningKey::sign_reader` (100 MiB, zero-copy `Pipeline`) | **4.46 ms** | 18.0M cyc | **23,521 MB/s** |
-| `VerifyingKey::verify_reader` (100 MiB, zero-copy `Pipeline`) | **3.79 ms** | 15.3M cyc | **27,674 MB/s** |
-| `Randomness::initialize` (48 B state update, no `fsync`) | 22.8 µs | 103k cyc | — |
+| `Signet::from_seed` (128 KiB top-tree build, 12 cores, no disk cache) | **5.42 ms** | 19.0M cyc | **185 / s** |
+| `Signet::imprint` (64 B) | **729.5 µs** | 2.56M cyc | **1,371 / s** |
+| `Signet::imprint_reader` (64 B) | **729.1 µs** | 2.57M cyc | **1,372 / s** |
+| `SignetId::verify` (64 B, 1 core) | **24.3 µs** | 114k cyc | **41,200 / s** |
+| `SignetId::verify_reader` (64 B, 1 core) | **24.6 µs** | 115k cyc | **40,700 / s** |
+| `Signet::imprint` (16 MiB) | **1.29 ms** | 5.06M cyc | **12,975 MB/s** |
+| `SignetId::verify` (16 MiB) | **594.3 µs** | 2.63M cyc | **28,228 MB/s** |
+| `Signet::imprint_reader` (100 MiB, zero-copy `Pipeline`) | **4.50 ms** | 18.4M cyc | **23,321 MB/s** |
+| `SignetId::verify_reader` (100 MiB, zero-copy `Pipeline`) | **3.79 ms** | 15.8M cyc | **27,641 MB/s** |
+| `Randomness::initialize` (48 B state update, no `fsync`) | 23.1 µs | 105k cyc | — |
 
 ## Quick start
 
+Unlike a handwritten signature tied to one person, a cryptographic key is a transferable **bearer** authority — anyone holding the secret can exercise it, and the public half simply tells you *which* authority you mean. In this API we therefore call the secret a `Signet`, its 32-byte public half a `SignetId` (which names which signet you mean and verifies its imprints), and the 5,616-byte proof an `Imprint`. If you are used to standard terminology, they correspond directly to a signing key, verifying key, and signature (see [`DESIGN.md`](DESIGN.md) for the authorization rationale).
+
 ```rust
-use blincs::{Randomness, SigningKey, VerifyingKey};
+use blincs::{Randomness, Signet, SignetId};
 
 // Provision once in a private directory owned by the signer:
 Randomness::create("/path/to/private/blincs.state")?;
@@ -104,14 +108,14 @@ Randomness::create("/path/to/private/blincs.state")?;
 let rng = Randomness::initialize("/path/to/private/blincs.state")?;
 
 // Caller supplies a 32-byte cryptographically random seed:
-let signing_key = SigningKey::from_seed(&seed);
-let verifying_key = VerifyingKey::from_bytes(signing_key.verifying_key().as_bytes());
+let signet = Signet::from_seed(&seed);
+let id = SignetId::from_bytes(signet.id().as_bytes());
 
-let signature = signing_key.sign(&rng, b"hello, BLINCS");
-assert!(verifying_key.verify(b"hello, BLINCS", &signature));
+let imprint = signet.imprint(&rng, b"hello, BLINCS");
+assert!(id.verify(b"hello, BLINCS", &imprint));
 ```
 
-For large files or streams, use `SigningKey::sign_reader` and `VerifyingKey::verify_reader`.
+For large files or streams, use `Signet::imprint_reader` and `SignetId::verify_reader`.
 
 ## Dependencies and testing
 
@@ -126,13 +130,14 @@ cargo nextest run --locked
 cargo test --doc --locked
 python3 reference/blake3.py
 python3 tools/counts.py
+python3 tools/domain_sep.py
 python3 tools/controls.py
 python3 tools/mutants/check.py
 ```
 
 ## Status and authorship
 
-Pre-1.0 draft (`0.1.0`): formats, context strings, and APIs may change before 1.0. Written primarily by an AI assistant at the direction of this repository's owner. Round 1 and Round 2 automated cross-family reviews are archived in [`audits/`](audits/); **no independent human cryptographic review or security audit has been performed**.
+**Pre-1.0 experimental / unsupported draft (`0.1.0`):** wire formats, context strings, and APIs may change incompatibly before 1.0, and there is no support commitment. Written primarily by an AI assistant at the direction of this repository's owner. Round 1–2 (`openai/gpt-6.2-astra-pro`) and recall-calibrated Round 3 (`anthropic/claude-opus-5.5`) automated cross-family reviews are archived in [`audits/`](audits/); **no independent human cryptographic review or security audit has been performed**.
 
 ## Contributing and licenses
 

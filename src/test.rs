@@ -4,11 +4,11 @@ use crate::content::{checked_add_stream_len, content_from_reader};
 use crate::few_time::parse_digest;
 use crate::one_time::{Pos, advance_chains, digits};
 use crate::params::{
-    CHAIN_STEPS, CHAINS, CTX_CONTENT, FORS_HEIGHT, FORS_TREES, HYPER_BITS, Layer, MSG_CHAINS, N, PublicKey, SIGNATURE_LEN, TweakKind, derive_key, ensure_init,
+    CHAIN_STEPS, CHAINS, CTX_CONTENT, FORS_HEIGHT, FORS_TREES, HYPER_BITS, IMPRINT_LEN, Layer, MSG_CHAINS, N, PublicKey, TweakKind, derive_key, ensure_init,
     tweak,
 };
 use crate::randomness::{STATE_LEN, mix, read_exact_or_reject, read_monotonic_clock};
-use crate::{Randomness, SEED_LEN, Signature, SigningKey, VERIFYING_KEY_LEN, VerifyingKey};
+use crate::{Imprint, Randomness, SEED_LEN, SIGNET_ID_LEN, Signet, SignetId};
 use blake3_servil::throughput::Batch;
 use std::fs;
 use std::io::{self, Cursor, ErrorKind, Read};
@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
-const REF_VK_HEX: &str = "0ad9c13b8972b912a211f9fd2ba1eec863399e14d2f6c8c3309f9d7e61a53c46";
+const REF_VK_HEX: &str = "8e15ddf8f53bf3066099aaa8b8c073a0b2955754ebc88c5be38e23f708c8f3e9";
 
 fn from_hex(s: &str) -> Vec<u8> {
     assert_eq!(s.len() % 2, 0);
@@ -111,24 +111,24 @@ fn reference_vector_matches_python_byte_for_byte() {
     let draw = [7u8; 32];
     let msg = b"hello, BLINCS";
 
-    let sk = SigningKey::from_seed(&seed);
+    let sk = Signet::from_seed(&seed);
     assert_eq!(sk.seed(), &seed);
-    assert_eq!(to_hex(sk.verifying_key().as_bytes()), REF_VK_HEX);
+    assert_eq!(to_hex(sk.id().as_bytes()), REF_VK_HEX);
 
-    let expected = fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/test_vectors/reference-signature-1.bin")).unwrap();
-    assert_eq!(expected.len(), SIGNATURE_LEN);
-    let ref_sig = Signature::try_from(expected.as_slice()).unwrap();
+    let expected = fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/test_vectors/reference-imprint-1.bin")).unwrap();
+    assert_eq!(expected.len(), IMPRINT_LEN);
+    let ref_sig = Imprint::try_from(expected.as_slice()).unwrap();
 
-    let rust_sig = sk.sign_with_draw(&draw, msg);
+    let rust_sig = sk.imprint_with_draw(&draw, msg);
     assert_eq!(rust_sig.as_bytes().as_slice(), expected.as_slice());
 
-    let reader_sig = sk.sign_reader_with_draw(&draw, Cursor::new(msg)).unwrap();
+    let reader_sig = sk.imprint_reader_with_draw(&draw, Cursor::new(msg)).unwrap();
     assert_eq!(reader_sig, rust_sig);
 
-    let vk = VerifyingKey::try_from(sk.verifying_key().as_bytes().as_slice()).unwrap();
-    assert_eq!(vk, VerifyingKey::from_bytes(sk.verifying_key().as_bytes()));
-    assert!(VerifyingKey::try_from(&vk.as_bytes()[..VERIFYING_KEY_LEN - 1]).is_err());
-    assert!(VerifyingKey::try_from([vk.as_bytes().as_slice(), &[0u8]].concat().as_slice()).is_err());
+    let vk = SignetId::try_from(sk.id().as_bytes().as_slice()).unwrap();
+    assert_eq!(vk, SignetId::from_bytes(sk.id().as_bytes()));
+    assert!(SignetId::try_from(&vk.as_bytes()[..SIGNET_ID_LEN - 1]).is_err());
+    assert!(SignetId::try_from([vk.as_bytes().as_slice(), &[0u8]].concat().as_slice()).is_err());
     assert!(vk.verify(msg, &ref_sig));
     assert!(vk.verify_reader(Cursor::new(msg), &ref_sig).unwrap());
     assert!(!vk.verify(b"hello, BLINCS!", &ref_sig));
@@ -136,10 +136,10 @@ fn reference_vector_matches_python_byte_for_byte() {
 
 #[test]
 fn verify_alone_initializes_blake3_in_fresh_process() {
-    let vk_bytes: [u8; VERIFYING_KEY_LEN] = from_hex(REF_VK_HEX).try_into().unwrap();
-    let sig_bytes = fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/test_vectors/reference-signature-1.bin")).unwrap();
-    let vk = VerifyingKey::from_bytes(&vk_bytes);
-    let sig = Signature::try_from(sig_bytes.as_slice()).unwrap();
+    let vk_bytes: [u8; SIGNET_ID_LEN] = from_hex(REF_VK_HEX).try_into().unwrap();
+    let sig_bytes = fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/test_vectors/reference-imprint-1.bin")).unwrap();
+    let vk = SignetId::from_bytes(&vk_bytes);
+    let sig = Imprint::try_from(sig_bytes.as_slice()).unwrap();
     assert!(vk.verify(b"hello, BLINCS", &sig));
 }
 
@@ -246,16 +246,16 @@ fn advance_chains_handles_zero_partial_and_full_lengths() {
 #[test]
 fn every_signature_region_is_checked() {
     let seed: [u8; SEED_LEN] = core::array::from_fn(|i| u8::try_from(i).unwrap());
-    let sk = SigningKey::from_seed(&seed);
-    let vk = sk.verifying_key();
+    let sk = Signet::from_seed(&seed);
+    let vk = sk.id();
     let msg = b"hello, BLINCS";
-    let base = sk.sign_with_draw(&[7u8; 32], msg);
+    let base = sk.imprint_with_draw(&[7u8; 32], msg);
     assert!(vk.verify(msg, &base));
 
     let flip = |offset: usize| -> bool {
         let mut raw = *base.as_bytes();
         raw[offset] ^= 1;
-        vk.verify(msg, &Signature::from_bytes(&raw))
+        vk.verify(msg, &Imprint::from_bytes(&raw))
     };
 
     // Salt and randomizer boundaries.
@@ -282,39 +282,39 @@ fn every_signature_region_is_checked() {
         assert!(!flip(at + CHAINS * N), "accepted flip in layer {} auth 0", layer.as_u8());
         assert!(!flip(at + (CHAINS + height - 1) * N), "accepted flip in layer {} last auth", layer.as_u8());
     }
-    assert_eq!(Layer::TOP.sig_offset() + Layer::TOP.sig_len(), SIGNATURE_LEN);
+    assert_eq!(Layer::TOP.sig_offset() + Layer::TOP.sig_len(), IMPRINT_LEN);
 
     // Wrong verifying key (public_seed byte 0, root byte 31).
     let mut bad_vk = *vk.as_bytes();
     bad_vk[0] ^= 1;
-    assert!(!VerifyingKey::from_bytes(&bad_vk).verify(msg, &base));
+    assert!(!SignetId::from_bytes(&bad_vk).verify(msg, &base));
     let mut bad_root = *vk.as_bytes();
     bad_root[31] ^= 1;
-    assert!(!VerifyingKey::from_bytes(&bad_root).verify(msg, &base));
+    assert!(!SignetId::from_bytes(&bad_root).verify(msg, &base));
 
-    // Signature slice length checks.
-    assert!(Signature::try_from(&base.as_bytes()[..SIGNATURE_LEN - 1]).is_err());
+    // Imprint slice length checks.
+    assert!(Imprint::try_from(&base.as_bytes()[..IMPRINT_LEN - 1]).is_err());
     let mut too_long = base.as_bytes().to_vec();
     too_long.push(0);
-    assert!(Signature::try_from(too_long.as_slice()).is_err());
+    assert!(Imprint::try_from(too_long.as_slice()).is_err());
 }
 
 #[test]
 fn streaming_boundaries_and_fragmented_readers_match_slices() {
     let seed = [0x11u8; SEED_LEN];
-    let sk = SigningKey::from_seed(&seed);
-    let vk = sk.verifying_key();
+    let sk = Signet::from_seed(&seed);
+    let vk = sk.id();
     let draw = [0x22u8; 32];
 
     // Covers small (< 16 KiB on-core path), exact 16 KiB and 64 KiB boundaries, Pipeline path (> 16 KiB),
     // and multithreaded slice threshold (>= 512 KiB).
     for &len in &[0usize, 1, 63, 64, 65, 1024, 16_383, 16_384, 16_385, 65_535, 65_536, 65_537, 256 * 1024, 512 * 1024, 1024 * 1024 + 19] {
         let msg: Vec<u8> = (0..len).map(|i| u8::try_from((i.wrapping_mul(37) ^ (i >> 8)) & 0xff).unwrap()).collect();
-        let sig = sk.sign_with_draw(&draw, &msg);
+        let sig = sk.imprint_with_draw(&draw, &msg);
         assert!(vk.verify(&msg, &sig), "slice verify failed for len {len}");
 
         let frag_sign = FragmentedReader::new(&msg, 7717, 5);
-        let sig_reader = sk.sign_reader_with_draw(&draw, frag_sign).unwrap();
+        let sig_reader = sk.imprint_reader_with_draw(&draw, frag_sign).unwrap();
         assert_eq!(sig_reader, sig, "reader signature differed for len {len}");
 
         let frag_ver = FragmentedReader::new(&msg, 11113, 3);
@@ -334,8 +334,8 @@ fn streaming_boundaries_and_fragmented_readers_match_slices() {
     // Immediate I/O errors propagate cleanly.
     let err = content_from_reader(&ck, &[0u8; N], FailingReader::default()).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::BrokenPipe);
-    assert_eq!(sk.sign_reader_with_draw(&draw, FailingReader::default()).unwrap_err().kind(), ErrorKind::BrokenPipe);
-    let sig = sk.sign_with_draw(&draw, b"x");
+    assert_eq!(sk.imprint_reader_with_draw(&draw, FailingReader::default()).unwrap_err().kind(), ErrorKind::BrokenPipe);
+    let sig = sk.imprint_with_draw(&draw, b"x");
     assert_eq!(vk.verify_reader(FailingReader::default(), &sig).unwrap_err().kind(), ErrorKind::BrokenPipe);
 
     // Mid-stream I/O error AFTER 16 KiB cleanly aborts the Pipeline without panicking.
@@ -345,14 +345,14 @@ fn streaming_boundaries_and_fragmented_readers_match_slices() {
 
 #[test]
 fn concurrent_signing_threads_produce_identical_signatures() {
-    let sk = Arc::new(SigningKey::from_seed(&[0x55u8; SEED_LEN]));
-    let vk = sk.verifying_key();
-    let expected: Vec<Signature> = (0u8..8).map(|i| sk.sign_with_draw(&[i; 32], &[i; 128])).collect();
+    let sk = Arc::new(Signet::from_seed(&[0x55u8; SEED_LEN]));
+    let vk = sk.id();
+    let expected: Vec<Imprint> = (0u8..8).map(|i| sk.imprint_with_draw(&[i; 32], &[i; 128])).collect();
 
     let handles: Vec<_> = (0u8..8)
         .map(|i| {
             let sk = Arc::clone(&sk);
-            thread::spawn(move || sk.sign_with_draw(&[i; 32], &[i; 128]))
+            thread::spawn(move || sk.imprint_with_draw(&[i; 32], &[i; 128]))
         })
         .collect();
     for (i, h) in handles.into_iter().enumerate() {
@@ -370,12 +370,12 @@ fn randomness_mix_matches_python_reference() {
     let clock = b"clock-reading";
     let (next_seed, run_key) = mix(&seed, 42, &system, clock);
 
-    assert_eq!(to_hex(&next_seed), "c0c6b6b9b4b215c0c9f1b2009f61a44b0f3756c95f33987fd05accc567079596");
-    assert_eq!(to_hex(&run_key), "ad9e373e2f5993eb67f17095c133073f746d32759f51fae8c5e9cc2ee7e96ad9");
+    assert_eq!(to_hex(&next_seed), "4ca4eedbb4c7fcb17762c7790173965d261b210dcbdff5b8790e3ef9c40b8fb3");
+    assert_eq!(to_hex(&run_key), "162b1dd1afb6dae37df25cc7ca3340f12fe601badac915d1a1156f6a9f49cc8d");
 
     let r1 = Randomness::from_run_key_at(run_key, 0);
-    assert_eq!(to_hex(&r1.draw()), "cd039bca0638eaf52a052a25c92cd471572fe06bc2f0eeaea4a5a6c5022b7877");
-    assert_eq!(to_hex(&r1.draw()), "5c71abf8b05980f9901486582351396292e987cadf689ed5bb5934e46c0ceec9");
+    assert_eq!(to_hex(&r1.draw()), "fe6737eeeac0278aaefa8b3f86433cb934105cadb0b184686929dde0ca74ef77");
+    assert_eq!(to_hex(&r1.draw()), "b31a518d2110b139f42edb7309d0aa3b1c7fa40ad858d05cf3a19ad899381fc8");
 }
 
 #[test]
@@ -493,15 +493,15 @@ fn create_works_with_bare_relative_filename() {
 #[test]
 fn debug_redacts_secrets() {
     let seed = [0xabu8; SEED_LEN];
-    let sk = SigningKey::from_seed(&seed);
+    let sk = Signet::from_seed(&seed);
     let s = format!("{sk:?}");
-    assert!(!s.contains("abababab"), "SigningKey Debug leaked seed: {s}");
-    assert!(s.contains(&to_hex(sk.verifying_key().as_bytes())));
+    assert!(!s.contains("abababab"), "Signet Debug leaked seed: {s}");
+    assert!(s.contains(&to_hex(sk.id().as_bytes())));
 
     let rng = Randomness::from_run_key_at([0xcdu8; 32], 0);
     assert_eq!(format!("{rng:?}"), "Randomness { .. }");
 
-    let sig = sk.sign_with_draw(&[1u8; 32], b"dbg");
+    let sig = sk.imprint_with_draw(&[1u8; 32], b"dbg");
     let sd = format!("{sig:?}");
     assert!(sd.contains("5616 bytes") && sd.contains(&to_hex(&sig.as_bytes()[..N])));
 }
@@ -527,8 +527,8 @@ fn initialize_alone_initializes_blake3_in_fresh_process() {
 
 #[test]
 fn signing_key_alone_initializes_blake3_in_fresh_process() {
-    let sk = SigningKey::from_seed(&[3u8; SEED_LEN]);
-    assert_eq!(sk.verifying_key().as_bytes().len(), VERIFYING_KEY_LEN);
+    let sk = Signet::from_seed(&[3u8; SEED_LEN]);
+    assert_eq!(sk.id().as_bytes().len(), SIGNET_ID_LEN);
 }
 
 #[test]
@@ -566,23 +566,23 @@ fn reader_never_sees_previous_callers_bytes() {
         }
     }
 
-    let sk = SigningKey::from_seed(&[0x33u8; SEED_LEN]);
-    let vk = sk.verifying_key();
+    let sk = Signet::from_seed(&[0x33u8; SEED_LEN]);
+    let vk = sk.id();
     let secret_msg = vec![0xAAu8; 256 * 1024];
 
     // First call dirties stack buffer AND multiple Pipeline rooms (256 KiB).
-    let sig = sk.sign_reader_with_draw(&[1u8; 32], Cursor::new(&secret_msg)).unwrap();
+    let sig = sk.imprint_reader_with_draw(&[1u8; 32], Cursor::new(&secret_msg)).unwrap();
 
     // Small snooping reader inspects stack fast path.
     let mut snoop_small = SnoopingReader { data: b"second", pos: 0, saw_nonzero: false };
-    let sig2 = sk.sign_reader_with_draw(&[2u8; 32], &mut snoop_small).unwrap();
+    let sig2 = sk.imprint_reader_with_draw(&[2u8; 32], &mut snoop_small).unwrap();
     assert!(!snoop_small.saw_nonzero, "small sign_reader observed previous caller's bytes");
     assert!(vk.verify(b"second", &sig2));
 
     // Large snooping reader (200 KiB > 16 KiB and > 3 rooms) inspects newly acquired & recycled Pipeline rooms.
     let big_data = vec![0x55u8; 200 * 1024];
     let mut snoop_big_sign = SnoopingReader { data: &big_data, pos: 0, saw_nonzero: false };
-    let sig_big = sk.sign_reader_with_draw(&[3u8; 32], &mut snoop_big_sign).unwrap();
+    let sig_big = sk.imprint_reader_with_draw(&[3u8; 32], &mut snoop_big_sign).unwrap();
     assert!(!snoop_big_sign.saw_nonzero, "Pipeline sign_reader observed nonzero room bytes");
     assert!(vk.verify(&big_data, &sig_big));
 
@@ -595,14 +595,14 @@ fn reader_never_sees_previous_callers_bytes() {
 
 #[test]
 fn reentrant_reader_can_sign_and_verify_without_borrowing_panic() {
-    let sk = SigningKey::from_seed(&[0x44u8; SEED_LEN]);
-    let vk = sk.verifying_key();
-    let inner_sig = sk.sign_with_draw(&[9u8; 32], b"inner");
+    let sk = Signet::from_seed(&[0x44u8; SEED_LEN]);
+    let vk = sk.id();
+    let inner_sig = sk.imprint_with_draw(&[9u8; 32], b"inner");
 
     struct ReentrantReader<'a> {
-        sk: &'a SigningKey,
-        vk: VerifyingKey,
-        inner_sig: &'a Signature,
+        sk: &'a Signet,
+        vk: SignetId,
+        inner_sig: &'a Imprint,
         prefix_remaining: usize,
         done: bool,
     }
@@ -618,7 +618,7 @@ fn reentrant_reader_can_sign_and_verify_without_borrowing_panic() {
                 return Ok(0);
             }
             self.done = true;
-            let nested = self.sk.sign_reader_with_draw(&[8u8; 32], Cursor::new(b"nested")).unwrap();
+            let nested = self.sk.imprint_reader_with_draw(&[8u8; 32], Cursor::new(b"nested")).unwrap();
             assert!(self.vk.verify_reader(Cursor::new(b"nested"), &nested).unwrap());
             assert!(self.vk.verify(b"inner", self.inner_sig));
             let msg = b"outer";
@@ -628,7 +628,7 @@ fn reentrant_reader_can_sign_and_verify_without_borrowing_panic() {
     }
 
     // Re-enter from the < 16 KiB stack path.
-    let outer = sk.sign_reader_with_draw(&[7u8; 32], ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, prefix_remaining: 0, done: false }).unwrap();
+    let outer = sk.imprint_reader_with_draw(&[7u8; 32], ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, prefix_remaining: 0, done: false }).unwrap();
     assert!(vk.verify(b"outer", &outer));
     assert!(vk.verify_reader(ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, prefix_remaining: 0, done: false }, &outer).unwrap());
 
@@ -636,7 +636,7 @@ fn reentrant_reader_can_sign_and_verify_without_borrowing_panic() {
     let mut expected_big = vec![0x41u8; 32 * 1024];
     expected_big.extend_from_slice(b"outer");
     let outer_big =
-        sk.sign_reader_with_draw(&[6u8; 32], ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, prefix_remaining: 32 * 1024, done: false }).unwrap();
+        sk.imprint_reader_with_draw(&[6u8; 32], ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, prefix_remaining: 32 * 1024, done: false }).unwrap();
     assert!(vk.verify(&expected_big, &outer_big));
     assert!(vk.verify_reader(ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, prefix_remaining: 32 * 1024, done: false }, &outer_big).unwrap());
 }
@@ -664,12 +664,12 @@ fn public_sign_with_shared_randomness_works_on_fresh_thread() {
     let state_path = temp_state_path("fresh-thread-sign");
     Randomness::create(&state_path).unwrap();
     let rng = Arc::new(Randomness::initialize(&state_path).unwrap());
-    let sk = Arc::new(SigningKey::from_seed(&[0x77u8; SEED_LEN]));
-    let vk = sk.verifying_key();
+    let sk = Arc::new(Signet::from_seed(&[0x77u8; SEED_LEN]));
+    let vk = sk.id();
 
     let rng_t = Arc::clone(&rng);
     let sk_t = Arc::clone(&sk);
-    let sig = thread::spawn(move || sk_t.sign(&rng_t, b"fresh thread message")).join().unwrap();
+    let sig = thread::spawn(move || sk_t.imprint(&rng_t, b"fresh thread message")).join().unwrap();
     assert!(vk.verify(b"fresh thread message", &sig));
     let _ = fs::remove_dir_all(state_path.parent().unwrap());
 }
@@ -721,8 +721,8 @@ fn oversized_read_return_fails_stop() {
         }
     }
 
-    let sk = SigningKey::from_seed(&[0x66u8; SEED_LEN]);
-    let vk = sk.verifying_key();
+    let sk = Signet::from_seed(&[0x66u8; SEED_LEN]);
+    let vk = sk.id();
     let ck = derive_key(CTX_CONTENT, vk.as_bytes());
 
     // Oversized Read return panics fail-stop in small path, Pipeline path, and state reader.
@@ -740,17 +740,17 @@ fn all_public_operations_fit_within_128kib_stack_budget() {
             let state_path = temp_state_path("stack-128k");
             Randomness::create(&state_path).unwrap();
             let rng = Randomness::initialize(&state_path).unwrap();
-            let sk = SigningKey::from_seed(&[0x88u8; SEED_LEN]);
-            let vk = VerifyingKey::from_bytes(sk.verifying_key().as_bytes());
+            let sk = Signet::from_seed(&[0x88u8; SEED_LEN]);
+            let vk = SignetId::from_bytes(sk.id().as_bytes());
 
             let small = b"bounded stack budget check";
-            let s_small = sk.sign(&rng, small);
+            let s_small = sk.imprint(&rng, small);
             assert!(vk.verify(small, &s_small));
-            let s_small_r = sk.sign_reader(&rng, Cursor::new(small)).unwrap();
+            let s_small_r = sk.imprint_reader(&rng, Cursor::new(small)).unwrap();
             assert!(vk.verify_reader(Cursor::new(small), &s_small_r).unwrap());
 
             let big = vec![0xA5u8; 100 * 1024];
-            let s_big = sk.sign_reader(&rng, Cursor::new(&big)).unwrap();
+            let s_big = sk.imprint_reader(&rng, Cursor::new(&big)).unwrap();
             assert!(vk.verify_reader(Cursor::new(&big), &s_big).unwrap());
             assert!(vk.verify(&big, &s_big));
 
@@ -771,8 +771,8 @@ fn edge_vectors_match_python_and_ts_byte_for_byte() {
     };
 
     let seed: [u8; SEED_LEN] = core::array::from_fn(|i| u8::try_from(i).unwrap());
-    let sk = SigningKey::from_seed(&seed);
-    let vk = sk.verifying_key();
+    let sk = Signet::from_seed(&seed);
+    let vk = sk.id();
 
     let messages: [(&str, Vec<u8>); 4] = [
         ("empty", vec![]),
@@ -787,28 +787,28 @@ fn edge_vectors_match_python_and_ts_byte_for_byte() {
         let name_end = block.find('"').unwrap();
         assert_eq!(&block[..name_end], *expected_name);
         let draw: [u8; 32] = from_hex(&extract(block, "draw_hex")).try_into().unwrap();
-        let expected_sig = from_hex(&extract(block, "sig_hex"));
-        assert_eq!(expected_sig.len(), SIGNATURE_LEN);
+        let expected_sig = from_hex(&extract(block, "imprint_hex"));
+        assert_eq!(expected_sig.len(), IMPRINT_LEN);
 
-        let sig_slice = sk.sign_with_draw(&draw, msg);
+        let sig_slice = sk.imprint_with_draw(&draw, msg);
         assert_eq!(sig_slice.as_bytes().as_slice(), expected_sig.as_slice(), "slice mismatch on {expected_name}");
-        let sig_reader = sk.sign_reader_with_draw(&draw, Cursor::new(msg)).unwrap();
+        let sig_reader = sk.imprint_reader_with_draw(&draw, Cursor::new(msg)).unwrap();
         assert_eq!(sig_reader, sig_slice, "reader mismatch on {expected_name}");
         assert!(vk.verify(msg, &sig_slice));
         assert!(vk.verify_reader(Cursor::new(msg), &sig_slice).unwrap());
 
         let mut bad = *sig_slice.as_bytes();
-        bad[SIGNATURE_LEN - 1] ^= 1;
-        assert!(!vk.verify(msg, &Signature::from_bytes(&bad)));
+        bad[IMPRINT_LEN - 1] ^= 1;
+        assert!(!vk.verify(msg, &Imprint::from_bytes(&bad)));
     }
 }
 
 #[test]
 fn stateful_lifecycle_and_trait_contracts() {
     fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<SigningKey>();
-    assert_send_sync::<VerifyingKey>();
-    assert_send_sync::<Signature>();
+    assert_send_sync::<Signet>();
+    assert_send_sync::<SignetId>();
+    assert_send_sync::<Imprint>();
     assert_send_sync::<Randomness>();
 
     let p1 = temp_state_path("lifecycle-contract-1");
@@ -818,25 +818,25 @@ fn stateful_lifecycle_and_trait_contracts() {
     let r1 = Randomness::initialize(&p1).unwrap();
     let r2 = Randomness::initialize(&p2).unwrap();
 
-    let sk1 = SigningKey::from_seed(&[0x10u8; SEED_LEN]);
-    let sk2 = SigningKey::from_seed(&[0x20u8; SEED_LEN]);
-    let vk1 = sk1.verifying_key();
+    let sk1 = Signet::from_seed(&[0x10u8; SEED_LEN]);
+    let sk2 = Signet::from_seed(&[0x20u8; SEED_LEN]);
+    let vk1 = sk1.id();
     let vk1_copy = vk1;
-    let vk1_rt = VerifyingKey::try_from(vk1.as_bytes().as_slice()).unwrap();
-    let vk2 = sk2.verifying_key();
+    let vk1_rt = SignetId::try_from(vk1.as_bytes().as_slice()).unwrap();
+    let vk2 = sk2.id();
     assert_eq!(vk1, vk1_copy);
     assert_eq!(vk1, vk1_rt);
     assert_ne!(vk1, vk2);
 
-    // Interleaved operations across two keys, two randomness states, slice & reader APIs, and Signature traits.
-    let s1a = sk1.sign(&r1, b"alpha");
-    let s1b = sk1.sign(&r1, b"alpha");
+    // Interleaved operations across two keys, two randomness states, slice & reader APIs, and Imprint traits.
+    let s1a = sk1.imprint(&r1, b"alpha");
+    let s1b = sk1.imprint(&r1, b"alpha");
     assert_ne!(s1a, s1b, "distinct draws must yield distinct signatures");
     let s1a_clone = s1a.clone();
     assert_eq!(s1a, s1a_clone);
-    assert_eq!(Signature::try_from(s1a.as_bytes().as_slice()).unwrap(), s1a);
+    assert_eq!(Imprint::try_from(s1a.as_bytes().as_slice()).unwrap(), s1a);
 
-    let s2 = sk2.sign_reader(&r2, Cursor::new(b"beta")).unwrap();
+    let s2 = sk2.imprint_reader(&r2, Cursor::new(b"beta")).unwrap();
     assert!(vk1.verify(b"alpha", &s1a));
     assert!(vk1_rt.verify_reader(Cursor::new(b"alpha"), &s1b).unwrap());
     assert!(vk2.verify(b"beta", &s2));

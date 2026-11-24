@@ -2,7 +2,7 @@
 //! with background-load detection (`clocks::load`). All summaries are integer arithmetic
 //! over the run's totals (`sum(wall_ns) / sum(calls)`).
 
-use blincs::{Randomness, SEED_LEN, SigningKey, VerifyingKey};
+use blincs::{Randomness, SEED_LEN, Signet, SignetId};
 use std::hint::black_box;
 use std::io::Cursor;
 
@@ -91,17 +91,17 @@ fn main() {
     let rng = Randomness::initialize(&state).unwrap();
 
     let seed = [0x42u8; SEED_LEN];
-    let sk = SigningKey::from_seed(&seed);
-    let vk = VerifyingKey::from_bytes(sk.verifying_key().as_bytes());
+    let sk = Signet::from_seed(&seed);
+    let vk = SignetId::from_bytes(sk.id().as_bytes());
 
     // Warm up the CPU / SME2 unit and thread-local workspaces.
     for _ in 0..8 {
-        let s = sk.sign(&rng, b"warmup");
+        let s = sk.imprint(&rng, b"warmup");
         assert!(vk.verify(b"warmup", &s));
     }
 
     let b = clocks::measure(10, 100_000_000, || {
-        black_box(SigningKey::from_seed(black_box(&seed)));
+        black_box(Signet::from_seed(black_box(&seed)));
     });
     report("from_seed (keygen/load)", &b, 0);
 
@@ -115,11 +115,11 @@ fn main() {
         ("100 MiB", 100 * 1024 * 1024),
     ] {
         let msg: Vec<u8> = (0..len).map(|i| (i.wrapping_mul(31) & 0xff) as u8).collect();
-        let sig = sk.sign(&rng, &msg);
+        let sig = sk.imprint(&rng, &msg);
         assert!(vk.verify(&msg, &sig));
 
         let sign_batches = clocks::measure(12, 150_000_000, || {
-            black_box(sk.sign(&rng, black_box(&msg)));
+            black_box(sk.imprint(&rng, black_box(&msg)));
         });
         report(&format!("sign slice {label}"), &sign_batches, if len >= 65536 { len as u64 } else { 0 });
 
@@ -130,7 +130,7 @@ fn main() {
 
         if len == 64 || len == 262144 || len == 1024 * 1024 || len == 100 * 1024 * 1024 {
             let sr = clocks::measure(10, 150_000_000, || {
-                black_box(sk.sign_reader(&rng, Cursor::new(black_box(&msg))).unwrap());
+                black_box(sk.imprint_reader(&rng, Cursor::new(black_box(&msg))).unwrap());
             });
             report(&format!("sign_reader {label}"), &sr, if len >= 65536 { len as u64 } else { 0 });
 

@@ -2,7 +2,7 @@
 
 ## Status
 
-BLINCS is pre-1.0 (`0.1.0`). Its wire format, key-derivation contexts, and APIs may change before 1.0, and **no independent human cryptographic audit has been performed**. Do not rely on BLINCS to protect high-value assets until independent review is complete.
+> **Pre-1.0 — Experimental & Unsupported.** BLINCS (`0.1.0`) is under active development. Its wire format, key-derivation contexts, and APIs may change incompatibly before 1.0, there is no support commitment, and **no independent human cryptographic audit has been performed**. Do not rely on BLINCS to protect high-value assets until independent review is complete.
 
 ## Reporting a vulnerability
 
@@ -13,12 +13,12 @@ Report suspected security vulnerabilities privately through GitHub's private vul
 Full mathematical and operational details are in [`SPEC.md`](SPEC.md) and [`DESIGN.md`](DESIGN.md). Key boundaries callers must uphold:
 
 - **Per-key signing budget:** at most $2^{32}$ signatures (4,294,967,296) per signing key. The library does not enforce this limit across copies of a seed or across runs.
-- **Signing-key seed entropy:** `SigningKey::from_seed` accepts a caller-supplied 32-byte seed and performs no entropy test. Generate seeds from a vetted cryptographic source; never pass passwords or low-entropy strings.
-- **Platform scope (Unix signing):** `Randomness::create` and `Randomness::initialize` currently target Unix (`/dev/urandom`, `0600` mode, POSIX advisory `flock`). `VerifyingKey` works on any target supporting `blake3-servil` and 64-bit atomics.
-- **State file placement & error recovery:** keep the 48-byte randomness state file in a private local directory owned by the signer on a Unix filesystem that enforces advisory `flock` locks. Create it once with `Randomness::create` before starting signers. If `create` fails partway through or a host crashes mid-`initialize`, remove and re-provision the state file before resuming signing.
+- **Signing-seed entropy:** `Signet::from_seed` accepts a caller-supplied 32-byte seed and performs no entropy test. Generate seeds from a vetted cryptographic source; never pass passwords or low-entropy strings.
+- **Platform scope (Unix imprinting):** `Randomness::create` and `Randomness::initialize` currently target Unix (`/dev/urandom`, `0600` mode, POSIX advisory `flock`). `SignetId` works on any target supporting `blake3-servil` and 64-bit atomics.
+- **State file placement & error recovery:** keep the 48-byte randomness state file in a private local directory owned by the signer on a Unix filesystem that enforces advisory `flock` locks. Create it once with `Randomness::create` before starting signers. If `create` fails partway through or a host crashes mid-`initialize`, remove and re-provision the state file before resuming imprinting.
 - **Process forks and VM snapshots:** do **not** call BLINCS in a `fork()` child without `exec()` (multithreaded fork children do not inherit background worker threads; the worker pool detects a PID change and aborts fail-stop rather than hanging). After restoring a live VM snapshot, call `Randomness::initialize` again so clones do not share the same `(run_key, count)` draw sequence.
-- **Memory retention:** `SigningKey` retains its 32-byte seed and derived keys, parallel jobs copy `SecretKey`, and both worker threads and participating application threads keep thread-local scratch buffers that retain intermediate leaf secrets until thread exit. Neither BLINCS nor `blake3-servil` wipes secret key memory on drop. Streaming readers use a fresh local zero-initialized 16 KiB stack buffer ($< 16$ KiB) or a fresh per-call `Pipeline` ($\ge 16$ KiB, zeroing each newly acquired room slice before `Read::read`) with no shared cross-caller pool.
-- **No pre-hash API:** pass the message or stream directly to `sign`/`sign_reader` and `verify`/`verify_reader`. Pre-hashing before calling BLINCS exposes users to collision attacks on the pre-hash.
+- **Memory retention:** `Signet` retains its 32-byte seed and derived keys, parallel jobs copy `SecretKey`, and both worker threads and participating application threads keep thread-local scratch buffers that retain intermediate leaf secrets until thread exit. Neither BLINCS nor `blake3-servil` wipes secret key memory on drop. Streaming readers use a fresh local zero-initialized 16 KiB stack buffer ($< 16$ KiB) or a fresh per-call `Pipeline` ($\ge 16$ KiB, zeroing each newly acquired room slice before `Read::read`) with no shared cross-caller pool.
+- **No pre-hash API:** pass the message or stream directly to `imprint`/`imprint_reader` and `verify`/`verify_reader`. Pre-hashing before calling BLINCS exposes users to collision attacks on the pre-hash.
 
 ## Timing and secret independence
 
@@ -28,9 +28,9 @@ In BLINCS's Rust code, every branch and memory index during signing and verifica
 
 Where this repository records digests, it records both SHA-256 and BLAKE3:
 
-- `test_vectors/reference-signature-1.bin` (5,616 bytes):
-  - SHA-256: `7fbc1537b5b516c823542c425f48129fe78d974a1806ae24fe0c8dc382a7436c`
-  - BLAKE3:  `ab80843efd3f5860ccc87f578b8831a79eaf3bb595ac516954823f2ed6886b23`
+- `test_vectors/reference-imprint-1.bin` (5,616 bytes):
+  - SHA-256: `f94f0a1f23135a4941ba79b11435cde6e3802894840f2ff306d2026d5e628784`
+  - BLAKE3:  `53405a42fe874e64f69d9f0e52140c7016226eabf7a59f33e8d5bed61614b94b`
 - `test_vectors/edge-vectors.json` (4 boundary vectors: empty, 1 B, 1,024 B, 16,385 B with bit-32 `leaf_addr`):
-  - SHA-256: `4be3ee44ca7318bdd15a492e77dd1b749ee8d957124701fe070615a52d4a3437`
-  - BLAKE3:  `ffddb6318d2d4a33974fb3d9062f3ec98c796bb58e1a59c9c8f9ab63232f1efe`
+  - SHA-256: `51dcec9fe12f78d726ffd39ef3748e8c8ff469a0069ab1c8f44c2b7e773a9d71`
+  - BLAKE3:  `a95d39c94d4d253ffdedd70924e84787705f9eb302ef1251cbaca0ffb730cf20`

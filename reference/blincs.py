@@ -19,18 +19,18 @@ HYPER_BITS = TOP_HEIGHT + (LAYERS - 1) * LOWER_HEIGHT
 FORS_LEN = FORS_TREES * (1 + FORS_HEIGHT) * N
 LOWER_LAYER_LEN = (CHAINS + LOWER_HEIGHT) * N
 TOP_LAYER_LEN = (CHAINS + TOP_HEIGHT) * N
-SIGNATURE_LEN = 2 * N + FORS_LEN + (LAYERS - 1) * LOWER_LAYER_LEN + TOP_LAYER_LEN
+IMPRINT_LEN = 2 * N + FORS_LEN + (LAYERS - 1) * LOWER_LAYER_LEN + TOP_LAYER_LEN
 
 # Key-derivation contexts (SPEC.md, "Key-derivation contexts").
-CTX_SECRET_VALUES = "BLINCS 2026-11-23 signing key: secret values"
-CTX_CONTENT_SALT = "BLINCS 2026-11-23 signing key: content salt"
-CTX_RANDOMIZER = "BLINCS 2026-11-23 signing key: randomizer"
-CTX_PUBLIC_SEED = "BLINCS 2026-11-23 signing key: public seed"
-CTX_PUBLIC_HASH = "BLINCS 2026-11-23 public hash"
-CTX_CONTENT = "BLINCS 2026-11-23 content"
-CTX_MIX = "BLINCS 2026-11-23 randomness: mix"
-CTX_NEXT_SEED = "BLINCS 2026-11-23 randomness: seed kept in the file"
-CTX_RUN_KEY = "BLINCS 2026-11-23 randomness: key of this run"
+CTX_SECRET_VALUES = "BLINCS 2026-11-24 signet: secret values"
+CTX_CONTENT_SALT = "BLINCS 2026-11-24 signet: content salt"
+CTX_RANDOMIZER = "BLINCS 2026-11-24 signet: randomizer"
+CTX_PUBLIC_SEED = "BLINCS 2026-11-24 signet: public seed"
+CTX_PUBLIC_HASH = "BLINCS 2026-11-24 public hash"
+CTX_CONTENT = "BLINCS 2026-11-24 content"
+CTX_MIX = "BLINCS 2026-11-24 randomness: mix"
+CTX_NEXT_SEED = "BLINCS 2026-11-24 randomness: seed kept in the file"
+CTX_RUN_KEY = "BLINCS 2026-11-24 randomness: key of this run"
 
 # Tweak kinds (SPEC.md, "Tweaks").
 KIND_CHAIN_SECRET, KIND_CHAIN, KIND_ONE_TIME_KEY, KIND_NODE = 1, 2, 3, 4
@@ -144,20 +144,20 @@ def draw(run_key, count):
     return blake3.keyed_hash(run_key, count.to_bytes(8, "little"))
 
 
-class VerifyingKey:
-    def __init__(self, key_bytes):
-        key_bytes = _check_len("verifying key", key_bytes, 2 * N)
-        self.bytes = key_bytes
-        self.public_seed, self.root = key_bytes[:N], key_bytes[N:]
+class SignetId:
+    def __init__(self, id_bytes):
+        id_bytes = _check_len("signet id", id_bytes, 2 * N)
+        self.bytes = id_bytes
+        self.public_seed, self.root = id_bytes[:N], id_bytes[N:]
         self.public = blake3.derive_key(CTX_PUBLIC_HASH, self.public_seed)
         self.content_key = blake3.derive_key(CTX_CONTENT, self.bytes)
 
-    def verify(self, message, signature):
+    def verify(self, message, imprint):
         message = _to_bytes("message", message)
-        signature = _to_bytes("signature", signature)
-        if len(signature) != SIGNATURE_LEN:
+        imprint = _to_bytes("imprint", imprint)
+        if len(imprint) != IMPRINT_LEN:
             return False
-        salt, randomizer, at = signature[:N], signature[N : 2 * N], 2 * N
+        salt, randomizer, at = imprint[:N], imprint[N : 2 * N], 2 * N
         short = content(self.content_key, salt, message)
         digest = blake3.keyed_hash(self.public, tweak(KIND_MESSAGE) + randomizer + self.root + short)
         indices, leaf_addr = parse_digest(digest)
@@ -166,11 +166,11 @@ class VerifyingKey:
         fors_roots = []
         for t in range(FORS_TREES):
             idx = indices[t]
-            sec = signature[at : at + N]
+            sec = imprint[at : at + N]
             at += N
             cur = H(self.public, tweak(KIND_FEW_LEAF, 0, leaf_addr, t, 0, idx), sec)
             for level in range(1, FORS_HEIGHT + 1):
-                sib = signature[at : at + N]
+                sib = imprint[at : at + N]
                 at += N
                 pair = cur + sib if idx % 2 == 0 else sib + cur
                 idx //= 2
@@ -187,23 +187,23 @@ class VerifyingKey:
             ds = digits(node)
             ends = []
             for c, d in enumerate(ds):
-                val = signature[at : at + N]
+                val = imprint[at : at + N]
                 at += N
                 ends.append(chain(self.public, layer, tree, leaf, c, val, d, CHAIN_STEPS - d))
             cur = H(self.public, tweak(KIND_ONE_TIME_KEY, layer, tree, leaf), b"".join(ends))
             idx = leaf
             for level in range(1, height + 1):
-                sib = signature[at : at + N]
+                sib = imprint[at : at + N]
                 at += N
                 pair = cur + sib if idx % 2 == 0 else sib + cur
                 idx //= 2
                 cur = H(self.public, tweak(KIND_NODE, layer, tree, 0, level, idx), pair)
             node = cur
             addr = tree
-        return at == SIGNATURE_LEN and hmac.compare_digest(node, self.root)
+        return at == IMPRINT_LEN and hmac.compare_digest(node, self.root)
 
 
-class SigningKey:
+class Signet:
     def __init__(self, seed):
         seed = _check_len("seed", seed, 32)
         self.secret = blake3.derive_key(CTX_SECRET_VALUES, seed)
@@ -222,21 +222,21 @@ class SigningKey:
         else:
             top_leaves = _wots_leaf_range((self.secret, self.public, LAYERS - 1, 0, 0, top_n))
         self.top_levels = merkle_tree(self.public, KIND_NODE, LAYERS - 1, 0, 0, top_leaves)
-        self.verifying_key = VerifyingKey(public_seed + self.top_levels[-1][0])
+        self.id = SignetId(public_seed + self.top_levels[-1][0])
 
-    def sign(self, message, draw_bytes):
+    def imprint(self, message, draw_bytes):
         message = _to_bytes("message", message)
         draw_bytes = _check_len("draw", draw_bytes, 32)
-        public, vk = self.public, self.verifying_key
+        public, sid = self.public, self.id
         salt = blake3.keyed_hash(self.salt_key, draw_bytes)[:N]
-        short = content(vk.content_key, salt, message)
+        short = content(sid.content_key, salt, message)
         randomizer = blake3.keyed_hash(self.randomizer_key, short)[:N]
-        digest = blake3.keyed_hash(public, tweak(KIND_MESSAGE) + randomizer + vk.root + short)
+        digest = blake3.keyed_hash(public, tweak(KIND_MESSAGE) + randomizer + sid.root + short)
         indices, leaf_addr = parse_digest(digest)
 
         out = bytearray(salt + randomizer)
 
-        # FORS signature
+        # FORS imprint
         fors_roots = []
         for t in range(FORS_TREES):
             secs = [H(self.secret, tweak(KIND_FEW_SECRET, 0, leaf_addr, t, 0, i)) for i in range(1 << FORS_HEIGHT)]
@@ -249,7 +249,7 @@ class SigningKey:
             fors_roots.append(levels[-1][0])
         node = H(public, tweak(KIND_FEW_ROOT, 0, leaf_addr), b"".join(fors_roots))
 
-        # Hypertree signature
+        # Hypertree imprint
         addr = leaf_addr
         for layer in range(LAYERS):
             height = TOP_HEIGHT if layer == LAYERS - 1 else LOWER_HEIGHT
@@ -269,32 +269,32 @@ class SigningKey:
             node = levels[-1][0]
             addr = tree
 
-        sig = bytes(out)
-        if len(sig) != SIGNATURE_LEN or not hmac.compare_digest(node, vk.root) or not vk.verify(message, sig):
-            raise RuntimeError("internal error: generated signature failed self-check")
-        return sig
+        imp = bytes(out)
+        if len(imp) != IMPRINT_LEN or not hmac.compare_digest(node, sid.root) or not sid.verify(message, imp):
+            raise RuntimeError("internal error: generated imprint failed self-check")
+        return imp
 
 
 def _cli():
     args = sys.argv[1:]
-    if len(args) == 5 and args[0] == "sign":
+    if len(args) == 5 and args[0] == "imprint":
         seed, draw_bytes = bytes.fromhex(args[1]), bytes.fromhex(args[2])
         msg = open(args[3], "rb").read()
-        sk = SigningKey(seed)
-        sig = sk.sign(msg, draw_bytes)
-        open(args[4], "wb").write(sig)
-        print(f"verifying_key: {sk.verifying_key.bytes.hex()}")
-        print(f"signature:     {len(sig)} bytes -> {args[4]}")
+        signet = Signet(seed)
+        imp = signet.imprint(msg, draw_bytes)
+        open(args[4], "wb").write(imp)
+        print(f"signet_id: {signet.id.bytes.hex()}")
+        print(f"imprint:   {len(imp)} bytes -> {args[4]}")
     elif len(args) == 4 and args[0] == "verify":
-        vk = VerifyingKey(bytes.fromhex(args[1]))
+        sid = SignetId(bytes.fromhex(args[1]))
         msg = open(args[2], "rb").read()
-        sig = open(args[3], "rb").read()
-        ok = vk.verify(msg, sig)
+        imp = open(args[3], "rb").read()
+        ok = sid.verify(msg, imp)
         print("OK" if ok else "INVALID")
         sys.exit(0 if ok else 1)
     else:
-        print("usage: blincs.py sign <seed-hex> <draw-hex> <msg-file> <sig-out>")
-        print("       blincs.py verify <vk-hex> <msg-file> <sig-file>")
+        print("usage: blincs.py imprint <seed-hex> <draw-hex> <msg-file> <imprint-out>")
+        print("       blincs.py verify <signet-id-hex> <msg-file> <imprint-file>")
         sys.exit(2)
 
 

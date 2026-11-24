@@ -1,21 +1,25 @@
 //! BLINCS — stateless hash-based digital signatures built on BLAKE3.
 //!
+//! **Pre-1.0 experimental software (unsupported):** formats, context strings, and APIs may change
+//! incompatibly before 1.0, and no independent human cryptographic audit has been performed.
+//!
 //! Designed for post-quantum use with a 128-bit classical security target (see `SPEC.md` for bounds).
-//! A signature is 5,616 bytes, a verifying key is 32 bytes, and a signing key is a 32-byte seed.
-//! Messages are hashed in a single salted keyed-BLAKE3 pass under a fresh per-signature salt; passing
-//! the message or stream directly to BLINCS avoids pre-hash collision exposure and hashes across all
-//! CPU cores at full BLAKE3 speed.
+//! Because a cryptographic key is a transferable bearer authority rather than a person's handwritten
+//! signature, this API calls the secret a [`Signet`], its 32-byte public identifier a [`SignetId`]
+//! (which names which signet you mean and verifies its imprints), and the 5,616-byte proof an
+//! [`Imprint`]. Messages are hashed in a single salted keyed-BLAKE3 pass under a fresh per-imprint
+//! salt so callers never pre-hash.
 //!
 //! ```no_run
-//! use blincs::{Randomness, SigningKey, VerifyingKey};
+//! use blincs::{Randomness, Signet, SignetId};
 //!
 //! Randomness::create("/path/to/blincs.state")?;
 //! let randomness = Randomness::initialize("/path/to/blincs.state")?;
-//! let sk = SigningKey::from_seed(&[0x42; 32]);
-//! let vk: VerifyingKey = sk.verifying_key();
+//! let signet = Signet::from_seed(&[0x42; 32]); // example only; use OS randomness in real code
+//! let id: SignetId = signet.id();
 //!
-//! let sig = sk.sign(&randomness, b"hello, BLINCS");
-//! assert!(vk.verify(b"hello, BLINCS", &sig));
+//! let imprint = signet.imprint(&randomness, b"hello, BLINCS");
+//! assert!(id.verify(b"hello, BLINCS", &imprint));
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
@@ -31,7 +35,7 @@ mod randomness;
 #[cfg(test)]
 mod test;
 
-pub use params::{SEED_LEN, SIGNATURE_LEN, VERIFYING_KEY_LEN};
+pub use params::{IMPRINT_LEN, SEED_LEN, SIGNET_ID_LEN};
 pub use randomness::Randomness;
 
 use content::{content_from_reader, content_from_slice};
@@ -81,19 +85,19 @@ fn msg_digest_input(randomizer: &[u8; N], root: &[u8; N], short: &[u8; SHORT_LEN
     buf
 }
 
-/// A 5,616-byte BLINCS signature.
+/// A 5,616-byte BLINCS imprint (proof produced by pressing a [`Signet`] onto a message).
 #[derive(Clone, PartialEq, Eq)]
-pub struct Signature([u8; SIGNATURE_LEN]);
+pub struct Imprint([u8; IMPRINT_LEN]);
 
-impl Signature {
-    /// Wrap a raw 5,616-byte signature array.
+impl Imprint {
+    /// Wrap a raw 5,616-byte imprint array.
     #[must_use]
-    pub fn from_bytes(bytes: &[u8; SIGNATURE_LEN]) -> Self {
+    pub fn from_bytes(bytes: &[u8; IMPRINT_LEN]) -> Self {
         Self(*bytes)
     }
 
-    /// Borrow the raw 5,616 signature bytes.
-    pub fn as_bytes(&self) -> &[u8; SIGNATURE_LEN] {
+    /// Borrow the raw 5,616 imprint bytes.
+    pub fn as_bytes(&self) -> &[u8; IMPRINT_LEN] {
         &self.0
     }
 
@@ -115,7 +119,7 @@ impl Signature {
     }
 }
 
-impl TryFrom<&[u8]> for Signature {
+impl TryFrom<&[u8]> for Imprint {
     type Error = TryFromSliceError;
 
     fn try_from(slice: &[u8]) -> Result<Self, Self::Error> {
@@ -123,23 +127,26 @@ impl TryFrom<&[u8]> for Signature {
     }
 }
 
-impl fmt::Debug for Signature {
+impl fmt::Debug for Imprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Signature({SIGNATURE_LEN} bytes, salt=")?;
+        write!(f, "Imprint({IMPRINT_LEN} bytes, salt=")?;
         fmt_hex(f, self.salt())?;
         f.write_str(")")
     }
 }
 
-/// A 32-byte BLINCS verifying key (`public_seed || top_root`).
+/// A 32-byte BLINCS signet identifier (`public_seed || top_root`).
+///
+/// A `SignetId` names which [`Signet`] you mean and lets anyone verify whether an [`Imprint`]
+/// came from that signet.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct VerifyingKey {
-    bytes: [u8; VERIFYING_KEY_LEN],
+pub struct SignetId {
+    bytes: [u8; SIGNET_ID_LEN],
     public_key: PublicKey,
     content_key: [u8; 32],
 }
 
-impl TryFrom<&[u8]> for VerifyingKey {
+impl TryFrom<&[u8]> for SignetId {
     type Error = TryFromSliceError;
 
     fn try_from(slice: &[u8]) -> Result<Self, Self::Error> {
@@ -147,26 +154,26 @@ impl TryFrom<&[u8]> for VerifyingKey {
     }
 }
 
-impl fmt::Debug for VerifyingKey {
+impl fmt::Debug for SignetId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("VerifyingKey(")?;
+        f.write_str("SignetId(")?;
         fmt_hex(f, &self.bytes)?;
         f.write_str(")")
     }
 }
 
-impl VerifyingKey {
-    /// Construct a verifying key from its 32-byte wire encoding (`public_seed || top_root`).
+impl SignetId {
+    /// Construct a signet identifier from its 32-byte wire encoding (`public_seed || top_root`).
     #[must_use]
-    pub fn from_bytes(bytes: &[u8; VERIFYING_KEY_LEN]) -> Self {
+    pub fn from_bytes(bytes: &[u8; SIGNET_ID_LEN]) -> Self {
         ensure_init();
         let public_key = PublicKey::from_seed(bytes[..N].try_into().unwrap());
         let content_key = derive_key(CTX_CONTENT, bytes);
         Self { bytes: *bytes, public_key, content_key }
     }
 
-    /// The 32-byte wire encoding of this verifying key.
-    pub fn as_bytes(&self) -> &[u8; VERIFYING_KEY_LEN] {
+    /// The 32-byte wire encoding of this signet identifier.
+    pub fn as_bytes(&self) -> &[u8; SIGNET_ID_LEN] {
         &self.bytes
     }
 
@@ -174,58 +181,59 @@ impl VerifyingKey {
         self.bytes[N..].try_into().unwrap()
     }
 
-    /// Verify `signature` over an in-memory `message` slice.
-    #[must_use = "signature verification result must be checked"]
-    pub fn verify(&self, message: &[u8], signature: &Signature) -> bool {
-        let short = content_from_slice(&self.content_key, signature.salt(), message);
-        self.verify_short(&short, signature)
+    /// Verify that `imprint` was made by this signet over an in-memory `message` slice.
+    #[must_use = "imprint verification result must be checked"]
+    pub fn verify(&self, message: &[u8], imprint: &Imprint) -> bool {
+        let short = content_from_slice(&self.content_key, imprint.salt(), message);
+        self.verify_short(&short, imprint)
     }
 
-    /// Verify `signature` over a streaming `reader` in one salted pass.
-    #[must_use = "signature verification result must be checked"]
-    pub fn verify_reader(&self, reader: impl Read, signature: &Signature) -> io::Result<bool> {
-        let short = content_from_reader(&self.content_key, signature.salt(), reader)?;
-        Ok(self.verify_short(&short, signature))
+    /// Verify that `imprint` was made by this signet over a streaming `reader` in one salted pass.
+    #[must_use = "imprint verification result must be checked"]
+    pub fn verify_reader(&self, reader: impl Read, imprint: &Imprint) -> io::Result<bool> {
+        let short = content_from_reader(&self.content_key, imprint.salt(), reader)?;
+        Ok(self.verify_short(&short, imprint))
     }
 
-    fn verify_short(&self, short: &[u8; SHORT_LEN], signature: &Signature) -> bool {
-        if !ct_eq_n(signature.salt(), short[..N].try_into().unwrap()) {
+    fn verify_short(&self, short: &[u8; SHORT_LEN], imprint: &Imprint) -> bool {
+        if !ct_eq_n(imprint.salt(), short[..N].try_into().unwrap()) {
             return false;
         }
-        let msg_in = msg_digest_input(signature.randomizer(), self.root(), short);
+        let msg_in = msg_digest_input(imprint.randomizer(), self.root(), short);
         let public = self.public_key.hasher(false);
         let (fors_indices, leaf_addr) = parse_digest(public.hash(&msg_in).as_bytes());
         let coords = leaf_addr.split_layers();
 
         with_verify_workspace(|ws| {
-            let mut node = fors_verify(&public, leaf_addr, &fors_indices, signature.fors(), ws);
+            let mut node = fors_verify(&public, leaf_addr, &fors_indices, imprint.fors(), ws);
             for layer in Layer::ALL {
                 let (tree, leaf) = coords[layer.index()];
-                node = verify_layer(&public, Pos::new(layer, tree, leaf), &node, signature.layer(layer), ws);
+                node = verify_layer(&public, Pos::new(layer, tree, leaf), &node, imprint.layer(layer), ws);
             }
             ct_eq_n(&node, self.root())
         })
     }
 }
 
-/// A BLINCS signing key derived from a 32-byte seed, holding the 128 KiB top hypertree in memory.
-pub struct SigningKey {
+/// A BLINCS signet (bearer authority derived from a 32-byte seed, holding the 128 KiB top hypertree in memory).
+pub struct Signet {
     seed: [u8; SEED_LEN],
     secret_key: SecretKey,
     salt_key: [u8; 32],
     randomizer_key: [u8; 32],
-    verifying_key: VerifyingKey,
+    id: SignetId,
     top_tree: Vec<[u8; N]>,
 }
 
-impl fmt::Debug for SigningKey {
+impl fmt::Debug for Signet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SigningKey({:?})", self.verifying_key)
+        write!(f, "Signet({:?})", self.id)
     }
 }
 
-impl SigningKey {
-    /// Derive a signing key from a 32-byte `seed`, building the 128 KiB top hypertree across all CPU cores.
+impl Signet {
+    /// Derive a signet from a 32-byte `seed`, building the 128 KiB top hypertree across all CPU cores.
+    #[must_use]
     pub fn from_seed(seed: &[u8; SEED_LEN]) -> Self {
         ensure_init();
         let secret_key = SecretKey::derive(seed);
@@ -243,37 +251,37 @@ impl SigningKey {
         let top_leaves: Vec<[u8; N]> = chunks.into_iter().flatten().collect();
         let top_tree = with_caller_scratch(|ws| build_merkle_heap(&public_key, Layer::TOP, 0, &top_leaves, ws));
 
-        let mut vk_bytes = [0u8; VERIFYING_KEY_LEN];
-        vk_bytes[..N].copy_from_slice(&public_seed);
-        vk_bytes[N..].copy_from_slice(&top_tree[1]);
-        Self { seed: *seed, secret_key, salt_key, randomizer_key, verifying_key: VerifyingKey::from_bytes(&vk_bytes), top_tree }
+        let mut id_bytes = [0u8; SIGNET_ID_LEN];
+        id_bytes[..N].copy_from_slice(&public_seed);
+        id_bytes[N..].copy_from_slice(&top_tree[1]);
+        Self { seed: *seed, secret_key, salt_key, randomizer_key, id: SignetId::from_bytes(&id_bytes), top_tree }
     }
 
-    /// The 32-byte seed from which this signing key was derived.
+    /// The 32-byte seed from which this signet was derived.
     pub fn seed(&self) -> &[u8; SEED_LEN] {
         &self.seed
     }
 
-    /// The 32-byte verifying key corresponding to this signing key.
-    pub fn verifying_key(&self) -> VerifyingKey {
-        self.verifying_key
+    /// The 32-byte identifier of this signet.
+    pub fn id(&self) -> SignetId {
+        self.id
     }
 
-    fn finish_signature(&self, short: &[u8; SHORT_LEN]) -> Signature {
+    fn finish_imprint(&self, short: &[u8; SHORT_LEN]) -> Imprint {
         enum WaveOut {
             Wots([[u8; N]; SIGN_WOTS_CHUNK]),
             Fors(ForsTreeOut),
         }
 
-        let mut sig = [0u8; SIGNATURE_LEN];
+        let mut sig = [0u8; IMPRINT_LEN];
         let randomizer = first_n(&keyed(&self.randomizer_key, short));
         sig[..N].copy_from_slice(&short[..N]);
         sig[N..2 * N].copy_from_slice(&randomizer);
 
-        let msg_in = msg_digest_input(&randomizer, self.verifying_key.root(), short);
-        let (fors_indices, leaf_addr) = parse_digest(&self.verifying_key.public_key.keyed(&msg_in));
+        let msg_in = msg_digest_input(&randomizer, self.id.root(), short);
+        let (fors_indices, leaf_addr) = parse_digest(&self.id.public_key.keyed(&msg_in));
         let coords = leaf_addr.split_layers();
-        let (sec, pubk) = (self.secret_key, self.verifying_key.public_key);
+        let (sec, pubk) = (self.secret_key, self.id.public_key);
 
         // One parallel wave builds all 3 lower XMSS leaf sets (384 WOTS+ leaves) and all 16 FORS trees.
         let results = parallel_collect(SIGN_TOTAL_TASKS, move |id, sme2, ws| {
@@ -289,7 +297,7 @@ impl SigningKey {
             }
         });
 
-        // Pack FORS signature and compute FORS root.
+        // Pack FORS imprint and compute FORS root.
         let mut at = 2 * N;
         let mut fors_roots = [[0u8; N]; FORS_TREES];
         for (t, item) in results[LOWER_WOTS_TASKS..].iter().enumerate() {
@@ -304,7 +312,7 @@ impl SigningKey {
         }
         let mut node = fors_root(&pubk.hasher(false), leaf_addr, &fors_roots);
 
-        // Build the 3 lower Merkle heaps and sign all 4 hypertree layers.
+        // Build the 3 lower Merkle heaps and imprint all 4 hypertree layers.
         with_caller_scratch(|ws| {
             for layer in Layer::LOWER {
                 let l = layer.index();
@@ -333,35 +341,35 @@ impl SigningKey {
             );
         });
 
-        let signature = Signature(sig);
-        assert!(self.verifying_key.verify_short(short, &signature), "internal error: generated signature failed self-verification");
-        signature
+        let imprint = Imprint(sig);
+        assert!(self.id.verify_short(short, &imprint), "internal error: generated imprint failed self-verification");
+        imprint
     }
 
-    pub(crate) fn sign_with_draw(&self, draw: &[u8; 32], message: &[u8]) -> Signature {
+    pub(crate) fn imprint_with_draw(&self, draw: &[u8; 32], message: &[u8]) -> Imprint {
         ensure_init();
         let salt = first_n(&keyed(&self.salt_key, draw));
-        let short = content_from_slice(&self.verifying_key.content_key, &salt, message);
-        self.finish_signature(&short)
+        let short = content_from_slice(&self.id.content_key, &salt, message);
+        self.finish_imprint(&short)
     }
 
-    pub(crate) fn sign_reader_with_draw(&self, draw: &[u8; 32], reader: impl Read) -> io::Result<Signature> {
+    pub(crate) fn imprint_reader_with_draw(&self, draw: &[u8; 32], reader: impl Read) -> io::Result<Imprint> {
         ensure_init();
         let salt = first_n(&keyed(&self.salt_key, draw));
-        let short = content_from_reader(&self.verifying_key.content_key, &salt, reader)?;
-        Ok(self.finish_signature(&short))
+        let short = content_from_reader(&self.id.content_key, &salt, reader)?;
+        Ok(self.finish_imprint(&short))
     }
 
-    /// Sign an in-memory `message`, drawing fresh per-signature randomness from `randomness`.
+    /// Imprint an in-memory `message`, drawing fresh per-imprint randomness from `randomness`.
     #[must_use]
-    pub fn sign(&self, randomness: &Randomness, message: &[u8]) -> Signature {
+    pub fn imprint(&self, randomness: &Randomness, message: &[u8]) -> Imprint {
         let draw = randomness.draw();
-        self.sign_with_draw(&draw, message)
+        self.imprint_with_draw(&draw, message)
     }
 
-    /// Sign a streaming `reader` in one salted pass, drawing fresh per-signature randomness from `randomness`.
-    pub fn sign_reader(&self, randomness: &Randomness, reader: impl Read) -> io::Result<Signature> {
+    /// Imprint a streaming `reader` in one salted pass, drawing fresh per-imprint randomness from `randomness`.
+    pub fn imprint_reader(&self, randomness: &Randomness, reader: impl Read) -> io::Result<Imprint> {
         let draw = randomness.draw();
-        self.sign_reader_with_draw(&draw, reader)
+        self.imprint_reader_with_draw(&draw, reader)
     }
 }

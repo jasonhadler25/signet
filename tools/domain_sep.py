@@ -122,7 +122,7 @@ def check_static(params_src, spec_text, shipped_sources):
 
 def self_test(params_src, spec_text, shipped_sources):
     # Planted fault 1: duplicate context string.
-    bad_ctx = params_src.replace("BLINCS 2026-11-23 content", "BLINCS 2026-11-23 public hash", 1)
+    bad_ctx = params_src.replace("BLINCS 2026-11-24 content", "BLINCS 2026-11-24 public hash", 1)
     assert check_static(bad_ctx, spec_text, shipped_sources), "self-test failed: duplicate CTX escaped"
 
     # Planted fault 2: duplicate TweakKind byte tag.
@@ -159,8 +159,8 @@ def check_dynamic_reference():
     k_sec_expected = orig_derive(blincs.CTX_SECRET_VALUES, seed)
     pk_seed = orig_derive(blincs.CTX_PUBLIC_SEED, seed)[:16]
     k_pub_expected = orig_derive(blincs.CTX_PUBLIC_HASH, pk_seed)
-    vk_bytes = bytes.fromhex("0ad9c13b8972b912a211f9fd2ba1eec863399e14d2f6c8c3309f9d7e61a53c46")
-    sig_bytes = open(os.path.join(ROOT, "test_vectors", "reference-signature-1.bin"), "rb").read()
+    id_bytes = bytes.fromhex("8e15ddf8f53bf3066099aaa8b8c073a0b2955754ebc88c5be38e23f708c8f3e9")
+    imp_bytes = open(os.path.join(ROOT, "test_vectors", "reference-imprint-1.bin"), "rb").read()
 
     bucket = [ver_sec_tweaks, ver_pub_tweaks]
 
@@ -180,9 +180,9 @@ def check_dynamic_reference():
     blake3.derive_key = traced_derive
     blake3.keyed_hash = traced_keyed
     try:
-        # 1. Trace full verification of reference-signature-1.bin (0 K_sec calls, every K_pub tweak unique).
-        vk = blincs.VerifyingKey(vk_bytes)
-        assert vk.verify(b"hello, BLINCS", sig_bytes)
+        # 1. Trace full verification of reference-imprint-1.bin (0 K_sec calls, every K_pub tweak unique).
+        sid = blincs.SignetId(id_bytes)
+        assert sid.verify(b"hello, BLINCS", imp_bytes)
 
         # 2. Trace FORS leaf/node derivation (16 leaves, height 4) and WOTS+/Merkle (4 leaves, layer 0) in-process.
         bucket[0], bucket[1] = fors_sec_tweaks, fors_pub_tweaks

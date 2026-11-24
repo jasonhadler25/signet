@@ -11,7 +11,7 @@ BENCHMARKS.md           SLH-DSA-B reproduction, BLINCS comparison, clocks & MT
 QUALITY.md              Verification layers, reproduction commands, and known gaps
 SECURITY.md             Threat model, operational boundaries, and reporting
 src/
-  lib.rs                Public API (SigningKey, VerifyingKey, Signature)
+  lib.rs                Public API (Signet, SignetId, Imprint)
   params.rs             Constants, contexts, 16-byte tweaks, key helpers
   content.rs            Single-pass salted BLAKE3 content hashing (multi-core slices & zero-copy Pipeline streams)
   few_time.rs           FORS few-time signatures (16 trees x 1,024 leaves, zero grinding)
@@ -44,7 +44,7 @@ audits/                 Unedited cross-family review reports
 - **Design by Contract:** document preconditions and fail stop on broken invariants; avoid defensive fallback modes that hide bugs.
 - **Crash-only:** avoid shutdown hooks and per-call allocate-and-drop cycles for reusable buffers.
 - **Zero `unsafe`:** the library crate enforces `#![forbid(unsafe_code)]`.
-- **Terminology:** call the 32-byte verification key a **verifying key**, not a "public key".
+- **Terminology:** call the 32-byte secret bearer object a **signet** (`Signet`), its 32-byte public identifier a **signet ID** (`SignetId`) — never "public key" — and the 5,616-byte proof an **imprint** (`Imprint`).
 - **Two hashes:** whenever recording or checking a file digest, record both SHA-256 and BLAKE3.
 - **Measurement:** time changes with `bench/` (`clocks`: wall time, core cycles, clock speed, and background load together).
 
@@ -57,4 +57,4 @@ python3 tools/land.py
 python3 tools/mutants/check.py
 ```
 
-`tools/land.py` checks a clean working tree, `cargo fmt -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo nextest run --locked`, `cargo test --doc --locked`, `reference/blake3.py`, `tools/optimize.py --check`, `tools/counts.py`, `tools/domain_sep.py`, `python3 -O` reference input validation, checked-in test vector SHA-256 and BLAKE3 digests (`reference-signature-1.bin` and `edge-vectors.json`), and all 16 planted-fault controls in `tools/controls.py`.
+`tools/land.py` checks a clean working tree, `cargo fmt -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo nextest run --locked`, `cargo test --doc --locked`, `reference/blake3.py`, `tools/optimize.py --check`, `tools/counts.py`, `tools/domain_sep.py`, `python3 -O` reference input validation, checked-in test vector SHA-256 and BLAKE3 digests (`reference-imprint-1.bin` and `edge-vectors.json`), and all 16 planted-fault controls in `tools/controls.py`.

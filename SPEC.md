@@ -35,7 +35,7 @@ Derived lengths:
 - `FORS_LEN = FORS_TREES * (1 + FORS_HEIGHT) * N = 2,816` bytes.
 - `LOWER_LAYER_LEN = (CHAINS + LOWER_HEIGHT) * N = 672` bytes.
 - `TOP_LAYER_LEN = (CHAINS + TOP_HEIGHT) * N = 752` bytes.
-- `SIGNATURE_LEN = 2 * N + FORS_LEN + 3 * LOWER_LAYER_LEN + TOP_LAYER_LEN = 5,616` bytes.
+- `IMPRINT_LEN = 2 * N + FORS_LEN + 3 * LOWER_LAYER_LEN + TOP_LAYER_LEN = 5,616` bytes.
 
 ## Key-derivation contexts
 
@@ -43,15 +43,15 @@ Every derived 32-byte key uses a distinct UTF-8 context string:
 
 | Name | Context string |
 |---|---|
-| `SECRET_VALUES` | `"BLINCS 2026-11-23 signing key: secret values"` |
-| `CONTENT_SALT` | `"BLINCS 2026-11-23 signing key: content salt"` |
-| `RANDOMIZER` | `"BLINCS 2026-11-23 signing key: randomizer"` |
-| `PUBLIC_SEED` | `"BLINCS 2026-11-23 signing key: public seed"` |
-| `PUBLIC_HASH` | `"BLINCS 2026-11-23 public hash"` |
-| `CONTENT` | `"BLINCS 2026-11-23 content"` |
-| `MIX` | `"BLINCS 2026-11-23 randomness: mix"` |
-| `NEXT_SEED` | `"BLINCS 2026-11-23 randomness: seed kept in the file"` |
-| `RUN_KEY` | `"BLINCS 2026-11-23 randomness: key of this run"` |
+| `SECRET_VALUES` | `"BLINCS 2026-11-24 signet: secret values"` |
+| `CONTENT_SALT` | `"BLINCS 2026-11-24 signet: content salt"` |
+| `RANDOMIZER` | `"BLINCS 2026-11-24 signet: randomizer"` |
+| `PUBLIC_SEED` | `"BLINCS 2026-11-24 signet: public seed"` |
+| `PUBLIC_HASH` | `"BLINCS 2026-11-24 public hash"` |
+| `CONTENT` | `"BLINCS 2026-11-24 content"` |
+| `MIX` | `"BLINCS 2026-11-24 randomness: mix"` |
+| `NEXT_SEED` | `"BLINCS 2026-11-24 randomness: seed kept in the file"` |
+| `RUN_KEY` | `"BLINCS 2026-11-24 randomness: key of this run"` |
 
 ## Tweaks
 
@@ -83,9 +83,9 @@ Unused fields are zero. The nine kinds are:
 
 Define `ShortHash(K, T, data) = Keyed(K, T || data)[..16]`.
 
-## Keys
+## Signet and SignetId
 
-A signing key is a 32-byte `seed` supplied by the caller. From `seed`:
+A `Signet` is derived from a 32-byte `seed` supplied by the caller:
 
 ```text
 K_sec   = Derive(SECRET_VALUES, seed)
@@ -96,12 +96,12 @@ K_pub   = Derive(PUBLIC_HASH,   pk_seed)
 root    = top hypertree root at layer = 3, tree = 0 (height 12, 4,096 leaves)
 ```
 
-The 32-byte verifying key is `vk = pk_seed || root`. A verifier derives from `vk`:
+The 32-byte signet identifier (`SignetId`) is `id = pk_seed || root`. A verifier derives from `id`:
 
 ```text
-K_pub     = Derive(PUBLIC_HASH, vk[..16])
-root      = vk[16..32]
-K_content = Derive(CONTENT,     vk)
+K_pub     = Derive(PUBLIC_HASH, id[..16])
+root      = id[16..32]
+K_content = Derive(CONTENT,     id)
 ```
 
 ## Content

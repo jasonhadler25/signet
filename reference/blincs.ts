@@ -78,7 +78,7 @@ export const derive = (ctx: string, m: Uint8Array): Uint8Array =>
 
 // ---------------- BLINCS ----------------
 const N = 16, CHAINS = 35, FORS_TREES = 16, FORS_HEIGHT = 10, SIG_LEN = 5616;
-const P = "BLINCS 2026-11-23 ";
+const P = "BLINCS 2026-11-24 ";
 const CTX_PUBLIC_HASH = P + "public hash", CTX_CONTENT = P + "content", CTX_MIX = P + "randomness: mix",
   CTX_NEXT_SEED = P + "randomness: seed kept in the file", CTX_RUN_KEY = P + "randomness: key of this run";
 const CHAIN = 2, ONE_TIME_KEY = 3, NODE = 4, FEW_LEAF = 6, FEW_NODE = 7, FEW_ROOT = 8, MESSAGE = 9;

@@ -97,14 +97,14 @@ CONTROLS = [
         "randomness_create_and_initialize_lifecycle_and_rejection",
     ),
     (
-        "VerifyingKey::from_bytes initializes blake3-servil",
+        "SignetId::from_bytes initializes blake3-servil",
         "src/lib.rs",
-        "    pub fn from_bytes(bytes: &[u8; VERIFYING_KEY_LEN]) -> Self {\n        ensure_init();",
-        "    pub fn from_bytes(bytes: &[u8; VERIFYING_KEY_LEN]) -> Self {",
+        "    pub fn from_bytes(bytes: &[u8; SIGNET_ID_LEN]) -> Self {\n        ensure_init();",
+        "    pub fn from_bytes(bytes: &[u8; SIGNET_ID_LEN]) -> Self {",
         "verify_alone_initializes_blake3_in_fresh_process",
     ),
     (
-        "SigningKey::from_seed initializes blake3-servil",
+        "Signet::from_seed initializes blake3-servil",
         "src/lib.rs",
         "    pub fn from_seed(seed: &[u8; SEED_LEN]) -> Self {\n        ensure_init();",
         "    pub fn from_seed(seed: &[u8; SEED_LEN]) -> Self {",
