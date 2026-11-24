@@ -49,26 +49,10 @@ thread_local! {
     static VERIFY_WS: RefCell<VerifyWorkspace> = RefCell::new(VerifyWorkspace::new());
 }
 
-/// Borrow this thread's signing scratch, falling back to a temporary scratch if TLS is already torn down.
 pub(crate) fn with_caller_scratch<R>(f: impl FnOnce(&mut WorkerScratch) -> R) -> R {
-    let mut f = Some(f);
-    match CALLER_SCRATCH.try_with(|cell| f.take().unwrap()(&mut cell.borrow_mut())) {
-        Ok(r) => r,
-        Err(_) => {
-            let mut tmp = WorkerScratch::new();
-            f.take().unwrap()(&mut tmp)
-        }
-    }
+    CALLER_SCRATCH.with(|cell| f(&mut cell.borrow_mut()))
 }
 
-/// Borrow this thread's verifier workspace, falling back to a temporary workspace if TLS is already torn down.
 pub(crate) fn with_verify_workspace<R>(f: impl FnOnce(&mut VerifyWorkspace) -> R) -> R {
-    let mut f = Some(f);
-    match VERIFY_WS.try_with(|cell| f.take().unwrap()(&mut cell.borrow_mut())) {
-        Ok(r) => r,
-        Err(_) => {
-            let mut tmp = VerifyWorkspace::new();
-            f.take().unwrap()(&mut tmp)
-        }
-    }
+    VERIFY_WS.with(|cell| f(&mut cell.borrow_mut()))
 }

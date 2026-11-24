@@ -2,9 +2,10 @@ use crate::few_time::{ForsTreeOut, build_fors_tree};
 use crate::one_time::{KeyPair, Pos, build_wots_leaves_chunk};
 use crate::params::{FORS_TREES, ForsIndex, LAYERS, LOWER_LEAVES, Layer, LeafAddr, N, PublicKey, SecretKey, TOP_LEAVES, TreeIndex, ensure_init};
 use crate::workspace::{WOTS_CHUNK_LEAVES, WorkerScratch, with_caller_scratch};
-use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::process::abort;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 
 /// Number of WOTS+ leaves processed per dynamic task during a signing wave (128 / 8 = 16 tasks per lower layer).
@@ -112,7 +113,6 @@ struct PoolState {
     generation: u64,
     active: Option<Arc<Job>>,
     remaining_workers: usize,
-    failed: bool,
 }
 
 /// Persistent crash-only worker pool for coarse tree/FORS waves.
@@ -129,7 +129,7 @@ impl Pool {
     fn new() -> Self {
         let cpus = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         let target = cpus.saturating_sub(1).min(MAX_WORKERS);
-        let state = Arc::new((Mutex::new(PoolState { generation: 0, active: None, remaining_workers: 0, failed: false }), Condvar::new(), Condvar::new()));
+        let state = Arc::new((Mutex::new(PoolState { generation: 0, active: None, remaining_workers: 0 }), Condvar::new(), Condvar::new()));
 
         let mut spawned = 0usize;
         for idx in 0..target {
@@ -148,17 +148,14 @@ impl Pool {
                         seen_gen = guard.generation;
                         Arc::clone(guard.active.as_ref().unwrap())
                     };
-                    let ok = catch_unwind(AssertUnwindSafe(|| job.drain(false, &mut ws))).is_ok();
-                    let mut guard = lock.lock().unwrap();
-                    if !ok {
-                        guard.failed = true;
+                    // Crash-only: an internal worker panic aborts the process rather than hanging waiters.
+                    if catch_unwind(AssertUnwindSafe(|| job.drain(false, &mut ws))).is_err() {
+                        abort();
                     }
+                    let mut guard = lock.lock().unwrap();
                     guard.remaining_workers -= 1;
                     if guard.remaining_workers == 0 {
                         done.notify_one();
-                    }
-                    if !ok {
-                        break;
                     }
                 }
             });
@@ -178,40 +175,30 @@ impl Pool {
             with_caller_scratch(|ws| job.drain(true, ws));
             return;
         }
-        let _dispatch_guard = match self.dispatch.try_lock() {
-            Ok(g) => g,
-            Err(TryLockError::WouldBlock) => {
-                with_caller_scratch(|ws| job.drain(true, ws));
-                return;
-            }
-            Err(TryLockError::Poisoned(_)) => panic!("blincs worker pool dispatch lock poisoned"),
+        let Ok(_dispatch_guard) = self.dispatch.try_lock() else {
+            with_caller_scratch(|ws| job.drain(true, ws));
+            return;
         };
 
         let (lock, wake, done) = &*self.state;
         {
             let mut guard = lock.lock().unwrap();
-            assert!(!guard.failed, "blincs worker pool failed in an earlier wave");
             guard.generation += 1;
             guard.active = Some(Arc::clone(&job));
             guard.remaining_workers = self.n_workers;
             wake.notify_all();
         }
 
-        let caller_res = catch_unwind(AssertUnwindSafe(|| with_caller_scratch(|ws| job.drain(true, ws))));
-
-        let worker_failed = {
-            let mut guard = lock.lock().unwrap();
-            while guard.remaining_workers > 0 {
-                guard = done.wait(guard).unwrap();
-            }
-            guard.active = None;
-            guard.failed
-        };
-
-        if let Err(payload) = caller_res {
-            resume_unwind(payload);
+        // Crash-only: an internal panic mid-wave aborts rather than leaving workers or secrets wedged.
+        if catch_unwind(AssertUnwindSafe(|| with_caller_scratch(|ws| job.drain(true, ws)))).is_err() {
+            abort();
         }
-        assert!(!worker_failed, "blincs worker thread panicked during parallel wave");
+
+        let mut guard = lock.lock().unwrap();
+        while guard.remaining_workers > 0 {
+            guard = done.wait(guard).unwrap();
+        }
+        guard.active = None;
     }
 }
 

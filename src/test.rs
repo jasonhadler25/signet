@@ -11,7 +11,7 @@ use crate::{Randomness, SEED_LEN, Signature, SigningKey, VERIFYING_KEY_LEN, Veri
 use blake3_servil::throughput::Batch;
 use std::fs;
 use std::io::{self, Cursor, ErrorKind, Read};
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::catch_unwind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -704,7 +704,7 @@ fn hostile_filesystem_and_non_regular_state_paths_are_rejected() {
 }
 
 #[test]
-fn oversized_read_return_and_caught_panic_are_handled_cleanly() {
+fn oversized_read_return_fails_stop() {
     struct OversizedReader {
         prefix: usize,
     }
@@ -719,20 +719,6 @@ fn oversized_read_return_and_caught_panic_are_handled_cleanly() {
             Ok(buf.len() + 1)
         }
     }
-    struct PanickingAfterReader {
-        prefix: usize,
-    }
-    impl Read for PanickingAfterReader {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            if self.prefix > 0 {
-                let n = self.prefix.min(buf.len());
-                buf[..n].fill(0x22);
-                self.prefix -= n;
-                return Ok(n);
-            }
-            panic!("simulated reader panic mid-stream");
-        }
-    }
 
     let sk = SigningKey::from_seed(&[0x66u8; SEED_LEN]);
     let vk = sk.verifying_key();
@@ -742,14 +728,6 @@ fn oversized_read_return_and_caught_panic_are_handled_cleanly() {
     assert!(catch_unwind(|| content_from_reader(&ck, &[0u8; N], OversizedReader { prefix: 0 })).is_err());
     assert!(catch_unwind(|| content_from_reader(&ck, &[0u8; N], OversizedReader { prefix: 32_768 })).is_err());
     assert!(catch_unwind(|| read_exact_or_reject(&mut OversizedReader { prefix: 0 })).is_err());
-
-    // Caught panic mid-Pipeline (after > 64 KiB room commit is in flight) leaves sign_reader / verify_reader reusable.
-    let res_sign = catch_unwind(AssertUnwindSafe(|| sk.sign_reader_with_draw(&[3u8; 32], PanickingAfterReader { prefix: 80_000 })));
-    assert!(res_sign.is_err());
-    let sig = sk.sign_reader_with_draw(&[4u8; 32], Cursor::new(vec![0x77u8; 90_000])).unwrap();
-    let res_ver = catch_unwind(AssertUnwindSafe(|| vk.verify_reader(PanickingAfterReader { prefix: 80_000 }, &sig)));
-    assert!(res_ver.is_err());
-    assert!(vk.verify_reader(Cursor::new(vec![0x77u8; 90_000]), &sig).unwrap());
 }
 
 #[test]
