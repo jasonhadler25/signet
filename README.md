@@ -39,7 +39,7 @@ These numbers are the cost of a brute-force attack. There is no known reason to 
 - **Resilient to copies and restarts.** Because your signing key is a 32-byte seed and requires no per-signature state synchronization, copying a key across servers or restoring a backup will not break it.
 - **Short verifying keys.** At 32 bytes, a verifying key fits naturally anywhere a short identifier goes.
 - **Fast on small messages and huge streams.** On a modern laptop, BLINCS signs in under a millisecond, verifies tens of thousands of signatures per second on a single core, and hashes large inputs across all CPU cores at tens of gigabytes per second.
-- **No pre-hash footgun.** You pass bytes or a stream directly to BLINCS. Pre-hashing a message before signing exposes your users to collision attacks on the pre-hash; hashing the stream directly inside BLINCS avoids that exposure at full BLAKE3 speed.
+- **Stream the original input directly (don't pre-hash).** BLINCS defines no separate pre-hash mode and streams large inputs at full BLAKE3 speed via `imprint_reader` / `verify_reader`. We advise passing the original bytes or stream directly rather than pre-hashing first, which would expose users to unsalted collision attacks on the pre-hash.
 - **Small enough to read and audit.** Zero `unsafe` Rust, one runtime dependency (`blake3-servil`), and a short pure-Python reference implementation that matches the Rust library byte for byte.
 
 BLINCS is built for general-purpose signing wherever 5.6 KiB signatures fit and you want simple, durable, post-quantum security. If you need 64-byte signatures, unlimited signatures from a single key without rotation, or FIPS 205 wire interoperability, choose a different scheme.

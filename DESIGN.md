@@ -144,9 +144,9 @@ This section records every hash-based signature technique we evaluated — both 
 
 ## 5. Single-pass salted content hashing
 
-### No pre-hash API
+### Why we omit a pre-hash mode (and advise passing the original message)
 
-BLINCS exposes `sign` / `sign_reader` and `verify` / `verify_reader`, and no entry point accepting a precomputed digest. Pre-hashing exposes callers to collision attacks on the pre-hash; hashing the stream directly inside BLINCS keeps the signature bound to a freshly chosen salt and runs at full BLAKE3 speed.
+Any API that accepts `&[u8]` cannot stop a caller from hashing their input first and passing the resulting digest. Instead, BLINCS intentionally omits any separate pre-hash mode (such as HashSLH-DSA), provides fast streaming entry points (`imprint_reader` and `verify_reader`) so callers do not need to pre-hash large files to fit them in memory or go fast, and prominently advises callers in the documentation to pass the original bytes or stream directly. Passing the original message keeps the imprint bound to a fresh per-imprint salt rather than exposing users to unsalted collision attacks on a pre-hash.
 
 ### Why single-pass salted BLAKE3 instead of two-pass chunking
 
