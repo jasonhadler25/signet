@@ -1,13 +1,48 @@
 # BLINCS
 
-Stateless hash-based signatures built on [BLAKE3](https://github.com/servil-software-factory/BLAKE3).
+**BLINCS** is a general-purpose, post-quantum digital signature library built entirely on [BLAKE3](https://github.com/servil-software-factory/BLAKE3).
 
-- **32-byte verifying key** — short enough to embed directly in a name or URL.
-- **32-byte signing-key seed** — caller-supplied; stateless across machines and backups, with no key cache file on disk (`5.43 ms` cold key derivation builds the 128 KiB top tree across CPU cores).
-- **5,616-byte fixed-size signature** (`7,488 B` Base64 — clears default Apache `8,190 B` and nginx `8,192 B` HTTP headers with 702 B to spare) for any message length from 0 bytes to multi-gigabyte streams.
-- **Zero counter grinding & WOTS+ / FORS structure** — nibble `WOTS+` (`w = 16`, 35 chains) + `FORS` (`16` trees of `1,024` leaves) on a `12 + 3×7` hypertree (BLINCS-specific nibble/tweak encodings and BLAKE3 instantiation; not FIPS 205 interoperable): no grinding tail-latency spikes, no disk cache API, and ~40% simpler spec and code.
-- **Salted single-pass multi-core content hash** — messages are hashed directly with keyed BLAKE3 under a fresh per-signature salt with no pre-hash API. Pre-hashing makes users vulnerable to collision attacks; passing the message or stream to BLINCS relies on randomized target-collision resistance and runs at full multi-core BLAKE3 speed (**28.6 GB/s** slice / **27.7 GB/s** streaming on Apple M6 via `blake3-servil`).
-- **Design target:** **128-bit classical security** (128-bit root) up to **$2^{32}$ signatures** per signing key (4,294,967,296: 10 signatures a second for 13.6 years; estimated FORS cover exponent **133.2 bits** at $2^{32}$, degrading gracefully to `126.8` bits at $2^{33}$ and `119.3` bits at $2^{34}$), pending independent human cryptographic review. Signing currently targets Unix (`Randomness` uses `/dev/urandom` and `flock`).
+It gives you a **32-byte verifying key**, a **32-byte signing seed**, and a **5.6 KiB signature** that signs in under a millisecond, verifies in 25 microseconds, and streams gigabytes per second — all with zero `unsafe` Rust and a single dependency.
+
+## Why BLINCS exists
+
+If your software already relies on a secure hash function, hash-based signatures let you add post-quantum signing without adding a dependency on any new cryptographic assumption. No elliptic curves, no factoring, no lattices.
+
+Existing hash-based schemes force an uncomfortable choice:
+
+- **Stateful schemes (XMSS, LMS)** are compact and fast, but require keeping exact per-signature state. Restoring a backup, cloning a virtual machine, or running two signers out of sync can compromise the signing key immediately.
+- **Standard stateless schemes (SLH-DSA)** avoid that fragility, but size their keys for $2^{64}$ signatures — a budget so extreme that every signature pays heavily in signing time or signature size.
+
+BLINCS takes the practical middle ground: size each key for **4 billion signatures** ($2^{32}$ — ten signatures every second for thirteen years) and build strictly on **BLAKE3**. Choosing a realistic per-key limit makes stateless signatures both compact and fast.
+
+## What happens past 4 billion signatures?
+
+A BLINCS signing key does **not** suddenly break at 4 billion signatures.
+
+Instead, every additional signature slowly wears down the key's security against brute-force attack. If an attacker collects billions of signatures made by the same key, forging a signature on a new message gradually gets easier:
+
+| Signatures made by one key | Brute-force security | Brute-force cost (ASIC electricity) | Brute-force time (800 EH/s, Bitcoin scale) | What that means in practice |
+|---:|---:|---:|---:|---|
+| Up to **4.3 billion** ($2^{32}$) | **128-bit** | ~$1.6 × 10²⁰ | ~13 billion years | Full strength (comparable to AES-128 / Ed25519) |
+| **34 billion** ($8\times$) | **111-bit** | ~$9.6 × 10¹⁴ | ~78,000 years | Still far beyond any practical attack |
+| **69 billion** ($16\times$) | **100-bit** | ~$870 billion | ~71 years | Weakening, though still out of reach today |
+| **More than 69 billion** | **< 100-bit** | falls rapidly | falls rapidly | Potentially forgeable by a well-funded attacker |
+
+To keep full security, rotate to a new signing key before making $2^{32}$ signatures.
+
+These numbers are the cost of a brute-force attack. There is no known reason to think that either quantum computers or super-intelligent AIs could generate forgeries any more efficiently than brute force; if they could, it would reduce the security level.
+
+## Why adopt it
+
+- **Resilient to copies and restarts.** Because your signing key is a 32-byte seed and requires no per-signature state synchronization, copying a key across servers or restoring a backup will not break it.
+- **Short verifying keys.** At 32 bytes, a verifying key fits naturally anywhere a short identifier goes.
+- **Fast on small messages and huge streams.** On a modern laptop, BLINCS signs in under a millisecond, verifies tens of thousands of signatures per second on a single core, and hashes large inputs across all CPU cores at tens of gigabytes per second.
+- **No pre-hash footgun.** You pass bytes or a stream directly to BLINCS. Pre-hashing a message before signing exposes your users to collision attacks on the pre-hash; hashing the stream directly inside BLINCS avoids that exposure at full BLAKE3 speed.
+- **Small enough to read and audit.** Zero `unsafe` Rust, one runtime dependency (`blake3-servil`), and a short pure-Python reference implementation that matches the Rust library byte for byte.
+
+BLINCS is built for general-purpose signing wherever 5.6 KiB signatures fit and you want simple, durable, post-quantum security. If you need 64-byte signatures, unlimited signatures from a single key without rotation, or FIPS 205 wire interoperability, choose a different scheme.
+
+*BLINCS is currently pre-1.0: formats and APIs may still change, and an independent human cryptographic audit has not yet been performed.*
 
 ## Credits and thanks
 
@@ -78,9 +113,9 @@ assert!(verifying_key.verify(b"hello, BLINCS", &signature));
 
 For large files or streams, use `SigningKey::sign_reader` and `VerifyingKey::verify_reader`.
 
-## Trusted base and testing
+## Dependencies and testing
 
-The library enforces `#![forbid(unsafe_code)]`, has **one** runtime dependency (`blake3-servil = "=0.10.0"`, 10 crates total in `Cargo.lock`, all BLAKE3 + SHA-256 hashset-verified before building), and zero dev-dependencies. An independent pure-Python implementation (`reference/blincs.py` + `reference/blake3.py`) cross-checks the Rust implementation byte for byte.
+The library enforces `#![forbid(unsafe_code)]`, has **one** runtime dependency (`blake3-servil = "=0.10.0"`, 10 crates total in `Cargo.lock`, all BLAKE3 + SHA-256 hashset-verified before building), and zero dev-dependencies. An independent pure-Python implementation (`reference/blincs.py` + `reference/blake3.py`) cross-checks the Rust implementation byte for byte. Signing randomness state (`Randomness`) currently targets Unix (`/dev/urandom` and `flock`).
 
 Tests run under `cargo-nextest` (one process per test):
 
@@ -90,13 +125,14 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo nextest run --locked
 cargo test --doc --locked
 python3 reference/blake3.py
+python3 tools/counts.py
 python3 tools/controls.py
 python3 tools/mutants/check.py
 ```
 
 ## Status and authorship
 
-Pre-1.0 draft (`0.1.0`): formats, context strings, and APIs may change before 1.0. Written primarily by an AI assistant at the direction of this repository's owner. Round 1 automated cross-family review is archived in [`audits/`](audits/); **no independent human cryptographic review or security audit has been performed**.
+Pre-1.0 draft (`0.1.0`): formats, context strings, and APIs may change before 1.0. Written primarily by an AI assistant at the direction of this repository's owner. Round 1 and Round 2 automated cross-family reviews are archived in [`audits/`](audits/); **no independent human cryptographic review or security audit has been performed**.
 
 ## Contributing and licenses
 
