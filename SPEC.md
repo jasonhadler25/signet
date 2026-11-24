@@ -2,7 +2,7 @@
 
 *Status: pre-1.0 design under active development (0.1.0, formats and context strings may still change before 1.0). Written by an AI assistant at the direction of this repository's owner; no independent cryptographic review or security audit has been performed. Builds on BLAKE3 (O'Connor, Aumasson, Neves, Wilcox-O'Hearn) and SPHINCS / SPHINCS+ / FIPS 205 SLH-DSA (Bernstein, Hopwood, Hülsing, Kölbl, Lange, Niederhagen, Papachristodoulou, Rijneveld, Schneider, Schwabe, Wilcox-O'Hearn, and the NIST SLH-DSA team). Thanks to [Project 11](https://research.projecteleven.com/) — especially **Conor Deegan**, **Alessandro Baiocchi**, **Matteo Vena**, and **Matteo Vicari** — for direct review feedback on this specification, benchmarks, and irregular-hypertree/caching ideas (full credits in [`README.md`](README.md#credits-and-thanks)).*
 
-BLINCS is a stateless hash-based signature scheme built on BLAKE3, combining textbook FIPS 205 **WOTS+** (nibbles, `w = 16`) and **FORS** (`16` trees of `1,024` leaves) on a 4-layer hypertree (`12 + 3×7`, total height `33`) with **zero counter grinding** and single-pass salted content hashing. A signature is **5,616 bytes** (`7,488` bytes Base64 — fitting cleanly under default Apache/nginx 8 KiB HTTP headers), a verifying key is **32 bytes**, and a signing key is a **32-byte seed**. Its parameters target **133.2 bits** of classical security at up to **$2^{32}$ signatures** per signing key (4,294,967,296: ten signatures a second for 13.6 years) under the SPHINCS+ / FIPS 205 FORS cover-probability model, degrading gracefully past the budget (`126.8` bits at $2^{33}$, `119.3` bits at $2^{34}$).
+BLINCS is a stateless hash-based signature scheme built on BLAKE3, using a **WOTS+** (nibbles, `w = 16`) and **FORS** (`16` trees of `1,024` leaves) structure on a 4-layer hypertree (`12 + 3×7`, total height `33`) with **zero counter grinding** and single-pass salted content hashing (BLINCS-specific nibble/tweak encodings and BLAKE3 instantiation; not FIPS 205 interoperable or validated). A signature is **5,616 bytes** (`7,488` bytes Base64 — fitting cleanly under default Apache/nginx 8 KiB HTTP headers), a verifying key is **32 bytes**, and a signing key is a **32-byte seed**. Its design target is **128-bit classical security** (128-bit root) at up to **$2^{32}$ signatures** per signing key (4,294,967,296: ten signatures a second for 13.6 years), with an estimated single-query FORS cover exponent of **133.2 bits** at $q = 2^{32}$, degrading gracefully past the budget (`126.8` bits at $2^{33}$, `119.3` bits at $2^{34}$, `110.6` bits at $2^{35}$).
 
 Messages are hashed in a single salted keyed-BLAKE3 pass under a fresh per-signature salt `e` derived from the signer's key and per-signature randomness. Signing and verifying take the message itself — as bytes or a stream — with no pre-hash entry point. Pre-hashing a message before signing makes users vulnerable to collision attacks on the pre-hash; feeding the message or stream directly to BLINCS avoids that exposure and runs at full BLAKE3 speed.
 
@@ -120,7 +120,7 @@ h_msg = Keyed(K_msg, M)                           # 32-byte keyed BLAKE3 hash of
 short = e || h_msg                                # 48 bytes
 ```
 
-Because BLAKE3 authenticates exact message length internally, `Keyed(K_msg, M)` is length-authenticated and prefix-free across all message lengths in a single streaming pass with no chunking layer.
+Because BLAKE3 authenticates exact message length internally, `Keyed(K_msg, M)` binds the exact message length across all supported lengths (`0..2^64`) in a single streaming pass with no chunking layer.
 
 ## Message digest and index extraction
 
@@ -129,7 +129,7 @@ Given `short` (48 bytes):
 - The signer computes `R = Keyed(K_R, short)[..16]`.
 - Signer and verifier both compute the 32-byte (256-bit) message digest:
   `D = Keyed(K_pub, tweak(MESSAGE, 0, 0, 0, 0, 0) || R || root || short)`.
-  *(Keeping `D` at 256 bits prevents multi-target collisions across up to $2^{32}$ signed digests.)*
+  *(193 bits of `D` are consumed directly as the 160 FORS index bits and 33 hypertree address bits; the upper 63 bits are unused.)*
 - Extract the 16 FORS leaf indices and 33-bit hypertree leaf address directly from `D` (no counter grinding):
   - `fors_bits = u160_le(D[0..20])`; for `t = 0..16`, `idx[t] = (fors_bits >> (10 * t)) & 0x3FF` (`0..1024`).
   - `leaf_addr = u64_le(D[20..28]) & ((1 << 33) - 1)` (`0..2^33`).
@@ -185,7 +185,7 @@ Starting from `node = fors_root` and `addr = leaf_addr`, for `layer = 0, 1, 2, 3
 - The signer produces the WOTS+ signature on `node` at `(layer, tree, leaf)` and the `height`-node authentication path in tree `(layer, tree)`.
 - `node` becomes the root of tree `(layer, tree)`; then `addr = tree`.
 
-After `layer = 3`, `node` must equal `vk.root` (verified in constant time by both signer and verifier).
+After `layer = 3`, `node` must equal `vk.root` (compared across all 16 bytes by both signer and verifier).
 
 A signature is 5,616 bytes:
 
@@ -222,20 +222,22 @@ Offset  Length  Field
   run_key   = Derive(RUN_KEY,   pool)
   ```
   It overwrites bytes `8..48` (`u64_le(new_count) || next_seed`) in place without calling `fsync`, releases the lock, and keeps `(run_key, sig_count = 0)` in memory.
-- **Per signature (`draw`)**: atomically fetches and increments `sig_count` (`0..u64::MAX`, panicking if exhausted so it never wraps) and returns `Keyed(run_key, u64_le(n))`.
-- **Fork and live snapshots**: `Randomness` ensures distinct draws within one process instance. After `fork()` or restoring a live process or VM snapshot, call `initialize` again so cloned images do not repeat `(run_key, sig_count)`.
+- **Platform scope**: the persistent `Randomness` state file implementation targets Unix (`/dev/urandom`, `0600` mode, POSIX advisory `flock`). `VerifyingKey` has no OS filesystem dependency.
+- **Per signature (`draw`)**: atomically fetches and increments `sig_count` (`0..u64::MAX`, panicking if exhausted so it never wraps) and returns `Keyed(run_key, u64_le(n))` (ensuring distinct PRF inputs within one run; truncated 128-bit salts still have birthday collision probability $\approx 2^{-65}$ over $2^{32}$ signatures).
+- **Fork and live VM snapshots**: do **not** call BLINCS in a `fork()` child without `exec()` (a multithreaded child does not inherit background worker threads, and `Randomness::initialize` does not recreate them). After restoring a live VM snapshot (where threads remain intact), call `Randomness::initialize` again so cloned images do not repeat `(run_key, sig_count)`.
+- **Crash and error recovery**: `initialize` overwrites bytes `8..48` via `write_all` (serialized under `flock`, not transactional across power loss), and `create` may leave a partial file if write or sync fails. If `create` or `initialize` returns an error or a host crashes mid-update, remove and re-provision the state file with `Randomness::create` (or verify it passes `initialize` cleanly) before resuming signing.
 - **Path trust boundary**: `initialize` follows symlinks and relies on cooperating writers using compatible advisory locks on a local filesystem. Keep the state file in a private trusted directory.
 
 Even if the state file, `/dev/urandom`, and the monotonic clock are all rolled back together so `draw` repeats identically:
 
-- The signing key is never leaked, and `R = Keyed(K_R, e || h_msg)[..16]` still prevents WOTS+ reuse or FORS leaf steering on distinct messages; only content hashing downgrades from second-preimage resistance to 128-bit known-key collision resistance of single-pass 256-bit keyed BLAKE3 `Keyed(K_msg, M)`.
+- The signing key is never leaked, and `R = Keyed(K_R, e || h_msg)[..16]` still limits advance steering of the honest signer on distinct messages (WOTS+ safety on hypertree address collisions comes from signing the same FORS/subtree root at that position); only content hashing downgrades from randomized target-collision resistance to 128-bit known-key collision resistance of single-pass 256-bit keyed BLAKE3 `Keyed(K_msg, M)`.
 
 ## Security target, model, and limits
 
-- **FORS cover-probability bound (FIPS 205 / SPHINCS+ model, classical ROM):** over $q$ signatures with hypertree height $h = 33$, $k = 16$ FORS trees, and $t = 2^{10} = 1{,}024$ leaves per tree, the probability that a single adversary query lands on a hypertree leaf hit $r$ times and finds all $k$ selected leaves already revealed is:
+- **Design target and FORS cover-probability estimate (classical single-key ideal-hash model):** BLINCS targets **128-bit classical security** (matching the 128-bit verifying-key root and 128-bit internal hashes). Over $q$ signatures with hypertree height $h = 33$, $k = 16$ FORS trees, and $t = 2^a = 2^{10} = 1{,}024$ leaves per tree ($a = 10$), the probability that a single fresh adversary query lands on a hypertree leaf hit $r$ times and finds all $k$ selected leaves already revealed is:
   $$P(q) = \sum_{r=0}^{q} \binom{q}{r} 2^{-hr} \left(1 - 2^{-h}\right)^{q-r} \left(1 - (1 - 2^{-a})^r\right)^k.$$
-  Evaluating $-\log_2 P(q)$ gives **133.2 bits** at $q = 2^{32}$, **126.8 bits** at $2^{33}$, **119.3 bits** at $2^{34}$, and **110.6 bits** at $2^{35}$. This follows the textbook FIPS 205 (SLH-DSA) WOTS+ and FORS security structure; a complete concrete proof accounting for every hash term, multi-key targets, quantum queries, and the BLAKE3 tweakable-hash instantiation has not been independently audited.
-- **Zero counter grinding & deterministic work:** signing performs the exact same tree and chain work on every signature, with no counter search, no rejection sampling, and no tail-latency spikes.
+  Evaluating $-\log_2 P(q)$ gives a FORS cover exponent of **133.2 bits** at $q = 2^{32}$, **126.8 bits** at $2^{33}$, **119.3 bits** at $2^{34}$, and **110.6 bits** at $2^{35}$. This estimates the single-query FORS cover event under independent ideal-hash assumptions; it is not a full multi-user or quantum proof of the entire signature scheme, and no independent human cryptographic audit has been performed.
+- **Zero counter grinding & bounded chain work:** signing performs no rejection sampling or counter grinding, eliminating grinding-induced tail-latency spikes (individual chain lengths still depend on the public signed roots, so execution is not globally constant-time).
 - **Operational signing budget:** the $2^{32}$ per-signing-key budget is an operational requirement not enforced by the library (the state-file counter counts startups, and `Randomness` counts draws in one instance, not total signatures across copies of a seed).
-- **Memory retention:** `SigningKey` retains its 32-byte seed and derived keys, and each worker thread keeps reusable scratch buffers that retain intermediate leaf secrets for the thread's lifetime. Neither BLINCS nor `blake3-servil` wipes secret key memory on drop. Streaming readers use a fresh local zero-initialized 16 KiB stack buffer (for streams $\le 16$ KiB) or a fresh per-call `Pipeline` (for streams $> 16$ KiB) with no shared cross-caller buffer pool.
-- **Self-check on signing:** in Rust, `SigningKey::sign` / `sign_reader` runs `VerifyingKey::verify_short` over the assembled signature before returning it, independently recomputing the FORS and hypertree paths against `vk.root` (it does not re-read external streams).
+- **Memory retention:** `SigningKey` retains its 32-byte seed and derived keys, parallel jobs copy `SecretKey`, and both background worker threads and participating application threads keep thread-local scratch buffers that retain intermediate leaf secrets for the thread's lifetime. Neither BLINCS nor `blake3-servil` wipes secret key memory on drop. Streaming readers use a fresh local zero-initialized 16 KiB stack buffer (for streams $< 16$ KiB) or a fresh per-call `Pipeline` (for streams $\ge 16$ KiB, with each newly acquired room slice zeroed before calling `Read::read`) with no shared cross-caller buffer pool.
+- **Self-check on signing:** in Rust, `SigningKey::sign` / `sign_reader` runs `VerifyingKey::verify_short` over the assembled signature before returning it, independently checking the serialized salt (`sig[..16]`) against `short[..16]` and recomputing the FORS and hypertree paths against `vk.root` (it does not re-read external streams).

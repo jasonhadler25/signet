@@ -163,6 +163,10 @@ impl VerifyingKey {
     }
 
     fn verify_short(&self, short: &[u8; SHORT_LEN], signature: &Signature) -> bool {
+        let short_salt: &[u8; N] = short[..N].try_into().unwrap();
+        if !ct_eq_n(signature.salt(), short_salt) {
+            return false;
+        }
         let mut msg_in = [0u8; 16 + N + N + SHORT_LEN];
         msg_in[..16].copy_from_slice(&tweak(TweakKind::Message, 0, TreeIndex::ZERO, 0, 0, 0));
         msg_in[16..32].copy_from_slice(signature.randomizer());
@@ -216,8 +220,7 @@ impl SigningKey {
         let mut vk_bytes = [0u8; VERIFYING_KEY_LEN];
         vk_bytes[..N].copy_from_slice(&public_seed);
         vk_bytes[N..].copy_from_slice(&top_tree[1]);
-        let content_key = ContentKey::from_vk_bytes(&vk_bytes);
-        let verifying_key = VerifyingKey { bytes: vk_bytes, public_key, content_key };
+        let verifying_key = VerifyingKey::from_bytes(&vk_bytes);
         Self { seed: *seed, secret_key, salt_key, randomizer_key, verifying_key, top_tree }
     }
 
@@ -231,10 +234,10 @@ impl SigningKey {
         self.verifying_key
     }
 
-    fn finish_signature(&self, salt: &[u8; N], short: &[u8; SHORT_LEN]) -> Signature {
+    fn finish_signature(&self, short: &[u8; SHORT_LEN]) -> Signature {
         let mut sig = [0u8; SIGNATURE_LEN];
         let randomizer = self.randomizer_key.derive_randomizer(short);
-        sig[..N].copy_from_slice(salt);
+        sig[..N].copy_from_slice(&short[..N]);
         sig[N..2 * N].copy_from_slice(&randomizer);
 
         let mut msg_in = [0u8; 16 + N + N + SHORT_LEN];
@@ -287,15 +290,17 @@ impl SigningKey {
     }
 
     pub(crate) fn sign_with_draw(&self, draw: &[u8; 32], message: &[u8]) -> Signature {
+        ensure_init();
         let salt = self.salt_key.derive_salt(draw);
         let short = content_from_slice(&self.verifying_key.content_key, &salt, message);
-        self.finish_signature(&salt, &short)
+        self.finish_signature(&short)
     }
 
     pub(crate) fn sign_reader_with_draw(&self, draw: &[u8; 32], reader: impl Read) -> io::Result<Signature> {
+        ensure_init();
         let salt = self.salt_key.derive_salt(draw);
         let short = content_from_reader(&self.verifying_key.content_key, &salt, reader)?;
-        Ok(self.finish_signature(&salt, &short))
+        Ok(self.finish_signature(&short))
     }
 
     /// Sign an in-memory `message`, drawing fresh per-signature randomness from `randomness`.

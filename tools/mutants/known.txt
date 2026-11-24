@@ -1,12 +1,12 @@
-# Known equivalent or test-indistinguishable mutants for BLINCS (cargo-mutants, --profile mutants).
+# Known surviving mutants for BLINCS (cargo-mutants, --profile mutants).
 # Format: <file>	<mutation>	<reason>
-# Line numbers are stripped when matching so unrelated edits do not churn this file.
+# Classified by property: [functional-equiv], [dispatch/resource], or [durability].
 # Every entry must name a real surviving mutant; stale entries fail tools/mutants/check.py.
 
-src/content.rs	replace >= with < in content_from_slice	Equivalent: selects between single-core TreeHasher::hash and multi-core update_multithreaded, both of which compute the identical BLAKE3 keyed hash.
-src/content.rs	replace > with >= in content_from_reader	Equivalent: Pipeline::commit with 0 bytes written is a documented no-op.
-src/pool.rs	replace == with != in Pool::run	Equivalent: runs the wave synchronously on the caller thread instead of waking background workers; computes identical WOTS+ and FORS results, just single-threaded.
-src/pool.rs	replace += with -= in Pool::run	Equivalent in release mode: workers only test guard.generation == seen for inequality, so wrapping decrement steps through the same 2^64 distinct wave IDs as increment.
-src/randomness.rs	replace read_monotonic_clock::<impl Hasher for Collect>::finish -> u64 with 1	Equivalent: Hasher::finish is never called; Instant::now().hash only invokes Hasher::write.
-src/randomness.rs	replace match guard !p.as_os_str().is_empty() with false in Randomness::create	Unobservable without power loss: syncs "." instead of path.parent(), both of which succeed when readable.
-src/workspace.rs	replace / with *	Equivalent capacity constant: allocates ws.b48 with 2048 slots instead of 512; build_merkle_heap chunks by ws.b48.len(), so results are identical.
+src/content.rs	replace >= with < in content_from_slice	[dispatch/resource] Selects between single-core TreeHasher::hash and multi-core update_multithreaded; identical BLAKE3 keyed hash bytes.
+src/content.rs	replace > with >= in content_from_reader	[functional-equiv] Pipeline::commit with 0 bytes written is a documented no-op in blake3-servil 0.10.0.
+src/pool.rs	replace == with != in Pool::run	[dispatch/resource] Runs the wave synchronously on the caller thread instead of waking background workers; identical WOTS+ and FORS bytes.
+src/pool.rs	replace += with -= in Pool::run	[functional-equiv] In release mode, workers only compare guard.generation == seen for inequality; wrapping decrement steps through the same 2^64 distinct wave tokens.
+src/randomness.rs	replace read_monotonic_clock::<impl Hasher for Collect>::finish -> u64 with 1	[functional-equiv] Hasher::finish is never called; Instant::now().hash only invokes Hasher::write.
+src/randomness.rs	replace match guard !p.as_os_str().is_empty() with false in Randomness::create	[durability] Syncs "." instead of path.parent() when both are readable; affects directory-sync target only.
+src/workspace.rs	replace / with *	[dispatch/resource] Allocates ws.b48 with 2048 slots instead of 512; build_merkle_heap chunks by ws.b48.len(), so results are identical.

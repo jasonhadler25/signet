@@ -56,7 +56,9 @@ fn public_api_round_trip_and_python_reference_cross_check() {
         let bad_path = dir.join(format!("{name}.bad.sig"));
         fs::write(&bad_path, bad).unwrap();
         let bad_out = Command::new("python3").args([py, "verify", &vk_hex, msg_path.to_str().unwrap(), bad_path.to_str().unwrap()]).output().unwrap();
-        assert!(!bad_out.status.success(), "python reference accepted tampered signature for {name}");
+        assert_eq!(bad_out.status.code(), Some(1), "python reference did not exit 1 for tampered {name}");
+        assert_eq!(String::from_utf8_lossy(&bad_out.stdout).trim(), "INVALID", "unexpected python stdout for tampered {name}");
+        assert!(bad_out.stderr.is_empty(), "python reference emitted stderr on tampered {name}: {}", String::from_utf8_lossy(&bad_out.stderr));
     }
 
     // Two signatures of the same message have distinct salts (different draws).

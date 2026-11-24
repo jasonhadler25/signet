@@ -20,6 +20,12 @@ fn pack_short(salt: &[u8; N], message_hash: &[u8; 32]) -> [u8; SHORT_LEN] {
     short
 }
 
+#[inline]
+pub(crate) fn checked_add_stream_len(total: u64, n: usize) -> io::Result<u64> {
+    let n_u64 = u64::try_from(n).map_err(|_| io::Error::new(ErrorKind::InvalidData, "stream length exceeds u64::MAX"))?;
+    total.checked_add(n_u64).ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "stream length exceeds u64::MAX"))
+}
+
 /// Compute `short = e || Keyed(Keyed(K_content, e), message)` in one pass for an in-memory slice,
 /// automatically spreading slices `>= 512 KiB` across all CPU cores via `blake3-servil`.
 pub(crate) fn content_from_slice(content_key: &ContentKey, salt: &[u8; N], message: &[u8]) -> [u8; SHORT_LEN] {
@@ -38,13 +44,14 @@ pub(crate) fn content_from_slice(content_key: &ContentKey, salt: &[u8; N], messa
 
 /// Compute `short = e || Keyed(Keyed(K_content, e), stream)` in one streaming pass over `reader`.
 ///
-/// Streams `<= 16 KiB` hash directly on the calling core with zero heap allocation; longer streams
-/// feed directly into `blake3-servil`'s zero-copy multi-core `Pipeline`.
+/// Streams shorter than 16 KiB hash directly on the calling core with zero heap allocation; longer
+/// streams feed into `blake3-servil`'s zero-copy multi-core `Pipeline`, zeroing each newly acquired
+/// room slice before exposing it to `reader.read`.
 pub(crate) fn content_from_reader(content_key: &ContentKey, salt: &[u8; N], mut reader: impl Read) -> io::Result<[u8; SHORT_LEN]> {
     ensure_init();
     let msg_key = content_key.message_key(salt);
 
-    // Fast path for small streams (<= 16 KiB): fresh zeroed stack buffer, zero Pipeline setup.
+    // Fast path for small streams (< 16 KiB): fresh zeroed stack buffer, zero Pipeline setup.
     let mut first = [0u8; SMALL_READER_BUF];
     let mut filled = 0usize;
     while filled < first.len() {
@@ -64,6 +71,7 @@ pub(crate) fn content_from_reader(content_key: &ContentKey, salt: &[u8; N], mut 
     }
 
     // Multi-core zero-copy streaming via `blake3-servil::throughput::Pipeline`.
+    let mut total_bytes = u64::try_from(SMALL_READER_BUF).unwrap();
     let mut pipe: Pipeline<()> = Pipeline::new(msg_key.mode(), Limits { messages: 1, rooms: PIPELINE_ROOMS });
     let mut msg = block_on(pipe.message((), None));
     let mut seeded = true;
@@ -77,6 +85,9 @@ pub(crate) fn content_from_reader(content_key: &ContentKey, salt: &[u8; N], mut 
         } else {
             0
         };
+        // Zero the exposed tail of every acquired room before passing `&mut [u8]` to `reader.read`.
+        room.bytes_mut()[room_filled..].fill(0);
+
         let mut hit_eof = false;
         while room_filled < ROOM_LEN {
             let buf = &mut room.bytes_mut()[room_filled..];
@@ -87,6 +98,16 @@ pub(crate) fn content_from_reader(content_key: &ContentKey, salt: &[u8; N], mut 
                 }
                 Ok(n) => {
                     assert!(n <= buf.len(), "Read implementation returned more bytes than buffer length");
+                    total_bytes = match checked_add_stream_len(total_bytes, n) {
+                        Ok(next) => next,
+                        Err(e) => {
+                            pipe.abort(msg);
+                            while pipe.next_event().is_none() {
+                                block_on(pipe.ready());
+                            }
+                            return Err(e);
+                        }
+                    };
                     room_filled += n;
                 }
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -110,10 +131,11 @@ pub(crate) fn content_from_reader(content_key: &ContentKey, salt: &[u8; N], mut 
 
     pipe.end(msg);
     let message_hash = loop {
-        if let Some(Event::Hashed { hash, .. }) = pipe.next_event() {
-            break *hash.as_bytes();
+        match pipe.next_event() {
+            Some(Event::Hashed { hash, .. }) => break *hash.as_bytes(),
+            Some(_) => panic!("unexpected Pipeline event after end"),
+            None => block_on(pipe.ready()),
         }
-        block_on(pipe.ready());
     };
     Ok(pack_short(salt, &message_hash))
 }

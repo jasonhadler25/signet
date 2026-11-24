@@ -96,7 +96,11 @@ def hash(data):
 
 def key_words(key):
     """A 32-byte key as the eight words `keyed_words` takes."""
-    assert len(key) == 32
+    if not isinstance(key, (bytes, bytearray, memoryview)):
+        raise TypeError("key must be bytes-like")
+    key = bytes(key)
+    if len(key) != 32:
+        raise ValueError(f"key must be 32 bytes, got {len(key)}")
     return tuple(int.from_bytes(key[i : i + 4], "little") for i in range(0, 32, 4))
 
 
@@ -120,14 +124,21 @@ def _self_test(path):
     import json
 
     vectors = json.load(open(path))
+    cases = vectors["cases"]
+    if len(cases) != 35:
+        raise AssertionError(f"expected 35 official BLAKE3 vectors, got {len(cases)}")
     key, context = vectors["key"].encode(), vectors["context_string"]
-    for case in vectors["cases"]:
+    for case in cases:
         data = bytes(i % 251 for i in range(case["input_len"]))
-        assert hash(data).hex() == case["hash"][:64], case["input_len"]
-        assert keyed_hash(key, data).hex() == case["keyed_hash"][:64], case["input_len"]
-        assert keyed_words(key_words(key), data).hex() == case["keyed_hash"][:64], case["input_len"]
-        assert derive_key(context, data).hex() == case["derive_key"][:64], case["input_len"]
-    return len(vectors["cases"])
+        if hash(data).hex() != case["hash"][:64]:
+            raise AssertionError(f"hash mismatch at len {case['input_len']}")
+        if keyed_hash(key, data).hex() != case["keyed_hash"][:64]:
+            raise AssertionError(f"keyed_hash mismatch at len {case['input_len']}")
+        if keyed_words(key_words(key), data).hex() != case["keyed_hash"][:64]:
+            raise AssertionError(f"keyed_words mismatch at len {case['input_len']}")
+        if derive_key(context, data).hex() != case["derive_key"][:64]:
+            raise AssertionError(f"derive_key mismatch at len {case['input_len']}")
+    return len(cases)
 
 
 if __name__ == "__main__":

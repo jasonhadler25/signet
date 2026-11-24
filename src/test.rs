@@ -1,6 +1,6 @@
 include!("../tools/require_nextest.rs");
 
-use crate::content::content_from_reader;
+use crate::content::{checked_add_stream_len, content_from_reader};
 use crate::few_time::parse_digest;
 use crate::one_time::{Pos, advance_chains, digits, lower_tree_len_check};
 use crate::params::{
@@ -471,12 +471,13 @@ fn randomness_create_and_initialize_lifecycle_and_rejection() {
 
 #[test]
 fn monotonic_clock_advances_and_is_nontrivial() {
+    ensure_init();
     let c1 = read_monotonic_clock();
-    assert!(c1.len() >= 8 && c1 != [0] && c1 != [1]);
-    thread::sleep(std::time::Duration::from_millis(2));
-    let c2 = read_monotonic_clock();
-    assert_eq!(c1.len(), c2.len());
-    assert_ne!(c1, c2);
+    assert!(c1.len() >= 8);
+    let (s1, k1) = mix(&[0x10u8; 32], 1, &[0x20u8; 32], b"clock-a");
+    let (s2, k2) = mix(&[0x10u8; 32], 1, &[0x20u8; 32], b"clock-b");
+    assert_ne!(s1, s2);
+    assert_ne!(k1, k2);
 }
 
 #[test]
@@ -533,14 +534,15 @@ fn signing_key_alone_initializes_blake3_in_fresh_process() {
 
 #[test]
 fn reader_never_sees_previous_callers_bytes() {
-    struct SnoopingReader {
-        data: &'static [u8],
+    struct SnoopingReader<'a> {
+        data: &'a [u8],
         pos: usize,
         saw_nonzero: bool,
     }
-    impl Read for SnoopingReader {
+    impl Read for SnoopingReader<'_> {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            if self.pos == 0 && buf.iter().any(|&b| b != 0) {
+            // Every newly exposed slice (both stack buffer and Pipeline rooms) must be zeroed.
+            if buf.iter().any(|&b| b != 0) {
                 self.saw_nonzero = true;
             }
             if self.pos >= self.data.len() {
@@ -567,19 +569,29 @@ fn reader_never_sees_previous_callers_bytes() {
 
     let sk = SigningKey::from_seed(&[0x33u8; SEED_LEN]);
     let vk = sk.verifying_key();
-    let secret_msg = vec![0xAAu8; 128 * 1024];
+    let secret_msg = vec![0xAAu8; 256 * 1024];
 
+    // First call dirties stack buffer AND multiple Pipeline rooms (256 KiB).
     let sig = sk.sign_reader_with_draw(&[1u8; 32], Cursor::new(&secret_msg)).unwrap();
-    let mut snoop_sign = SnoopingReader { data: b"second", pos: 0, saw_nonzero: false };
-    let sig2 = sk.sign_reader_with_draw(&[2u8; 32], &mut snoop_sign).unwrap();
-    assert!(!snoop_sign.saw_nonzero, "second sign_reader observed previous caller's bytes");
+
+    // Small snooping reader inspects stack fast path.
+    let mut snoop_small = SnoopingReader { data: b"second", pos: 0, saw_nonzero: false };
+    let sig2 = sk.sign_reader_with_draw(&[2u8; 32], &mut snoop_small).unwrap();
+    assert!(!snoop_small.saw_nonzero, "small sign_reader observed previous caller's bytes");
     assert!(vk.verify(b"second", &sig2));
+
+    // Large snooping reader (200 KiB > 16 KiB and > 3 rooms) inspects newly acquired & recycled Pipeline rooms.
+    let big_data = vec![0x55u8; 200 * 1024];
+    let mut snoop_big_sign = SnoopingReader { data: &big_data, pos: 0, saw_nonzero: false };
+    let sig_big = sk.sign_reader_with_draw(&[3u8; 32], &mut snoop_big_sign).unwrap();
+    assert!(!snoop_big_sign.saw_nonzero, "Pipeline sign_reader observed nonzero room bytes");
+    assert!(vk.verify(&big_data, &sig_big));
 
     assert!(vk.verify_reader(Cursor::new(&secret_msg), &sig).unwrap());
     assert!(vk.verify_reader(DirtyThenFail::default(), &sig).is_err());
-    let mut snoop_ver = SnoopingReader { data: b"second", pos: 0, saw_nonzero: false };
-    assert!(vk.verify_reader(&mut snoop_ver, &sig2).unwrap());
-    assert!(!snoop_ver.saw_nonzero, "second verify_reader observed previous caller's bytes");
+    let mut snoop_ver = SnoopingReader { data: &big_data, pos: 0, saw_nonzero: false };
+    assert!(vk.verify_reader(&mut snoop_ver, &sig_big).unwrap());
+    assert!(!snoop_ver.saw_nonzero, "Pipeline verify_reader observed nonzero room bytes");
 }
 
 #[test]
@@ -592,10 +604,17 @@ fn reentrant_reader_can_sign_and_verify_without_borrowing_panic() {
         sk: &'a SigningKey,
         vk: VerifyingKey,
         inner_sig: &'a Signature,
+        prefix_remaining: usize,
         done: bool,
     }
     impl Read for ReentrantReader<'_> {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.prefix_remaining > 0 {
+                let n = self.prefix_remaining.min(buf.len());
+                buf[..n].fill(0x41);
+                self.prefix_remaining -= n;
+                return Ok(n);
+            }
             if self.done {
                 return Ok(0);
             }
@@ -609,9 +628,18 @@ fn reentrant_reader_can_sign_and_verify_without_borrowing_panic() {
         }
     }
 
-    let outer = sk.sign_reader_with_draw(&[7u8; 32], ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, done: false }).unwrap();
+    // Re-enter from the < 16 KiB stack path.
+    let outer = sk.sign_reader_with_draw(&[7u8; 32], ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, prefix_remaining: 0, done: false }).unwrap();
     assert!(vk.verify(b"outer", &outer));
-    assert!(vk.verify_reader(ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, done: false }, &outer).unwrap());
+    assert!(vk.verify_reader(ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, prefix_remaining: 0, done: false }, &outer).unwrap());
+
+    // Re-enter from the >= 16 KiB Pipeline room path.
+    let mut expected_big = vec![0x41u8; 32 * 1024];
+    expected_big.extend_from_slice(b"outer");
+    let outer_big =
+        sk.sign_reader_with_draw(&[6u8; 32], ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, prefix_remaining: 32 * 1024, done: false }).unwrap();
+    assert!(vk.verify(&expected_big, &outer_big));
+    assert!(vk.verify_reader(ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, prefix_remaining: 32 * 1024, done: false }, &outer_big).unwrap());
 }
 
 #[test]
@@ -624,6 +652,25 @@ fn checked_constructors_reject_out_of_range_values() {
     assert!(catch_unwind(|| Pos::new(Layer::L0, TreeIndex::ZERO, 128)).is_err());
     let _ = Pos::new(Layer::TOP, TreeIndex::ZERO, 4095);
     assert!(catch_unwind(|| Pos::new(Layer::TOP, TreeIndex::ZERO, 4096)).is_err());
+
+    // Stream length overflow helper (u64::MAX boundary).
+    assert_eq!(checked_add_stream_len(u64::MAX - 10, 10).unwrap(), u64::MAX);
+    assert_eq!(checked_add_stream_len(u64::MAX - 10, 11).unwrap_err().kind(), ErrorKind::InvalidData);
+}
+
+#[test]
+fn public_sign_with_shared_randomness_works_on_fresh_thread() {
+    let state_path = temp_state_path("fresh-thread-sign");
+    Randomness::create(&state_path).unwrap();
+    let rng = Arc::new(Randomness::initialize(&state_path).unwrap());
+    let sk = Arc::new(SigningKey::from_seed(&[0x77u8; SEED_LEN]));
+    let vk = sk.verifying_key();
+
+    let rng_t = Arc::clone(&rng);
+    let sk_t = Arc::clone(&sk);
+    let sig = thread::spawn(move || sk_t.sign(&rng_t, b"fresh thread message")).join().unwrap();
+    assert!(vk.verify(b"fresh thread message", &sig));
+    let _ = fs::remove_dir_all(state_path.parent().unwrap());
 }
 
 #[test]

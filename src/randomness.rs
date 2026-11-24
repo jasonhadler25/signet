@@ -1,6 +1,6 @@
 use crate::params::{CTX_MIX, CTX_NEXT_SEED, CTX_RUN_KEY, derive_key, ensure_init, keyed};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -28,8 +28,8 @@ fn read_os_randomness() -> io::Result<[u8; 32]> {
     Ok(bytes)
 }
 
-/// Capture the bytes `Instant::now()` feeds to `Hash` (raw seconds and nanoseconds of the system monotonic
-/// clock, without unsafe code or external dependencies).
+/// Capture opaque local diversification bytes from the system monotonic clock (`Instant::hash`,
+/// without unsafe code or external dependencies).
 pub(crate) fn read_monotonic_clock() -> Vec<u8> {
     struct Collect(Vec<u8>);
     impl Hasher for Collect {
@@ -83,10 +83,11 @@ impl RunKey {
 /// After [`Randomness::initialize`] returns, drawing per-signature randomness computes a keyed BLAKE3 hash
 /// over an in-memory counter (no disk writes, no clock reads, and no system calls by BLINCS itself).
 ///
-/// Keep the state file in a private local directory owned by the signer on a filesystem that supports
-/// advisory file locks (`flock`). Provision the file once with [`Randomness::create`] before starting
-/// signers. After `fork()` or restoring a live process or VM snapshot, call [`Randomness::initialize`]
-/// again so cloned process images do not share the same `(run_key, count)` sequence.
+/// Keep the state file in a private local directory owned by the signer on a Unix filesystem that
+/// supports advisory file locks (`flock`). Provision the file once with [`Randomness::create`] before
+/// starting signers. Do not use BLINCS in a `fork()` child without `exec()` (a multithreaded child does
+/// not inherit background worker threads). After restoring a live VM snapshot, call
+/// [`Randomness::initialize`] again so cloned images do not share the same `(run_key, count)` sequence.
 pub struct Randomness {
     run_key: RunKey,
     count: AtomicU64,
@@ -113,18 +114,12 @@ impl Randomness {
             opts.mode(0o600);
         }
         let mut file = opts.open(path)?;
-        let write_res = (|| -> io::Result<()> {
-            let mut state = [0u8; STATE_LEN];
-            state[..8].copy_from_slice(MAGIC);
-            state[8..16].copy_from_slice(&0u64.to_le_bytes());
-            state[16..48].copy_from_slice(&os_bytes);
-            file.write_all(&state)?;
-            file.sync_all()
-        })();
-        if let Err(e) = write_res {
-            let _ = fs::remove_file(path);
-            return Err(e);
-        }
+        let mut state = [0u8; STATE_LEN];
+        state[..8].copy_from_slice(MAGIC);
+        state[8..16].copy_from_slice(&0u64.to_le_bytes());
+        state[16..48].copy_from_slice(&os_bytes);
+        file.write_all(&state)?;
+        file.sync_all()?;
         let parent = match path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => Path::new("."),
@@ -165,6 +160,7 @@ impl Randomness {
 
     /// Draw a fresh 32-byte per-signature value from memory alone.
     pub(crate) fn draw(&self) -> [u8; 32] {
+        ensure_init();
         let n = self.count.try_update(Ordering::Relaxed, Ordering::Relaxed, |c| c.checked_add(1)).expect("randomness draw counter exhausted");
         self.run_key.draw_at(n)
     }

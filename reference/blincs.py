@@ -130,9 +130,10 @@ def content(content_key, salt, message):
 def mix(seed, count, system, clock):
     seed = _check_len("seed", seed, 32)
     system = _check_len("system", system, 32)
+    clock = _to_bytes("clock", clock)
     if not isinstance(count, int) or isinstance(count, bool) or not (0 <= count < 1 << 64):
         raise ValueError("count must be a u64")
-    pool = blake3.derive_key(CTX_MIX, seed + count.to_bytes(8, "little") + system + bytes(clock))
+    pool = blake3.derive_key(CTX_MIX, seed + count.to_bytes(8, "little") + system + clock)
     return blake3.derive_key(CTX_NEXT_SEED, pool), blake3.derive_key(CTX_RUN_KEY, pool)
 
 
@@ -268,9 +269,10 @@ class SigningKey:
             node = levels[-1][0]
             addr = tree
 
-        if len(out) != SIGNATURE_LEN or not hmac.compare_digest(node, vk.root):
+        sig = bytes(out)
+        if len(sig) != SIGNATURE_LEN or not hmac.compare_digest(node, vk.root) or not vk.verify(message, sig):
             raise RuntimeError("internal error: generated signature failed self-check")
-        return bytes(out)
+        return sig
 
 
 def _cli():

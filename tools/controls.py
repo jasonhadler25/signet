@@ -41,6 +41,13 @@ CONTROLS = [
         "every_signature_region_is_checked",
     ),
     (
+        "Signing self-verification binds serialized salt to short (verify_short)",
+        "src/lib.rs",
+        "        sig[..N].copy_from_slice(&short[..N]);",
+        "        sig[..N].copy_from_slice(&short[..N]);\n        sig[0] ^= 1;",
+        "reference_vector_matches_python_byte_for_byte",
+    ),
+    (
         "Per-signature salt keyed into content hash (content_from_slice)",
         "src/content.rs",
         "    let msg_key = content_key.message_key(salt);\n    let message_hash = if message.len() >= MT_SLICE_THRESHOLD {",
@@ -124,7 +131,7 @@ def run_nextest(test_filter=None):
     cmd = ["cargo", "nextest", "run", "--locked", "--no-fail-fast"]
     if test_filter is not None:
         cmd += ["-E", f"test(/{test_filter}$/)"]
-    return subprocess.run(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return subprocess.run(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
 
 
 def main():
@@ -152,6 +159,9 @@ def main():
         if res.returncode == 0:
             print(f"MISSED [{i}/{len(CONTROLS)}] {name} ({flt} still passed!)")
             missed.append(name)
+        elif "FAIL [" not in res.stdout or flt not in res.stdout:
+            print(f"ERROR [{i}/{len(CONTROLS)}] {name}: nonzero exit without running/failing {flt}:\n{res.stdout}", file=sys.stderr)
+            return 2
         else:
             print(f"CAUGHT [{i}/{len(CONTROLS)}] {name}")
 

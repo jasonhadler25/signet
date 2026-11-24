@@ -1,9 +1,10 @@
 use crate::few_time::{ForsTreeOut, build_fors_tree};
 use crate::one_time::{KeyPair, Pos, build_wots_leaves_chunk};
-use crate::params::{FORS_TREES, ForsIndex, LAYERS, LOWER_LEAVES, Layer, LeafAddr, N, PublicKey, SecretKey, TOP_LEAVES, TreeIndex};
+use crate::params::{FORS_TREES, ForsIndex, LAYERS, LOWER_LEAVES, Layer, LeafAddr, N, PublicKey, SecretKey, TOP_LEAVES, TreeIndex, ensure_init};
 use crate::workspace::{WOTS_CHUNK_LEAVES, WorkerScratch, with_caller_scratch};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, TryLockError};
 use std::thread;
 
 /// Number of WOTS+ leaves processed per dynamic task during a signing wave (128 / 8 = 16 tasks per lower layer).
@@ -15,13 +16,14 @@ const SIGN_TOTAL_TASKS: usize = LOWER_WOTS_TASKS + FORS_TREES;
 
 const TOP_CHUNKS: usize = TOP_LEAVES / WOTS_CHUNK_LEAVES;
 
-/// Maximum background workers spawned by the persistent pool (bounded by task count even on 128+ core hosts).
-const MAX_WORKERS: usize = SIGN_TOTAL_TASKS;
+/// Maximum background workers spawned by the persistent pool (`tasks - 1`, since the caller participates).
+const MAX_WORKERS: usize = 63;
 
 const _: () = {
     assert!(TOP_LEAVES.is_multiple_of(WOTS_CHUNK_LEAVES));
     assert!(LOWER_LEAVES.is_multiple_of(SIGN_WOTS_CHUNK));
     assert!(TOP_CHUNKS == SIGN_TOTAL_TASKS);
+    assert!(MAX_WORKERS == SIGN_TOTAL_TASKS - 1);
 };
 
 enum JobKind {
@@ -41,8 +43,16 @@ enum JobKind {
     },
 }
 
+impl JobKind {
+    fn total(&self) -> usize {
+        match self {
+            Self::TopTree { .. } => TOP_CHUNKS,
+            Self::SignWave { .. } => SIGN_TOTAL_TASKS,
+        }
+    }
+}
+
 struct Job {
-    total: usize,
     next: AtomicUsize,
     kind: JobKind,
 }
@@ -87,9 +97,10 @@ impl Job {
     }
 
     fn drain(&self, use_sme2: bool, ws: &mut WorkerScratch) {
+        let total = self.kind.total();
         loop {
             let id = self.next.fetch_add(1, Ordering::Relaxed);
-            if id >= self.total {
+            if id >= total {
                 break;
             }
             self.execute_one(id, use_sme2, ws);
@@ -101,12 +112,13 @@ struct PoolState {
     generation: u64,
     active: Option<Arc<Job>>,
     remaining_workers: usize,
+    failed: bool,
 }
 
 /// Persistent crash-only worker pool for coarse tree/FORS waves.
 ///
 /// The calling thread runs with SME2/full vector width while background workers run `on_this_core()`,
-/// dynamically stealing tasks via `AtomicUsize` so heterogeneous cores (e.g. 1 SME2 + N NEON) stay balanced.
+/// dynamically claiming tasks via `AtomicUsize` so heterogeneous cores (e.g. 1 SME2 + N NEON) stay balanced.
 struct Pool {
     n_workers: usize,
     dispatch: Mutex<()>,
@@ -116,38 +128,47 @@ struct Pool {
 impl Pool {
     fn new() -> Self {
         let cpus = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-        let n_workers = cpus.saturating_sub(1).min(MAX_WORKERS);
-        let state = Arc::new((Mutex::new(PoolState { generation: 0, active: None, remaining_workers: 0 }), Condvar::new(), Condvar::new()));
+        let target = cpus.saturating_sub(1).min(MAX_WORKERS);
+        let state = Arc::new((Mutex::new(PoolState { generation: 0, active: None, remaining_workers: 0, failed: false }), Condvar::new(), Condvar::new()));
 
-        for idx in 0..n_workers {
+        let mut spawned = 0usize;
+        for idx in 0..target {
             let shared = Arc::clone(&state);
-            thread::Builder::new()
-                .name(format!("blincs-worker-{idx}"))
-                .spawn(move || {
-                    let mut ws = WorkerScratch::new();
-                    let mut seen_gen = 0u64;
-                    let (lock, wake, done) = &*shared;
-                    loop {
-                        let job = {
-                            let mut guard = lock.lock().unwrap();
-                            while guard.generation == seen_gen {
-                                guard = wake.wait(guard).unwrap();
-                            }
-                            seen_gen = guard.generation;
-                            Arc::clone(guard.active.as_ref().unwrap())
-                        };
-                        job.drain(false, &mut ws);
+            let res = thread::Builder::new().name(format!("blincs-worker-{idx}")).spawn(move || {
+                ensure_init();
+                let mut ws = WorkerScratch::new();
+                let mut seen_gen = 0u64;
+                let (lock, wake, done) = &*shared;
+                loop {
+                    let job = {
                         let mut guard = lock.lock().unwrap();
-                        guard.remaining_workers -= 1;
-                        if guard.remaining_workers == 0 {
-                            done.notify_one();
+                        while guard.generation == seen_gen {
+                            guard = wake.wait(guard).unwrap();
                         }
+                        seen_gen = guard.generation;
+                        Arc::clone(guard.active.as_ref().unwrap())
+                    };
+                    let ok = catch_unwind(AssertUnwindSafe(|| job.drain(false, &mut ws))).is_ok();
+                    let mut guard = lock.lock().unwrap();
+                    if !ok {
+                        guard.failed = true;
                     }
-                })
-                .expect("failed to spawn blincs worker thread");
+                    guard.remaining_workers -= 1;
+                    if guard.remaining_workers == 0 {
+                        done.notify_one();
+                    }
+                    if !ok {
+                        break;
+                    }
+                }
+            });
+            match res {
+                Ok(_) => spawned += 1,
+                Err(_) => break,
+            }
         }
 
-        Self { n_workers, dispatch: Mutex::new(()), state }
+        Self { n_workers: spawned, dispatch: Mutex::new(()), state }
     }
 
     fn run(&self, job: Arc<Job>) {
@@ -157,27 +178,40 @@ impl Pool {
             with_caller_scratch(|ws| job.drain(true, ws));
             return;
         }
-        let Ok(_dispatch_guard) = self.dispatch.try_lock() else {
-            with_caller_scratch(|ws| job.drain(true, ws));
-            return;
+        let _dispatch_guard = match self.dispatch.try_lock() {
+            Ok(g) => g,
+            Err(TryLockError::WouldBlock) => {
+                with_caller_scratch(|ws| job.drain(true, ws));
+                return;
+            }
+            Err(TryLockError::Poisoned(_)) => panic!("blincs worker pool dispatch lock poisoned"),
         };
 
         let (lock, wake, done) = &*self.state;
         {
             let mut guard = lock.lock().unwrap();
+            assert!(!guard.failed, "blincs worker pool failed in an earlier wave");
             guard.generation += 1;
             guard.active = Some(Arc::clone(&job));
             guard.remaining_workers = self.n_workers;
             wake.notify_all();
         }
 
-        with_caller_scratch(|ws| job.drain(true, ws));
+        let caller_res = catch_unwind(AssertUnwindSafe(|| with_caller_scratch(|ws| job.drain(true, ws))));
 
-        let mut guard = lock.lock().unwrap();
-        while guard.remaining_workers > 0 {
-            guard = done.wait(guard).unwrap();
+        let worker_failed = {
+            let mut guard = lock.lock().unwrap();
+            while guard.remaining_workers > 0 {
+                guard = done.wait(guard).unwrap();
+            }
+            guard.active = None;
+            guard.failed
+        };
+
+        if let Err(payload) = caller_res {
+            resume_unwind(payload);
         }
-        guard.active = None;
+        assert!(!worker_failed, "blincs worker thread panicked during parallel wave");
     }
 }
 
@@ -189,15 +223,17 @@ fn pool() -> &'static Pool {
 /// Build all `TOP_LEAVES` (4,096) WOTS+ leaves of the top hypertree in parallel across all CPU cores.
 pub(crate) fn build_top_leaves_parallel(secret_key: &SecretKey, public_key: &PublicKey) -> Vec<[u8; N]> {
     let chunks = (0..TOP_CHUNKS).map(|_| Mutex::new([[0u8; N]; WOTS_CHUNK_LEAVES])).collect();
-    let job =
-        Arc::new(Job { total: TOP_CHUNKS, next: AtomicUsize::new(0), kind: JobKind::TopTree { secret_key: *secret_key, public_key: *public_key, chunks } });
+    let job = Arc::new(Job { next: AtomicUsize::new(0), kind: JobKind::TopTree { secret_key: *secret_key, public_key: *public_key, chunks } });
     pool().run(Arc::clone(&job));
 
     let mut leaves = Vec::with_capacity(TOP_LEAVES);
-    if let JobKind::TopTree { chunks, .. } = &job.kind {
-        for slot in chunks {
-            leaves.extend_from_slice(&*slot.lock().unwrap());
+    match &job.kind {
+        JobKind::TopTree { chunks, .. } => {
+            for slot in chunks {
+                leaves.extend_from_slice(&*slot.lock().unwrap());
+            }
         }
+        JobKind::SignWave { .. } => unreachable!(),
     }
     leaves
 }
@@ -213,7 +249,6 @@ pub(crate) fn run_sign_wave(
     let wots_chunks = (0..LOWER_WOTS_TASKS).map(|_| Mutex::new([[0u8; N]; SIGN_WOTS_CHUNK])).collect();
     let fors_out = (0..FORS_TREES).map(|_| Mutex::new(ForsTreeOut::default())).collect();
     let job = Arc::new(Job {
-        total: SIGN_TOTAL_TASKS,
         next: AtomicUsize::new(0),
         kind: JobKind::SignWave { secret_key: *secret_key, public_key: *public_key, leaf_addr, lower_trees, fors_indices, wots_chunks, fors_out },
     });
@@ -221,17 +256,20 @@ pub(crate) fn run_sign_wave(
 
     let mut lower_leaves = [[[0u8; N]; LOWER_LEAVES]; LOWER_LAYERS];
     let mut fors_trees = [ForsTreeOut::default(); FORS_TREES];
-    if let JobKind::SignWave { wots_chunks, fors_out, .. } = &job.kind {
-        for layer in Layer::LOWER {
-            let l = layer.index();
-            for chunk in 0..LOWER_CHUNKS_PER_LAYER {
-                let data = *wots_chunks[l * LOWER_CHUNKS_PER_LAYER + chunk].lock().unwrap();
-                lower_leaves[l][chunk * SIGN_WOTS_CHUNK..(chunk + 1) * SIGN_WOTS_CHUNK].copy_from_slice(&data);
+    match &job.kind {
+        JobKind::SignWave { wots_chunks, fors_out, .. } => {
+            for layer in Layer::LOWER {
+                let l = layer.index();
+                for chunk in 0..LOWER_CHUNKS_PER_LAYER {
+                    let data = *wots_chunks[l * LOWER_CHUNKS_PER_LAYER + chunk].lock().unwrap();
+                    lower_leaves[l][chunk * SIGN_WOTS_CHUNK..(chunk + 1) * SIGN_WOTS_CHUNK].copy_from_slice(&data);
+                }
+            }
+            for t in 0..FORS_TREES {
+                fors_trees[t] = *fors_out[t].lock().unwrap();
             }
         }
-        for t in 0..FORS_TREES {
-            fors_trees[t] = *fors_out[t].lock().unwrap();
-        }
+        JobKind::TopTree { .. } => unreachable!(),
     }
     (lower_leaves, fors_trees)
 }
