@@ -7,8 +7,8 @@
 //! Because a cryptographic key is a transferable bearer authority rather than a person's handwritten
 //! signature, this API calls the secret a [`Signet`], its 32-byte public identifier a [`SignetId`]
 //! (which names which signet you mean and verifies its imprints), and the 5,616-byte proof an
-//! [`Imprint`]. Messages are hashed in a single salted keyed-BLAKE3 pass under a fresh per-imprint
-//! salt; pass the original bytes or stream directly rather than pre-hashing.
+//! [`Imprint`]. Pass message bytes or a stream directly: BLINCS hashes the input in a single
+//! salted keyed-BLAKE3 pass under a fresh per-imprint salt.
 //!
 //! ```no_run
 //! use blincs::{Randomness, Signet, SignetId};

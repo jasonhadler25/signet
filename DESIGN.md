@@ -118,7 +118,7 @@ This section records every hash-based signature technique we evaluated — both 
 3. **Nibble `WOTS+` (`w = 16`, 35 chains) and `FORS` (`16` trees of `1,024` leaves) with zero counter grinding:** bounded chain work (no grinding tail latency), clean byte/nibble arithmetic, and ~40% smaller spec and codebase than `WOTS+C` + `PORS+FP` (BLINCS-specific encodings and BLAKE3 instantiation; not FIPS 205 interoperable).
 4. **Irregular hypertree (`12 + 3×7`) with in-memory 128 KiB top tree and no disk cache** (inspired by Project 11's irregular-hypertree work — Alessandro Baiocchi, Matteo Vena, Matteo Vicari, and Conor Deegan: [Companion Guide](https://research.projecteleven.com/articles/sphincs-parameter-explorer-companion-guide), [Raising SPHINCS-like lifetime budgets](https://research.projecteleven.com/articles/raising-sphincs-lifetime-budgets); and Zhen Qin, Siwei Sun, and Fangyu Zheng, ASIACRYPT 2026, [ePrint 2025/2236](https://eprint.iacr.org/2025/2236)): putting 12 levels in the in-memory top tree gives `5,616 B` signatures, `0.73 ms` warm signing, and `25.3 µs` verification while keeping cold keygen at `5.43 ms` so no on-disk cache file is needed.
 5. **256-bit internal message digest `D`:** verification consumes 193 bits of `D` (160 FORS index bits + 33 hypertree address bits; the upper 63 bits are unused), keeping coordinate selection directly in BLAKE3's native 32-byte digest output.
-6. **Single-pass salted content hash (`Keyed(Keyed(K_content, e), M)`):** eliminates pre-hash collision exposure with no chunking layer, keeping signatures fixed-size, zero `Drop` implementations, and multi-core streaming up to **27.7–28.6 GB/s** on Apple M6 via `blake3-servil` `Pipeline::room()` / `update_multithreaded` (§5).
+6. **Single-pass salted content hash (`Keyed(Keyed(K_content, e), M)`):** hashes arbitrarily large messages in one salted pass at up to **27.7–28.6 GB/s** on Apple M6 via `blake3-servil` `Pipeline::room()` / `update_multithreaded` with no chunking layer and zero `Drop` implementations (§5).
 7. **Default multithreading via `blake3-servil` + coarse leaf-parallel signing wave** (motivated by Conor Deegan's independent-hash parallelism note): builds all 4,096 top-tree leaves in parallel during `from_seed`, and builds all 384 lower-layer WOTS+ leaves and all 16 FORS trees in one parallel wave during `sign` / `sign_reader` (1 SME2 core + worker cores via `TreeHasher::on_this_core()`), while verification of small messages stays single-core on `TreeHasher::on_this_core()` to avoid Apple SME2 short-burst downclocking (§7).
 
 ### Declined (and why)
@@ -144,9 +144,9 @@ This section records every hash-based signature technique we evaluated — both 
 
 ## 5. Single-pass salted content hashing
 
-### Why we omit a pre-hash mode (and advise passing the original message)
+### Pass the message or stream directly
 
-Any API that accepts `&[u8]` cannot stop a caller from hashing their input first and passing the resulting digest. Instead, BLINCS intentionally omits any separate pre-hash mode (such as HashSLH-DSA), provides fast streaming entry points (`imprint_reader` and `verify_reader`) so callers do not need to pre-hash large files to fit them in memory or go fast, and prominently advises callers in the documentation to pass the original bytes or stream directly. Passing the original message keeps the imprint bound to a fresh per-imprint salt rather than exposing users to unsalted collision attacks on a pre-hash.
+BLINCS takes the message directly — as bytes (`imprint` / `verify`) or as a stream (`imprint_reader` / `verify_reader`) — and hashes it in a single salted keyed-BLAKE3 pass under a fresh per-imprint salt chosen before reading the input. Passing the original message or stream gives full BLAKE3 streaming speed without buffering and rests message hashing on randomized target-collision resistance rather than unsalted collision resistance.
 
 ### Why single-pass salted BLAKE3 instead of two-pass chunking
 
