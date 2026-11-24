@@ -144,9 +144,17 @@ This section records every hash-based signature technique we evaluated — both 
 
 ## 5. Single-pass salted content hashing
 
-### Pass the message or stream directly
+### The three message-hashing modes
 
-BLINCS takes the message directly — as bytes (`imprint` / `verify`) or as a stream (`imprint_reader` / `verify_reader`) — and hashes it in a single salted keyed-BLAKE3 pass under a fresh per-imprint salt chosen before reading the input. Passing the original message or stream gives full BLAKE3 streaming speed without buffering and rests message hashing on randomized target-collision resistance rather than unsalted collision resistance.
+Discussions of signature schemes often treat message hashing as a binary choice between "pure" signing and unsalted pre-hashing. In fact there are **three** distinct modes:
+
+| Mode | How the message `M` is hashed | Passes over `M` | Hash assumption on `M` | Examples |
+|---|---|---:|---|---|
+| **1. Unsalted pre-hash** | Hash `M` first with a fixed hash `H(M)`, then sign the digest | 1 | Unsalted collision resistance | HashSLH-DSA, Ed25519ph |
+| **2. Two-pass message-dependent randomization** | Pass 1 derives randomizer `R` from `(key, M)`; Pass 2 hashes `(R, pk, M)` | 2 *(must buffer or rewind `M`)* | Randomized target-collision resistance | Pure SLH-DSA (FIPS 205), Ed25519 |
+| **3. Single-pass salted streaming** *(BLINCS)* | Derive fresh salt `e` from `(K_salt, draw)` **before** reading `M`; hash `Keyed(Keyed(K_content, e), M)` | 1 *(constant-RAM streaming)* | Randomized target-collision resistance *(falls back to 128-bit known-key collision resistance only if `draw` repeats)* | **BLINCS** |
+
+BLINCS implements **Mode 3**: it chooses the fresh per-imprint salt `e` upfront so it can stream arbitrarily large inputs in a single BLAKE3 pass (`imprint_reader` / `verify_reader`) while resting message hashing on randomized target-collision resistance. To get Mode 3's randomized target-collision resistance over a message, pass the full message bytes or stream directly into BLINCS (rather than hashing `M` into an unsalted digest beforehand).
 
 ### Why single-pass salted BLAKE3 instead of two-pass chunking
 
