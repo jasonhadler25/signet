@@ -128,7 +128,7 @@ CONTROLS = [
 
 
 def run_nextest(test_filter=None):
-    cmd = ["cargo", "nextest", "run", "--locked", "--no-fail-fast"]
+    cmd = ["cargo", "nextest", "run", "--locked", "--no-fail-fast", "--color", "never"]
     if test_filter is not None:
         cmd += ["-E", f"test(/{test_filter}$/)"]
     return subprocess.run(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
