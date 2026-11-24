@@ -2,6 +2,7 @@ use crate::params::{ContentKey, N, SHORT_LEN, ensure_init};
 use blake3_servil::convenience;
 use blake3_servil::throughput::{Event, Limits, Pipeline, ROOM_LEN, TreeHasher, block_on, update_multithreaded};
 use std::io::{self, ErrorKind, Read};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
 const MT_SLICE_THRESHOLD: usize = 524_288;
 const SMALL_READER_BUF: usize = 16_384;
@@ -91,7 +92,17 @@ pub(crate) fn content_from_reader(content_key: &ContentKey, salt: &[u8; N], mut 
         let mut hit_eof = false;
         while room_filled < ROOM_LEN {
             let buf = &mut room.bytes_mut()[room_filled..];
-            match reader.read(buf) {
+            let read_res = match catch_unwind(AssertUnwindSafe(|| reader.read(buf))) {
+                Ok(r) => r,
+                Err(payload) => {
+                    pipe.abort(msg);
+                    while pipe.next_event().is_none() {
+                        block_on(pipe.ready());
+                    }
+                    resume_unwind(payload);
+                }
+            };
+            match read_res {
                 Ok(0) => {
                     hit_eof = true;
                     break;

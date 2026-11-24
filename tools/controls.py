@@ -159,7 +159,7 @@ def main():
         if res.returncode == 0:
             print(f"MISSED [{i}/{len(CONTROLS)}] {name} ({flt} still passed!)")
             missed.append(name)
-        elif "FAIL [" not in res.stdout or flt not in res.stdout:
+        elif "1 test run: 0 passed, 1 failed" not in res.stdout or flt not in res.stdout:
             print(f"ERROR [{i}/{len(CONTROLS)}] {name}: nonzero exit without running/failing {flt}:\n{res.stdout}", file=sys.stderr)
             return 2
         else:

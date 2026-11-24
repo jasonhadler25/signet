@@ -743,11 +743,11 @@ fn oversized_read_return_and_caught_panic_are_handled_cleanly() {
     assert!(catch_unwind(|| content_from_reader(&ck, &[0u8; N], OversizedReader { prefix: 32_768 })).is_err());
     assert!(catch_unwind(|| read_exact_or_reject(&mut OversizedReader { prefix: 0 })).is_err());
 
-    // Caught panic mid-Pipeline leaves sign_reader / verify_reader completely reusable.
-    let res_sign = catch_unwind(AssertUnwindSafe(|| sk.sign_reader_with_draw(&[3u8; 32], PanickingAfterReader { prefix: 40_000 })));
+    // Caught panic mid-Pipeline (after > 64 KiB room commit is in flight) leaves sign_reader / verify_reader reusable.
+    let res_sign = catch_unwind(AssertUnwindSafe(|| sk.sign_reader_with_draw(&[3u8; 32], PanickingAfterReader { prefix: 80_000 })));
     assert!(res_sign.is_err());
     let sig = sk.sign_reader_with_draw(&[4u8; 32], Cursor::new(vec![0x77u8; 90_000])).unwrap();
-    let res_ver = catch_unwind(AssertUnwindSafe(|| vk.verify_reader(PanickingAfterReader { prefix: 40_000 }, &sig)));
+    let res_ver = catch_unwind(AssertUnwindSafe(|| vk.verify_reader(PanickingAfterReader { prefix: 80_000 }, &sig)));
     assert!(res_ver.is_err());
     assert!(vk.verify_reader(Cursor::new(vec![0x77u8; 90_000]), &sig).unwrap());
 }
