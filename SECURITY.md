@@ -16,9 +16,13 @@ Full mathematical and operational details are in [`SPEC.md`](SPEC.md) and [`DESI
 - **Signing-key seed entropy:** `SigningKey::from_seed` accepts a caller-supplied 32-byte seed and performs no entropy test. Generate seeds from a vetted cryptographic source; never pass passwords or low-entropy strings.
 - **Platform scope (Unix signing):** `Randomness::create` and `Randomness::initialize` currently target Unix (`/dev/urandom`, `0600` mode, POSIX advisory `flock`). `VerifyingKey` works on any target supporting `blake3-servil` and 64-bit atomics.
 - **State file placement & error recovery:** keep the 48-byte randomness state file in a private local directory owned by the signer on a Unix filesystem that enforces advisory `flock` locks. Create it once with `Randomness::create` before starting signers. If `create` fails partway through or a host crashes mid-`initialize`, remove and re-provision the state file before resuming signing.
-- **Process forks and VM snapshots:** do **not** call BLINCS in a `fork()` child without `exec()` (multithreaded fork children do not inherit background worker threads). After restoring a live VM snapshot, call `Randomness::initialize` again so clones do not share the same `(run_key, count)` draw sequence.
+- **Process forks and VM snapshots:** do **not** call BLINCS in a `fork()` child without `exec()` (multithreaded fork children do not inherit background worker threads; the worker pool detects a PID change and aborts fail-stop rather than hanging). After restoring a live VM snapshot, call `Randomness::initialize` again so clones do not share the same `(run_key, count)` draw sequence.
 - **Memory retention:** `SigningKey` retains its 32-byte seed and derived keys, parallel jobs copy `SecretKey`, and both worker threads and participating application threads keep thread-local scratch buffers that retain intermediate leaf secrets until thread exit. Neither BLINCS nor `blake3-servil` wipes secret key memory on drop. Streaming readers use a fresh local zero-initialized 16 KiB stack buffer ($< 16$ KiB) or a fresh per-call `Pipeline` ($\ge 16$ KiB, zeroing each newly acquired room slice before `Read::read`) with no shared cross-caller pool.
 - **No pre-hash API:** pass the message or stream directly to `sign`/`sign_reader` and `verify`/`verify_reader`. Pre-hashing before calling BLINCS exposes users to collision attacks on the pre-hash.
+
+## Timing and secret independence
+
+In BLINCS's Rust code, every branch and memory index during signing and verification depends only on public inputs or values published in the signature (`salt`, `randomizer`, `D`, `fors_indices`, `leaf_addr`, and WOTS+ chain digits). Secret values (`seed`, `SecretKey`, `salt_key`, `randomizer_key`, `run_key`, `draw`, and unrevealed leaf secrets) are only copied or hashed by `blake3-servil`, whose assembly kernels are proved branch- and address-independent of keys and inputs. Hardware timing guarantees (Arm `DIT`, Intel `DOITM`, and mitigation of frequency/prefetcher channels such as Hertzbleed or GoFetch) remain the caller's or platform's responsibility; see [`QUALITY.md`](QUALITY.md).
 
 ## Verifying checked-in vectors
 
@@ -27,3 +31,6 @@ Where this repository records digests, it records both SHA-256 and BLAKE3:
 - `test_vectors/reference-signature-1.bin` (5,616 bytes):
   - SHA-256: `7fbc1537b5b516c823542c425f48129fe78d974a1806ae24fe0c8dc382a7436c`
   - BLAKE3:  `ab80843efd3f5860ccc87f578b8831a79eaf3bb595ac516954823f2ed6886b23`
+- `test_vectors/edge-vectors.json` (4 boundary vectors: empty, 1 B, 1,024 B, 16,385 B with bit-32 `leaf_addr`):
+  - SHA-256: `4be3ee44ca7318bdd15a492e77dd1b749ee8d957124701fe070615a52d4a3437`
+  - BLAKE3:  `ffddb6318d2d4a33974fb3d9062f3ec98c796bb58e1a59c9c8f9ab63232f1efe`

@@ -19,6 +19,9 @@ import blincs  # noqa: E402
 REF_SIG = os.path.join(ROOT, "test_vectors", "reference-signature-1.bin")
 REF_SHA256 = "7fbc1537b5b516c823542c425f48129fe78d974a1806ae24fe0c8dc382a7436c"
 REF_BLAKE3 = "ab80843efd3f5860ccc87f578b8831a79eaf3bb595ac516954823f2ed6886b23"
+EDGE_VEC = os.path.join(ROOT, "test_vectors", "edge-vectors.json")
+EDGE_SHA256 = "4be3ee44ca7318bdd15a492e77dd1b749ee8d957124701fe070615a52d4a3437"
+EDGE_BLAKE3 = "ffddb6318d2d4a33974fb3d9062f3ec98c796bb58e1a59c9c8f9ab63232f1efe"
 
 
 def run(label, cmd):
@@ -38,9 +41,27 @@ def check_vectors_and_python():
     assert got_sha256 == REF_SHA256, f"SHA-256 mismatch: {got_sha256}"
     assert got_blake3 == REF_BLAKE3, f"BLAKE3 mismatch: {got_blake3}"
 
-    # Verify reference-signature-1.bin with pure Python reference.
+    # Verify reference-signature-1.bin and edge-vectors.json with pure Python reference.
     vk = blincs.VerifyingKey(bytes.fromhex("0ad9c13b8972b912a211f9fd2ba1eec863399e14d2f6c8c3309f9d7e61a53c46"))
     assert vk.verify(b"hello, BLINCS", raw), "Python reference rejected reference-signature-1.bin"
+
+    print("==> Checking edge-vectors.json digests (SHA-256 + BLAKE3) and Python verification")
+    import json
+
+    edge_raw = open(EDGE_VEC, "rb").read()
+    assert hashlib.sha256(edge_raw).hexdigest() == EDGE_SHA256, "edge-vectors.json SHA-256 mismatch"
+    assert blake3.hash(edge_raw).hex() == EDGE_BLAKE3, "edge-vectors.json BLAKE3 mismatch"
+    edge_msgs = {
+        "empty": b"",
+        "one-byte-zero": b"\x00",
+        "chunk-1024": bytes((i * 31) & 0xFF for i in range(1024)),
+        "pipeline-16385-high-leaf": bytes((i * 37 + 5) & 0xFF for i in range(16385)),
+    }
+    for entry in json.loads(edge_raw.decode("utf-8")):
+        sig = bytes.fromhex(entry["sig_hex"])
+        assert hashlib.sha256(sig).hexdigest() == entry["sig_sha256"]
+        assert blake3.hash(sig).hex() == entry["sig_blake3"]
+        assert vk.verify(edge_msgs[entry["name"]], sig), f"Python reference rejected edge vector {entry['name']}"
 
     # Verify python3 -O validation (no reliance on assert).
     run(
@@ -82,6 +103,7 @@ def main():
     run("BLAKE3 official test vectors (Python)", [sys.executable, "reference/blake3.py"])
     run("Parameter optimizer self-check", [sys.executable, "tools/optimize.py", "--check"])
     run("Shipped-code safety counts", [sys.executable, "tools/counts.py"])
+    run("Static + dynamic domain separation", [sys.executable, "tools/domain_sep.py"])
     check_vectors_and_python()
 
     if "--skip-rust" not in args:

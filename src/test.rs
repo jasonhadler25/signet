@@ -647,11 +647,12 @@ fn checked_constructors_reject_out_of_range_values() {
     assert_eq!(&max_t[2..8], &[0xff; 6]);
     assert!(catch_unwind(|| tweak(TweakKind::Node, 0, 1u64 << 48, 0, 0, 0)).is_err());
 
-    let _ = Pos::new(Layer::L0, (1u64 << 48) - 1, 127);
-    assert!(catch_unwind(|| Pos::new(Layer::L0, 1u64 << 48, 0)).is_err());
-    assert!(catch_unwind(|| Pos::new(Layer::L0, 0, 128)).is_err());
-    let _ = Pos::new(Layer::TOP, 0, 4095);
-    assert!(catch_unwind(|| Pos::new(Layer::TOP, 0, 4096)).is_err());
+    // Exact per-layer hypertree bounds: L0 < 2^26, L1 < 2^19, L2 < 2^12, L3 == 0.
+    for (layer, max_trees, max_leaves) in [(Layer::L0, 1u64 << 26, 128u16), (Layer::L1, 1u64 << 19, 128), (Layer::L2, 1u64 << 12, 128), (Layer::L3, 1, 4096)] {
+        let _ = Pos::new(layer, max_trees - 1, max_leaves - 1);
+        assert!(catch_unwind(|| Pos::new(layer, max_trees, 0)).is_err());
+        assert!(catch_unwind(|| Pos::new(layer, 0, max_leaves)).is_err());
+    }
 
     // Stream length overflow helper (u64::MAX boundary).
     assert_eq!(checked_add_stream_len(u64::MAX - 10, 10).unwrap(), u64::MAX);
@@ -757,4 +758,108 @@ fn all_public_operations_fit_within_128kib_stack_budget() {
         })
         .unwrap();
     handle.join().unwrap();
+}
+
+#[test]
+fn edge_vectors_match_python_and_ts_byte_for_byte() {
+    let json = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/test_vectors/edge-vectors.json")).unwrap();
+    let extract = |block: &str, key: &str| -> String {
+        let pat = format!("\"{key}\": \"");
+        let start = block.find(&pat).unwrap() + pat.len();
+        let end = block[start..].find('"').unwrap();
+        block[start..start + end].to_owned()
+    };
+
+    let seed: [u8; SEED_LEN] = core::array::from_fn(|i| u8::try_from(i).unwrap());
+    let sk = SigningKey::from_seed(&seed);
+    let vk = sk.verifying_key();
+
+    let messages: [(&str, Vec<u8>); 4] = [
+        ("empty", vec![]),
+        ("one-byte-zero", vec![0u8]),
+        ("chunk-1024", (0..1024usize).map(|i| u8::try_from((i * 31) & 0xff).unwrap()).collect()),
+        ("pipeline-16385-high-leaf", (0..16385usize).map(|i| u8::try_from((i * 37 + 5) & 0xff).unwrap()).collect()),
+    ];
+
+    let blocks: Vec<&str> = json.split("\"name\": \"").skip(1).collect();
+    assert_eq!(blocks.len(), messages.len());
+    for (block, (expected_name, msg)) in blocks.iter().zip(messages.iter()) {
+        let name_end = block.find('"').unwrap();
+        assert_eq!(&block[..name_end], *expected_name);
+        let draw: [u8; 32] = from_hex(&extract(block, "draw_hex")).try_into().unwrap();
+        let expected_sig = from_hex(&extract(block, "sig_hex"));
+        assert_eq!(expected_sig.len(), SIGNATURE_LEN);
+
+        let sig_slice = sk.sign_with_draw(&draw, msg);
+        assert_eq!(sig_slice.as_bytes().as_slice(), expected_sig.as_slice(), "slice mismatch on {expected_name}");
+        let sig_reader = sk.sign_reader_with_draw(&draw, Cursor::new(msg)).unwrap();
+        assert_eq!(sig_reader, sig_slice, "reader mismatch on {expected_name}");
+        assert!(vk.verify(msg, &sig_slice));
+        assert!(vk.verify_reader(Cursor::new(msg), &sig_slice).unwrap());
+
+        let mut bad = *sig_slice.as_bytes();
+        bad[SIGNATURE_LEN - 1] ^= 1;
+        assert!(!vk.verify(msg, &Signature::from_bytes(&bad)));
+    }
+}
+
+#[test]
+fn stateful_lifecycle_and_trait_contracts() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<SigningKey>();
+    assert_send_sync::<VerifyingKey>();
+    assert_send_sync::<Signature>();
+    assert_send_sync::<Randomness>();
+
+    let p1 = temp_state_path("lifecycle-contract-1");
+    let p2 = temp_state_path("lifecycle-contract-2");
+    Randomness::create(&p1).unwrap();
+    Randomness::create(&p2).unwrap();
+    let r1 = Randomness::initialize(&p1).unwrap();
+    let r2 = Randomness::initialize(&p2).unwrap();
+
+    let sk1 = SigningKey::from_seed(&[0x10u8; SEED_LEN]);
+    let sk2 = SigningKey::from_seed(&[0x20u8; SEED_LEN]);
+    let vk1 = sk1.verifying_key();
+    let vk1_copy = vk1;
+    let vk1_rt = VerifyingKey::try_from(vk1.as_bytes().as_slice()).unwrap();
+    let vk2 = sk2.verifying_key();
+    assert_eq!(vk1, vk1_copy);
+    assert_eq!(vk1, vk1_rt);
+    assert_ne!(vk1, vk2);
+
+    // Interleaved operations across two keys, two randomness states, slice & reader APIs, and Signature traits.
+    let s1a = sk1.sign(&r1, b"alpha");
+    let s1b = sk1.sign(&r1, b"alpha");
+    assert_ne!(s1a, s1b, "distinct draws must yield distinct signatures");
+    let s1a_clone = s1a.clone();
+    assert_eq!(s1a, s1a_clone);
+    assert_eq!(Signature::try_from(s1a.as_bytes().as_slice()).unwrap(), s1a);
+
+    let s2 = sk2.sign_reader(&r2, Cursor::new(b"beta")).unwrap();
+    assert!(vk1.verify(b"alpha", &s1a));
+    assert!(vk1_rt.verify_reader(Cursor::new(b"alpha"), &s1b).unwrap());
+    assert!(vk2.verify(b"beta", &s2));
+    assert!(!vk1.verify(b"beta", &s2));
+    assert!(!vk2.verify(b"alpha", &s1a));
+
+    let _ = fs::remove_dir_all(p1.parent().unwrap());
+    let _ = fs::remove_dir_all(p2.parent().unwrap());
+}
+
+#[test]
+fn pool_executes_tasks_across_multiple_threads_when_available() {
+    ensure_init();
+    let cpus = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    // First wave lets newly spawned workers finish one-time scratch allocation and park on the condvar.
+    let _ = crate::pool::parallel_collect(1, |_, _, _| ());
+    let ids = crate::pool::parallel_collect(32, |_, _, _| {
+        thread::sleep(std::time::Duration::from_millis(2));
+        thread::current().id()
+    });
+    assert_eq!(ids.len(), 32);
+    if cpus > 1 {
+        let unique: std::collections::HashSet<_> = ids.into_iter().collect();
+        assert!(unique.len() > 1, "expected parallel_collect to use > 1 thread on {cpus}-CPU host");
+    }
 }

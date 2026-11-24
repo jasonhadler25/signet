@@ -24,11 +24,13 @@ tests/
 reference/
   blake3.py             From-spec pure-Python BLAKE3 (35 official test vectors)
   blincs.py             Independent pure-Python reference implementation
-test_vectors/           Checked-in reference signature (SHA-256 + BLAKE3 recorded)
+  blincs.ts             Educational blind spec-only TypeScript verifier (for reading, not production execution)
+test_vectors/           Checked-in primary & edge-case reference signatures (SHA-256 + BLAKE3 recorded)
 tools/
   require_nextest.rs    Sentinel test failing plain `cargo test`
-  controls.py           15 planted-fault controls
+  controls.py           16 planted-fault controls
   counts.py             Shipped-code safety counts (0 unsafe, 0 debug_assert!, 0 truncation allows, 0 Drop)
+  domain_sep.py         Static & dynamic domain-separation and tweak-uniqueness check
   optimize.py           Reproducible parameter optimizer (unknown-thresholds model)
   mutants/              cargo-mutants runner and known-survivors list
   land.py               Exact-commit landing gate
@@ -55,4 +57,4 @@ python3 tools/land.py
 python3 tools/mutants/check.py
 ```
 
-`tools/land.py` checks a clean working tree, `cargo fmt -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo nextest run --locked`, `cargo test --doc --locked`, `reference/blake3.py`, `tools/optimize.py --check`, `tools/counts.py`, `python3 -O` reference input validation, `test_vectors/reference-signature-1.bin` SHA-256 and BLAKE3 digests, and all 15 planted-fault controls in `tools/controls.py`.
+`tools/land.py` checks a clean working tree, `cargo fmt -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo nextest run --locked`, `cargo test --doc --locked`, `reference/blake3.py`, `tools/optimize.py --check`, `tools/counts.py`, `tools/domain_sep.py`, `python3 -O` reference input validation, checked-in test vector SHA-256 and BLAKE3 digests (`reference-signature-1.bin` and `edge-vectors.json`), and all 16 planted-fault controls in `tools/controls.py`.

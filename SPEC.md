@@ -144,10 +144,10 @@ At hypertree bottom-layer leaf address `leaf_addr` (`0 <= leaf_addr < 2^33`), fo
   `L_{t,i} = ShortHash(K_pub, tweak(FEW_LEAF, 0, leaf_addr, t, 0, i), s_{t,i})`.
 - Internal node at `height = 1..=10`, `index = 0..2^(10 - height)`:
   `node(t, height, index) = ShortHash(K_pub, tweak(FEW_NODE, 0, leaf_addr, t, height, index), left || right)`.
-- The FORS root compresses all 16 tree roots (`height = 10`, `index = 0`):
+- The FORS root compresses all 16 tree roots (where each `root_t` is `node(t, 10, 0)`):
   `fors_root = ShortHash(K_pub, tweak(FEW_ROOT, 0, leaf_addr, 0, 0, 0), root_0 || ... || root_15)`.
 
-For each `t = 0..16`, the signer emits `s_{t, idx[t]}` followed by the 10 sibling nodes along `idx[t]`'s authentication path (bottom level `height = 0` first). The verifier hashes each secret to `L_{t, idx[t]}`, climbs the 10 authentication nodes (putting the running value on the left when `(idx[t] >> height) & 1 == 0`, on the right otherwise) to obtain `root_t`, and compresses `root_0 || ... || root_15` to `fors_root`.
+For each `t = 0..16`, the signer emits `s_{t, idx[t]}` followed by the 10 sibling nodes `auth[0..10]` along `idx[t]`'s authentication path (bottom level `j = 0` first). The verifier hashes each secret to `L_{t, idx[t]}`, climbs `j = 0..10` using `tweak(FEW_NODE, 0, leaf_addr, t, j + 1, idx[t] >> (j + 1))` (putting the running value on the left when `(idx[t] >> j) & 1 == 0`, on the right otherwise) to obtain `root_t`, and compresses `root_0 || ... || root_15` to `fors_root`.
 
 ## One-time signatures (WOTS+)
 
@@ -174,11 +174,11 @@ d[33] = (csum >> 4) & 0x0F
 d[34] = (csum >> 8) & 0x0F
 ```
 
-The signer advances each chain `c` from `0` to `d[c]` and emits the 35 chain values followed by the `height` sibling nodes along `leaf`'s authentication path (bottom level `0` first). The verifier advances each signature chain value from `d[c]` to `15`, compresses the 35 ends to `pk_leaf`, and climbs the `height` authentication nodes to obtain the tree root.
+The signer advances each chain `c` from `0` to `d[c]` and emits the 35 chain values followed by the `height` sibling nodes `auth[0..height]` along `leaf`'s authentication path (bottom level `j = 0` first). The verifier advances each signature chain value from `d[c]` to `15`, compresses the 35 ends to `pk_leaf`, and climbs `j = 0..height` using `tweak(NODE, layer, tree, 0, j + 1, leaf >> (j + 1))` (putting the running value on the left when `(leaf >> j) & 1 == 0`, on the right otherwise) to obtain the tree root.
 
 ## Hypertree and signature layout
 
-Starting from `node = fors_root` and `addr = leaf_addr`, for `layer = 0, 1, 2, 3`:
+Verification rejects any verifying key not of length 32 bytes or signature not of length 5,616 bytes. Starting from `node = fors_root` and `addr = leaf_addr`, for `layer = 0, 1, 2, 3`:
 
 - Let `height = 12` if `layer == 3`, else `7`.
 - Let `leaf = addr & ((1 << height) - 1)` and `tree = addr >> height`.
@@ -226,7 +226,7 @@ Offset  Length  Field
 - **Per signature (`draw`)**: atomically fetches and increments `sig_count` (`0..u64::MAX`, panicking if exhausted so it never wraps) and returns `Keyed(run_key, u64_le(n))` (ensuring distinct PRF inputs within one run; truncated 128-bit salts still have birthday collision probability $\approx 2^{-65}$ over $2^{32}$ signatures).
 - **Fork and live VM snapshots**: do **not** call BLINCS in a `fork()` child without `exec()` (a multithreaded child does not inherit background worker threads, and `Randomness::initialize` does not recreate them). After restoring a live VM snapshot (where threads remain intact), call `Randomness::initialize` again so cloned images do not repeat `(run_key, sig_count)`.
 - **Crash and error recovery**: `initialize` overwrites bytes `8..48` via `write_all` (serialized under `flock`, not transactional across power loss), and `create` may leave a partial file if write or sync fails. If `create` or `initialize` returns an error or a host crashes mid-update, remove and re-provision the state file with `Randomness::create` (or verify it passes `initialize` cleanly) before resuming signing.
-- **Path trust boundary**: `initialize` follows symlinks and relies on cooperating writers using compatible advisory locks on a local filesystem. Keep the state file in a private trusted directory.
+- **Path boundary**: `initialize` follows symlinks and relies on cooperating writers using compatible advisory locks on a local filesystem. Keep the state file in a private local directory owned by the signer.
 
 Even if the state file, `/dev/urandom`, and the monotonic clock are all rolled back together so `draw` repeats identically:
 

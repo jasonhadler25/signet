@@ -64,7 +64,7 @@ CONTROLS = [
     (
         "Streaming content_from_reader aborts Pipeline cleanly on mid-stream I/O error",
         "src/content.rs",
-        "                pipe.abort(msg);\n                while pipe.next_event().is_none() {\n                    block_on(pipe.ready());\n                }\n                return Err(e);",
+        "                pipe.abort(msg);\n                loop {\n                    match pipe.next_event() {\n                        Some(Event::Aborted { .. }) => break,\n                        Some(_) => panic!(\"unexpected Pipeline event after abort\"),\n                        None => block_on(pipe.ready()),\n                    }\n                }\n                return Err(e);",
         "                return Err(e);",
         "streaming_boundaries_and_fragmented_readers_match_slices",
     ),

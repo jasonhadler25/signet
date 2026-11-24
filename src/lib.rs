@@ -1,5 +1,6 @@
-//! BLINCS — stateless post-quantum digital signatures built on BLAKE3.
+//! BLINCS — stateless hash-based digital signatures built on BLAKE3.
 //!
+//! Designed for post-quantum use with a 128-bit classical security target (see `SPEC.md` for bounds).
 //! A signature is 5,616 bytes, a verifying key is 32 bytes, and a signing key is a 32-byte seed.
 //! Messages are hashed in a single salted keyed-BLAKE3 pass under a fresh per-signature salt; passing
 //! the message or stream directly to BLINCS avoids pre-hash collision exposure and hashes across all
@@ -86,6 +87,7 @@ pub struct Signature([u8; SIGNATURE_LEN]);
 
 impl Signature {
     /// Wrap a raw 5,616-byte signature array.
+    #[must_use]
     pub fn from_bytes(bytes: &[u8; SIGNATURE_LEN]) -> Self {
         Self(*bytes)
     }
@@ -155,6 +157,7 @@ impl fmt::Debug for VerifyingKey {
 
 impl VerifyingKey {
     /// Construct a verifying key from its 32-byte wire encoding (`public_seed || top_root`).
+    #[must_use]
     pub fn from_bytes(bytes: &[u8; VERIFYING_KEY_LEN]) -> Self {
         ensure_init();
         let public_key = PublicKey::from_seed(bytes[..N].try_into().unwrap());
@@ -172,12 +175,14 @@ impl VerifyingKey {
     }
 
     /// Verify `signature` over an in-memory `message` slice.
+    #[must_use = "signature verification result must be checked"]
     pub fn verify(&self, message: &[u8], signature: &Signature) -> bool {
         let short = content_from_slice(&self.content_key, signature.salt(), message);
         self.verify_short(&short, signature)
     }
 
     /// Verify `signature` over a streaming `reader` in one salted pass.
+    #[must_use = "signature verification result must be checked"]
     pub fn verify_reader(&self, reader: impl Read, signature: &Signature) -> io::Result<bool> {
         let short = content_from_reader(&self.content_key, signature.salt(), reader)?;
         Ok(self.verify_short(&short, signature))
@@ -315,6 +320,7 @@ impl SigningKey {
                 node = heap[1];
             }
             let (top_tree_idx, top_leaf) = coords[Layer::TOP.index()];
+            assert_eq!(top_tree_idx, 0);
             let off = Layer::TOP.sig_offset();
             write_layer_signature(
                 &sec,
@@ -347,6 +353,7 @@ impl SigningKey {
     }
 
     /// Sign an in-memory `message`, drawing fresh per-signature randomness from `randomness`.
+    #[must_use]
     pub fn sign(&self, randomness: &Randomness, message: &[u8]) -> Signature {
         let draw = randomness.draw();
         self.sign_with_draw(&draw, message)

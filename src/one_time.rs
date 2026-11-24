@@ -2,7 +2,7 @@ use crate::params::{CHAIN_STEPS, CHAINS, Layer, MSG_CHAINS, N, PublicKey, Secret
 use crate::pool::{VerifyWorkspace, WOTS_CHUNK_LEAVES, WorkerScratch};
 use blake3_servil::throughput::{Batch, Prepared, TreeHasher};
 
-/// Checked position of a one-time signature in the hypertree (`leaf < layer.leaves()`).
+/// Checked position of a one-time signature in the hypertree (`tree < layer.trees()` and `leaf < layer.leaves()`).
 #[derive(Clone, Copy)]
 pub(crate) struct Pos {
     layer: Layer,
@@ -12,7 +12,7 @@ pub(crate) struct Pos {
 
 impl Pos {
     pub(crate) fn new(layer: Layer, tree: u64, leaf: u16) -> Self {
-        assert!(tree < (1u64 << 48) && usize::from(leaf) < layer.leaves());
+        assert!(tree < layer.trees() && usize::from(leaf) < layer.leaves());
         Self { layer, tree, leaf }
     }
 }

@@ -160,6 +160,16 @@ impl Layer {
         if matches!(self, Self::L3) { TOP_LEAVES } else { LOWER_LEAVES }
     }
 
+    /// Number of trees at this layer (`2^26`, `2^19`, `2^12`, `1` for layers 0..=3).
+    pub(crate) const fn trees(self) -> u64 {
+        match self {
+            Self::L0 => 1u64 << (HYPER_BITS - LOWER_HEIGHT),
+            Self::L1 => 1u64 << (HYPER_BITS - 2 * LOWER_HEIGHT),
+            Self::L2 => 1u64 << (HYPER_BITS - 3 * LOWER_HEIGHT),
+            Self::L3 => 1,
+        }
+    }
+
     pub(crate) const fn sig_len(self) -> usize {
         if matches!(self, Self::L3) { TOP_LAYER_LEN } else { LOWER_LAYER_LEN }
     }

@@ -91,8 +91,12 @@ pub(crate) fn content_from_reader(content_key: &[u8; 32], salt: &[u8; N], mut re
             Ok(v) => v,
             Err(e) => {
                 pipe.abort(msg);
-                while pipe.next_event().is_none() {
-                    block_on(pipe.ready());
+                loop {
+                    match pipe.next_event() {
+                        Some(Event::Aborted { .. }) => break,
+                        Some(_) => panic!("unexpected Pipeline event after abort"),
+                        None => block_on(pipe.ready()),
+                    }
                 }
                 return Err(e);
             }

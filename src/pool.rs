@@ -89,8 +89,15 @@ struct PoolState {
     remaining_workers: usize,
 }
 
+fn drain_or_abort(wave: &Wave, use_sme2: bool, ws: &mut WorkerScratch) {
+    if catch_unwind(AssertUnwindSafe(|| wave.drain(use_sme2, ws))).is_err() {
+        abort();
+    }
+}
+
 /// Persistent crash-only worker pool: caller runs full-width/SME2, workers stay `on_this_core()`.
 struct Pool {
+    pid: u32,
     n_workers: usize,
     dispatch: Mutex<()>,
     state: Arc<(Mutex<PoolState>, Condvar, Condvar)>,
@@ -105,27 +112,31 @@ impl Pool {
         for idx in 0..target {
             let shared = Arc::clone(&state);
             let res = thread::Builder::new().name(format!("blincs-worker-{idx}")).spawn(move || {
-                ensure_init();
-                let mut ws = WorkerScratch::new();
-                let mut seen_gen = 0u64;
-                let (lock, wake, done) = &*shared;
-                loop {
-                    let wave = {
+                if catch_unwind(AssertUnwindSafe(move || {
+                    ensure_init();
+                    let mut ws = WorkerScratch::new();
+                    let mut seen_gen = 0u64;
+                    let (lock, wake, done) = &*shared;
+                    loop {
+                        let wave = {
+                            let mut guard = lock.lock().unwrap();
+                            while guard.generation == seen_gen {
+                                guard = wake.wait(guard).unwrap();
+                            }
+                            seen_gen = guard.generation;
+                            Arc::clone(guard.active.as_ref().unwrap())
+                        };
+                        wave.drain(false, &mut ws);
                         let mut guard = lock.lock().unwrap();
-                        while guard.generation == seen_gen {
-                            guard = wake.wait(guard).unwrap();
+                        guard.remaining_workers -= 1;
+                        if guard.remaining_workers == 0 {
+                            done.notify_one();
                         }
-                        seen_gen = guard.generation;
-                        Arc::clone(guard.active.as_ref().unwrap())
-                    };
-                    if catch_unwind(AssertUnwindSafe(|| wave.drain(false, &mut ws))).is_err() {
-                        abort();
                     }
-                    let mut guard = lock.lock().unwrap();
-                    guard.remaining_workers -= 1;
-                    if guard.remaining_workers == 0 {
-                        done.notify_one();
-                    }
+                }))
+                .is_err()
+                {
+                    abort();
                 }
             });
             if res.is_ok() {
@@ -134,16 +145,19 @@ impl Pool {
                 break;
             }
         }
-        Self { n_workers: spawned, dispatch: Mutex::new(()), state }
+        Self { pid: std::process::id(), n_workers: spawned, dispatch: Mutex::new(()), state }
     }
 
     fn run(&self, wave: Arc<Wave>) {
+        if std::process::id() != self.pid {
+            abort();
+        }
         if self.n_workers == 0 {
-            with_caller_scratch(|ws| wave.drain(true, ws));
+            with_caller_scratch(|ws| drain_or_abort(&wave, true, ws));
             return;
         }
         let Ok(_dispatch_guard) = self.dispatch.try_lock() else {
-            with_caller_scratch(|ws| wave.drain(true, ws));
+            with_caller_scratch(|ws| drain_or_abort(&wave, true, ws));
             return;
         };
 
@@ -155,9 +169,7 @@ impl Pool {
             guard.remaining_workers = self.n_workers;
             wake.notify_all();
         }
-        if catch_unwind(AssertUnwindSafe(|| with_caller_scratch(|ws| wave.drain(true, ws)))).is_err() {
-            abort();
-        }
+        with_caller_scratch(|ws| drain_or_abort(&wave, true, ws));
         let mut guard = lock.lock().unwrap();
         while guard.remaining_workers > 0 {
             guard = done.wait(guard).unwrap();
