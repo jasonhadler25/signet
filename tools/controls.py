@@ -50,8 +50,8 @@ CONTROLS = [
     (
         "Per-signature salt keyed into content hash (content_from_slice)",
         "src/content.rs",
-        "    let msg_key = content_key.message_key(salt);\n    let message_hash = if message.len() >= MT_SLICE_THRESHOLD {",
-        "    let msg_key = content_key.message_key(&[0u8; N]);\n    let message_hash = if message.len() >= MT_SLICE_THRESHOLD {",
+        "    let msg_key = keyed(content_key, salt);\n    let message_hash = if message.len() >= MT_SLICE_THRESHOLD {",
+        "    let msg_key = keyed(content_key, &[0u8; N]);\n    let message_hash = if message.len() >= MT_SLICE_THRESHOLD {",
         "reference_vector_matches_python_byte_for_byte",
     ),
     (
@@ -64,8 +64,8 @@ CONTROLS = [
     (
         "Streaming content_from_reader aborts Pipeline cleanly on mid-stream I/O error",
         "src/content.rs",
-        "                    pipe.abort(msg);\n                    while pipe.next_event().is_none() {\n                        block_on(pipe.ready());\n                    }\n                    return Err(e);",
-        "                    return Err(e);",
+        "                pipe.abort(msg);\n                while pipe.next_event().is_none() {\n                    block_on(pipe.ready());\n                }\n                return Err(e);",
+        "                return Err(e);",
         "streaming_boundaries_and_fragmented_readers_match_slices",
     ),
     (

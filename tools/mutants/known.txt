@@ -9,4 +9,4 @@ src/pool.rs	replace == with != in Pool::run	[dispatch/resource] Runs the wave sy
 src/pool.rs	replace += with -= in Pool::run	[functional-equiv] In release mode, workers only compare guard.generation == seen for inequality; wrapping decrement steps through the same 2^64 distinct wave tokens.
 src/randomness.rs	replace read_monotonic_clock::<impl Hasher for Collect>::finish -> u64 with 1	[functional-equiv] Hasher::finish is never called; Instant::now().hash only invokes Hasher::write.
 src/randomness.rs	replace match guard !p.as_os_str().is_empty() with false in Randomness::create	[durability] Syncs "." instead of path.parent() when both are readable; affects directory-sync target only.
-src/workspace.rs	replace / with *	[dispatch/resource] Allocates ws.b48 with 2048 slots instead of 512; build_merkle_heap chunks by ws.b48.len(), so results are identical.
+src/pool.rs	replace / with *	[dispatch/resource] Allocates ws.b48 with 2048 slots instead of 512; build_merkle_heap chunks by ws.b48.len(), so results are identical.

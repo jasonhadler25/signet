@@ -2,9 +2,10 @@ include!("../tools/require_nextest.rs");
 
 use crate::content::{checked_add_stream_len, content_from_reader};
 use crate::few_time::parse_digest;
-use crate::one_time::{Pos, advance_chains, digits, lower_tree_len_check};
+use crate::one_time::{Pos, advance_chains, digits};
 use crate::params::{
-    CHAIN_STEPS, CHAINS, ContentKey, FORS_HEIGHT, FORS_TREES, HYPER_BITS, Layer, MSG_CHAINS, N, PublicKey, SIGNATURE_LEN, TreeIndex, TweakKind, ensure_init,
+    CHAIN_STEPS, CHAINS, CTX_CONTENT, FORS_HEIGHT, FORS_TREES, HYPER_BITS, Layer, MSG_CHAINS, N, PublicKey, SIGNATURE_LEN, TweakKind, derive_key, ensure_init,
+    tweak,
 };
 use crate::randomness::{STATE_LEN, mix, read_exact_or_reject, read_monotonic_clock};
 use crate::{Randomness, SEED_LEN, Signature, SigningKey, VERIFYING_KEY_LEN, VerifyingKey};
@@ -113,7 +114,6 @@ fn reference_vector_matches_python_byte_for_byte() {
     let sk = SigningKey::from_seed(&seed);
     assert_eq!(sk.seed(), &seed);
     assert_eq!(to_hex(sk.verifying_key().as_bytes()), REF_VK_HEX);
-    assert_eq!(lower_tree_len_check(), 8_192);
 
     let expected = fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/test_vectors/reference-signature-1.bin")).unwrap();
     assert_eq!(expected.len(), SIGNATURE_LEN);
@@ -196,15 +196,14 @@ fn parse_digest_extracts_all_fors_indices_and_33bit_leaf_addr() {
     d[20..28].copy_from_slice(&raw_addr.to_le_bytes());
 
     let (indices, addr) = parse_digest(&d);
-    let got_idx: [u16; FORS_TREES] = indices.map(|x| x.as_u16());
-    assert_eq!(got_idx, expected_idx);
+    assert_eq!(indices, expected_idx);
     assert_eq!(addr.as_u64(), expected_addr);
 }
 
 #[test]
 fn advance_chains_handles_zero_partial_and_full_lengths() {
     ensure_init();
-    let public = PublicKey::from_public_seed(&[0x33u8; N]);
+    let public = PublicKey::from_seed(&[0x33u8; N]);
     let starts: [u8; CHAINS] = core::array::from_fn(|i| u8::try_from(i % 5).unwrap());
     let ends: [u8; CHAINS] = core::array::from_fn(|i| if i % 6 == 0 { starts[i] } else { CHAIN_STEPS - u8::try_from(i % 4).unwrap() });
     let initial: [[u8; N]; CHAINS] = core::array::from_fn(|i| [u8::try_from(i).unwrap(); N]);
@@ -212,32 +211,32 @@ fn advance_chains_handles_zero_partial_and_full_lengths() {
     let mut batched = initial;
     let mut b32 = Batch::new(32, CHAINS);
     let mut out = [[0u8; 32]; CHAINS];
-    let pub_core = public.tree_hasher(false);
-    let pos2 = Pos::new(Layer::L2, TreeIndex::new(17), 9);
+    let pub_core = public.hasher(false);
+    let pos2 = Pos::new(Layer::L2, 17, 9);
     advance_chains(&pub_core, pos2, &mut batched, &starts, &ends, &mut b32, &mut out);
 
     for c in 0..CHAINS {
         let mut expected = initial[c];
         for step in starts[c]..ends[c] {
-            let t = crate::params::tweak(TweakKind::Chain, Layer::L2.as_u8(), TreeIndex::new(17), 9, u16::try_from(c).unwrap(), u32::from(step));
+            let t = tweak(TweakKind::Chain, Layer::L2.as_u8(), 17, 9, u16::try_from(c).unwrap(), u32::from(step));
             expected = crate::params::short_hash(&public, t, &expected);
         }
         assert_eq!(batched[c], expected, "chain {c}");
     }
 
     let mut noop = initial;
-    advance_chains(&pub_core, Pos::new(Layer::L0, TreeIndex::ZERO, 0), &mut noop, &[5u8; CHAINS], &[5u8; CHAINS], &mut b32, &mut out);
+    advance_chains(&pub_core, Pos::new(Layer::L0, 0, 0), &mut noop, &[5u8; CHAINS], &[5u8; CHAINS], &mut b32, &mut out);
     assert_eq!(noop, initial);
 
     // Early-finish case: every chain finishes by step 4 (< CHAIN_STEPS).
     let mut short = initial;
     let short_starts = [2u8; CHAINS];
     let short_ends: [u8; CHAINS] = core::array::from_fn(|i| 2 + u8::try_from(i % 5).unwrap());
-    advance_chains(&pub_core, Pos::new(Layer::L1, TreeIndex::new(3), 2), &mut short, &short_starts, &short_ends, &mut b32, &mut out);
+    advance_chains(&pub_core, Pos::new(Layer::L1, 3, 2), &mut short, &short_starts, &short_ends, &mut b32, &mut out);
     for c in 0..CHAINS {
         let mut expected = initial[c];
         for step in short_starts[c]..short_ends[c] {
-            let t = crate::params::tweak(TweakKind::Chain, Layer::L1.as_u8(), TreeIndex::new(3), 2, u16::try_from(c).unwrap(), u32::from(step));
+            let t = tweak(TweakKind::Chain, Layer::L1.as_u8(), 3, 2, u16::try_from(c).unwrap(), u32::from(step));
             expected = crate::params::short_hash(&public, t, &expected);
         }
         assert_eq!(short[c], expected, "short chain {c}");
@@ -331,7 +330,7 @@ fn streaming_boundaries_and_fragmented_readers_match_slices() {
         }
     }
 
-    let ck = ContentKey::from_vk_bytes(vk.as_bytes());
+    let ck = derive_key(CTX_CONTENT, vk.as_bytes());
     // Immediate I/O errors propagate cleanly.
     let err = content_from_reader(&ck, &[0u8; N], FailingReader::default()).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::BrokenPipe);
@@ -644,14 +643,15 @@ fn reentrant_reader_can_sign_and_verify_without_borrowing_panic() {
 
 #[test]
 fn checked_constructors_reject_out_of_range_values() {
-    let max_tree = TreeIndex::new((1u64 << 48) - 1);
-    assert_eq!(max_tree.to_le_6(), [0xff; 6]);
-    assert!(catch_unwind(|| TreeIndex::new(1u64 << 48)).is_err());
+    let max_t = tweak(TweakKind::Node, 0, (1u64 << 48) - 1, 0, 0, 0);
+    assert_eq!(&max_t[2..8], &[0xff; 6]);
+    assert!(catch_unwind(|| tweak(TweakKind::Node, 0, 1u64 << 48, 0, 0, 0)).is_err());
 
-    let _ = Pos::new(Layer::L0, TreeIndex::ZERO, 127);
-    assert!(catch_unwind(|| Pos::new(Layer::L0, TreeIndex::ZERO, 128)).is_err());
-    let _ = Pos::new(Layer::TOP, TreeIndex::ZERO, 4095);
-    assert!(catch_unwind(|| Pos::new(Layer::TOP, TreeIndex::ZERO, 4096)).is_err());
+    let _ = Pos::new(Layer::L0, (1u64 << 48) - 1, 127);
+    assert!(catch_unwind(|| Pos::new(Layer::L0, 1u64 << 48, 0)).is_err());
+    assert!(catch_unwind(|| Pos::new(Layer::L0, 0, 128)).is_err());
+    let _ = Pos::new(Layer::TOP, 0, 4095);
+    assert!(catch_unwind(|| Pos::new(Layer::TOP, 0, 4096)).is_err());
 
     // Stream length overflow helper (u64::MAX boundary).
     assert_eq!(checked_add_stream_len(u64::MAX - 10, 10).unwrap(), u64::MAX);
@@ -722,7 +722,7 @@ fn oversized_read_return_fails_stop() {
 
     let sk = SigningKey::from_seed(&[0x66u8; SEED_LEN]);
     let vk = sk.verifying_key();
-    let ck = ContentKey::from_vk_bytes(vk.as_bytes());
+    let ck = derive_key(CTX_CONTENT, vk.as_bytes());
 
     // Oversized Read return panics fail-stop in small path, Pipeline path, and state reader.
     assert!(catch_unwind(|| content_from_reader(&ck, &[0u8; N], OversizedReader { prefix: 0 })).is_err());

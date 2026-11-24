@@ -16,9 +16,8 @@ src/
   content.rs            Single-pass salted BLAKE3 content hashing (multi-core slices & zero-copy Pipeline streams)
   few_time.rs           FORS few-time signatures (16 trees x 1,024 leaves, zero grinding)
   one_time.rs           WOTS+ nibble one-time signatures (w = 16, 35 chains, zero grinding) and Merkle trees
-  pool.rs               Crash-only dynamic work-stealing thread pool for top-tree keygen and signing waves
+  pool.rs               Crash-only parallel task runner and per-thread scratch workspaces (zero Drop impls)
   randomness.rs         48-byte state file (create, initialize) and in-memory draws
-  workspace.rs          Crash-only per-thread scratch workspaces (zero Drop implementations)
   test.rs               Unit tests, reference vector checks, negative tests
 tests/
   integration.rs        Public API tests and live Python cross-verification

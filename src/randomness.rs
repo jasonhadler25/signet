@@ -28,8 +28,7 @@ fn read_os_randomness() -> io::Result<[u8; 32]> {
     Ok(bytes)
 }
 
-/// Capture opaque local diversification bytes from the system monotonic clock (`Instant::hash`,
-/// without unsafe code or external dependencies).
+/// Capture opaque local diversification bytes from the system monotonic clock (`Instant::hash`).
 pub(crate) fn read_monotonic_clock() -> Vec<u8> {
     struct Collect(Vec<u8>);
     impl Hasher for Collect {
@@ -48,34 +47,11 @@ pub(crate) fn read_monotonic_clock() -> Vec<u8> {
 
 pub(crate) fn read_exact_or_reject(reader: &mut impl Read) -> io::Result<[u8; STATE_LEN]> {
     let mut buf = [0u8; STATE_LEN + 1];
-    let mut filled = 0;
-    while filled < buf.len() {
-        let slice = &mut buf[filled..];
-        match reader.read(slice) {
-            Ok(0) => break,
-            Ok(n) => {
-                assert!(n <= slice.len(), "Read implementation returned more bytes than buffer length");
-                filled += n;
-            }
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
+    let (filled, _) = crate::content::fill_buf(reader, &mut buf, 0, &mut 0)?;
     if filled != STATE_LEN || &buf[..8] != MAGIC {
         return Err(io::Error::new(ErrorKind::InvalidData, "not a BLINCS randomness state file"));
     }
-    let mut state = [0u8; STATE_LEN];
-    state.copy_from_slice(&buf[..STATE_LEN]);
-    Ok(state)
-}
-
-#[derive(Clone, Copy)]
-struct RunKey([u8; 32]);
-
-impl RunKey {
-    fn draw_at(&self, count: u64) -> [u8; 32] {
-        keyed(&self.0, &count.to_le_bytes())
-    }
+    Ok(buf[..STATE_LEN].try_into().unwrap())
 }
 
 /// Per-process signer randomness, backed by a 48-byte persistent state file updated once at startup.
@@ -89,7 +65,7 @@ impl RunKey {
 /// not inherit background worker threads). After restoring a live VM snapshot, call
 /// [`Randomness::initialize`] again so cloned images do not share the same `(run_key, count)` sequence.
 pub struct Randomness {
-    run_key: RunKey,
+    run_key: [u8; 32],
     count: AtomicU64,
 }
 
@@ -116,7 +92,6 @@ impl Randomness {
         let mut file = opts.open(path)?;
         let mut state = [0u8; STATE_LEN];
         state[..8].copy_from_slice(MAGIC);
-        state[8..16].copy_from_slice(&0u64.to_le_bytes());
         state[16..48].copy_from_slice(&os_bytes);
         file.write_all(&state)?;
         file.sync_all()?;
@@ -129,8 +104,7 @@ impl Randomness {
     }
 
     /// Open an existing regular state file at `path`, mix it with OS randomness and the monotonic clock,
-    /// write the updated counter and seed in place (without `fsync`), and return the in-memory generator
-    /// for this run.
+    /// write the updated counter and seed in place (without `fsync`), and return the in-memory generator.
     pub fn initialize(path: impl AsRef<Path>) -> io::Result<Self> {
         ensure_init();
         let mut file = OpenOptions::new().read(true).write(true).open(path.as_ref())?;
@@ -142,26 +116,24 @@ impl Randomness {
         let old_count = u64::from_le_bytes(state[8..16].try_into().unwrap());
         let new_count = old_count.checked_add(1).ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "randomness state counter exhausted"))?;
         let old_seed: [u8; 32] = state[16..48].try_into().unwrap();
-        let os_bytes = read_os_randomness()?;
-        let clock_bytes = read_monotonic_clock();
-        let (next_seed, run_key) = mix(&old_seed, new_count, &os_bytes, &clock_bytes);
+        let (next_seed, run_key) = mix(&old_seed, new_count, &read_os_randomness()?, &read_monotonic_clock());
         let mut updated = [0u8; 40];
         updated[..8].copy_from_slice(&new_count.to_le_bytes());
         updated[8..40].copy_from_slice(&next_seed);
         file.seek(SeekFrom::Start(8))?;
         file.write_all(&updated)?;
-        Ok(Self { run_key: RunKey(run_key), count: AtomicU64::new(0) })
+        Ok(Self { run_key, count: AtomicU64::new(0) })
     }
 
     #[cfg(test)]
     pub(crate) fn from_run_key_at(run_key: [u8; 32], start: u64) -> Self {
-        Self { run_key: RunKey(run_key), count: AtomicU64::new(start) }
+        Self { run_key, count: AtomicU64::new(start) }
     }
 
     /// Draw a fresh 32-byte per-signature value from memory alone.
     pub(crate) fn draw(&self) -> [u8; 32] {
         ensure_init();
         let n = self.count.try_update(Ordering::Relaxed, Ordering::Relaxed, |c| c.checked_add(1)).expect("randomness draw counter exhausted");
-        self.run_key.draw_at(n)
+        keyed(&self.run_key, &n.to_le_bytes())
     }
 }
