@@ -4,4 +4,4 @@
 # Every entry must name a real surviving mutant; stale entries fail tools/mutants/check.py.
 
 src/randomness.rs	replace read_monotonic_clock::<impl Hasher for Collect>::finish -> u64 with 1	[functional-equiv] Hasher::finish is never called; Instant::now().hash only invokes Hasher::write.
-src/randomness.rs	replace match guard !p.as_os_str().is_empty() with false in Randomness::create	[durability] Syncs "." instead of path.parent() when both are readable; affects directory-sync target only.
+src/randomness.rs	replace match guard e.kind() == ErrorKind::AlreadyExists with true in write_next_seed	[dispatch/resource] Testing a non-AlreadyExists I/O error turns this guard-to-true mutant into an infinite loop (timeout) on the unbounded collision-rehash loop; AlreadyExists collision re-hash is directly tested.

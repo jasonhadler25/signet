@@ -14,9 +14,9 @@ src/
   lib.rs                Public API (Signet, SignetId, Imprint)
   params.rs             Constants, contexts, 16-byte tweaks, key helpers
   content.rs            Single-pass salted BLAKE3 content hashing (single-threaded slices & 16 KiB stack streams)
-  few_time.rs           FORS few-time signatures (16 trees x 1,024 leaves, zero grinding)
-  one_time.rs           WOTS+ nibble one-time signatures (w = 16, 35 chains, zero grinding), Merkle trees, SignWorkspace
-  randomness.rs         48-byte state file (create, initialize) and in-memory draws
+  few_time.rs           FORS few-time signatures (13 trees x 2,048 leaves, zero grinding)
+  one_time.rs           WOTS+ nibble one-time signatures (w = 16, 35 chains, zero grinding), uniform height-7 trees, SignWorkspace
+  randomness.rs         Lock-free content-addressed seed directory (create, initialize) and in-memory draws
   test.rs               Unit tests, reference vector checks, negative tests
 tests/
   integration.rs        Public API tests and live Python cross-verification
@@ -43,7 +43,7 @@ audits/                 Unedited cross-family review reports
 - **Design by Contract:** document preconditions and fail stop on broken invariants; avoid defensive fallback modes that hide bugs.
 - **Crash-only:** avoid shutdown hooks and per-call allocate-and-drop cycles for reusable buffers.
 - **Zero `unsafe`:** the library crate enforces `#![forbid(unsafe_code)]`.
-- **Terminology:** call the 32-byte secret bearer object a **signet** (`Signet`), its 32-byte public identifier a **signet ID** (`SignetId`) — never "public key" — and the 5,616-byte proof an **imprint** (`Imprint`).
+- **Terminology:** call the 32-byte secret bearer object a **signet** (`Signet`), its 32-byte self-certifying identifier a **signet ID** (`SignetId`) — never "public key" — and the 5,888-byte proof an **imprint** (`Imprint`).
 - **Two hashes:** whenever recording or checking a file digest, record both SHA-256 and BLAKE3.
 - **Measurement:** time changes with `bench/` (`clocks`: wall time, core cycles, clock speed, and background load together).
 

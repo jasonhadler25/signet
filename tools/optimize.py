@@ -191,27 +191,26 @@ def fmt_row(c):
 
 
 def run_check():
-    # Verify current SPEC.md implementation (12+3x7, w=16, FORS(10,16)) size, FORS cover curve, and 1T M6 calibration.
-    c = eval_candidate(12, 4, 7, 4, 10, 16)
-    assert c["bytes"] == 5616, c["bytes"]
-    f32 = fors_security_bits(1 << 32, 33, 10, 16)
-    f33 = fors_security_bits(1 << 33, 33, 10, 16)
-    f34 = fors_security_bits(1 << 34, 33, 10, 16)
-    f35 = fors_security_bits(1 << 35, 33, 10, 16)
-    assert abs(f32 - 133.1701) < 1e-3, f32
-    assert abs(f33 - 126.7908) < 1e-3, f33
-    assert abs(f34 - 119.3346) < 1e-3, f34
-    assert abs(f35 - 110.6233) < 1e-3, f35
-    assert abs(c["m6_kg_ms"] - 20.53) < 1.5, c["m6_kg_ms"]
-    assert abs(c["m6_sign_ms"] - 2.54) < 0.35, c["m6_sign_ms"]
-    assert abs(c["m6_ver_us"] - 21.3) < 2.5, c["m6_ver_us"]
-    # Also verify the constrained-device search finds feasible candidates cleanly.
+    # Verify current SPEC.md implementation (uniform 5x7, w=16, FORS(11,13)) size, FORS cover curve, and 1T M6 calibration.
+    c = eval_candidate(7, 5, 7, 4, 11, 13)
+    if c["bytes"] != 5888:
+        raise RuntimeError(f"unexpected bytes {c['bytes']}")
+    f32 = fors_security_bits(1 << 32, 35, 11, 13)
+    f33 = fors_security_bits(1 << 33, 35, 11, 13)
+    f34 = fors_security_bits(1 << 34, 35, 11, 13)
+    f35 = fors_security_bits(1 << 35, 35, 11, 13)
+    f36 = fors_security_bits(1 << 36, 35, 11, 13)
+    if not (abs(f32 - 132.5006) < 1e-3 and abs(f33 - 128.4523) < 1e-3 and abs(f34 - 123.7671) < 1e-3 and abs(f35 - 118.3066) < 1e-3 and abs(f36 - 111.9204) < 1e-3):
+        raise RuntimeError(f"unexpected FORS curve {f32}/{f33}/{f34}/{f35}/{f36}")
+    if not (abs(c["m6_kg_ms"] - 0.65) < 0.2 and abs(c["m6_sign_ms"] - 3.47) < 0.4 and abs(c["m6_ver_us"] - 26.3) < 3.0):
+        raise RuntimeError(f"unexpected M6 1T calibration: kg={c['m6_kg_ms']} sign={c['m6_sign_ms']} ver={c['m6_ver_us']}")
     feasible, pareto = search_feasible(1 << 32, 128.0, 3.0, 12.0, 5950)
-    assert len(feasible) > 0 and len(pareto) > 0
+    if not (feasible and pareto):
+        raise RuntimeError("constrained search returned no feasible candidates")
     print(
-        f"CHECK PASSED: current SPEC 12+3x7 ({c['bytes']} B, {c['top_kib']:.0f} KiB top tree, ST33 kg={c['ledger_kg_s']:.1f}s unc={c['ledger_sign_s']:.1f}s) | "
-        f"FORS={f32:.1f}/{f33:.1f}/{f34:.1f}/{f35:.1f}b (2^32..2^35) | "
-        f"M6-1T kg={c['m6_kg_ms']:.2f}ms (meas 20.53), sign={c['m6_sign_ms']:.2f}ms (meas 2.54), ver={c['m6_ver_us']:.1f}us (meas 21.3) | "
+        f"CHECK PASSED: adopted SPEC 5x7 ({c['bytes']} B, {c['top_kib']:.0f} KiB top tree, ST33 kg={c['ledger_kg_s']:.1f}s unc={c['ledger_sign_s']:.1f}s) | "
+        f"FORS={f32:.1f}/{f33:.1f}/{f34:.1f}/{f35:.1f}/{f36:.1f}b (2^32..2^36) | "
+        f"M6-1T kg={c['m6_kg_ms']:.2f}ms (meas 0.65), sign={c['m6_sign_ms']:.2f}ms (meas 3.47), ver={c['m6_ver_us']:.1f}us (meas 26.3) | "
         f"constrained search (<=3s kg, <=12s sign on ST33, <=5950 B): {len(feasible)} feasible / {len(pareto)} Pareto."
     )
 

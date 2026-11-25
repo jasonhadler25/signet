@@ -1,36 +1,36 @@
 #!/usr/bin/env python3
-"""BLINCS — reference implementation from SPEC.md.
+"""BLINCS — reference implementation from SPEC.md (educational / vector conformance only).
 
 Self-contained except for reference/blake3.py (BLAKE3 from its spec).
 """
 
-import concurrent.futures
 import hmac
-import os
 import sys
 
 import blake3
 
 N = 16
-LAYERS, LOWER_HEIGHT, TOP_HEIGHT = 4, 7, 12
+LAYERS, TREE_HEIGHT = 5, 7
 W, CHAIN_STEPS, MSG_CHAINS, CSUM_CHAINS, CHAINS = 16, 15, 32, 3, 35
-FORS_HEIGHT, FORS_TREES = 10, 16
-HYPER_BITS = TOP_HEIGHT + (LAYERS - 1) * LOWER_HEIGHT
+FORS_HEIGHT, FORS_TREES = 11, 13
+HYPER_BITS = LAYERS * TREE_HEIGHT
 FORS_LEN = FORS_TREES * (1 + FORS_HEIGHT) * N
-LOWER_LAYER_LEN = (CHAINS + LOWER_HEIGHT) * N
-TOP_LAYER_LEN = (CHAINS + TOP_HEIGHT) * N
-IMPRINT_LEN = 2 * N + FORS_LEN + (LAYERS - 1) * LOWER_LAYER_LEN + TOP_LAYER_LEN
+LAYER_LEN = (CHAINS + TREE_HEIGHT) * N
+IMPRINT_LEN = 2 * N + FORS_LEN + LAYERS * LAYER_LEN
 
 # Key-derivation contexts (SPEC.md, "Key-derivation contexts").
-CTX_SECRET_VALUES = "BLINCS 2026-11-24 signet: secret values"
-CTX_CONTENT_SALT = "BLINCS 2026-11-24 signet: content salt"
-CTX_RANDOMIZER = "BLINCS 2026-11-24 signet: randomizer"
-CTX_PUBLIC_SEED = "BLINCS 2026-11-24 signet: public seed"
-CTX_PUBLIC_HASH = "BLINCS 2026-11-24 public hash"
-CTX_CONTENT = "BLINCS 2026-11-24 content"
-CTX_MIX = "BLINCS 2026-11-24 randomness: mix"
-CTX_NEXT_SEED = "BLINCS 2026-11-24 randomness: seed kept in the file"
-CTX_RUN_KEY = "BLINCS 2026-11-24 randomness: key of this run"
+CTX_SECRET_VALUES = "BLINCS 2026-11-25 signet: secret values"
+CTX_CONTENT_SALT = "BLINCS 2026-11-25 signet: content salt"
+CTX_RANDOMIZER = "BLINCS 2026-11-25 signet: randomizer"
+CTX_PUBLIC_SEED = "BLINCS 2026-11-25 signet: public seed"
+CTX_GENERATE_SIGNET = "BLINCS 2026-11-25 signet: generate"
+CTX_PUBLIC_HASH = "BLINCS 2026-11-25 public hash"
+CTX_CONTENT = "BLINCS 2026-11-25 content"
+CTX_MIX = "BLINCS 2026-11-25 randomness: mix"
+CTX_FILE_ID = "BLINCS 2026-11-25 randomness: file id"
+CTX_NEXT_SEED = "BLINCS 2026-11-25 randomness: next seed"
+CTX_RUN_KEY = "BLINCS 2026-11-25 randomness: key of this run"
+CTX_KEYGEN_KEY = "BLINCS 2026-11-25 randomness: keygen key"
 
 # Tweak kinds (SPEC.md, "Tweaks").
 KIND_CHAIN_SECRET, KIND_CHAIN, KIND_ONE_TIME_KEY, KIND_NODE = 1, 2, 3, 4
@@ -87,9 +87,9 @@ def digits(node):
 
 
 def parse_digest(digest):
-    """16 ten-bit FORS leaf indices (digest[:20]) and 33-bit hypertree leaf address (digest[20:28])."""
-    fors_bits = int.from_bytes(digest[:20], "little")
-    indices = [(fors_bits >> (10 * j)) & 0x3FF for j in range(FORS_TREES)]
+    """13 eleven-bit FORS leaf indices (digest[:18], low 143 bits) and 35-bit leaf address (digest[20:28])."""
+    fors_bits = int.from_bytes(digest[:18], "little")
+    indices = [(fors_bits >> (FORS_HEIGHT * j)) & 0x7FF for j in range(FORS_TREES)]
     leaf_addr = int.from_bytes(digest[20:28], "little") & ((1 << HYPER_BITS) - 1)
     return indices, leaf_addr
 
@@ -100,11 +100,6 @@ def one_time_leaf(secret, public, layer, tree, leaf):
         s = H(secret, tweak(KIND_CHAIN_SECRET, layer, tree, leaf, c, 0))
         ends.append(chain(public, layer, tree, leaf, c, s, 0, CHAIN_STEPS))
     return H(public, tweak(KIND_ONE_TIME_KEY, layer, tree, leaf), b"".join(ends))
-
-
-def _wots_leaf_range(args):
-    secret, public, layer, tree, start, count = args
-    return [one_time_leaf(secret, public, layer, tree, leaf) for leaf in range(start, start + count)]
 
 
 def merkle_tree(public, kind, layer, tree, extra_leaf, leaves):
@@ -127,21 +122,34 @@ def content(content_key, salt, message):
     return salt + blake3.keyed_hash(msg_key, message)
 
 
-def mix(seed, count, system, clock):
-    seed = _check_len("seed", seed, 32)
+def mix_pool(seeds, system, clock):
     system = _check_len("system", system, 32)
     clock = _to_bytes("clock", clock)
-    if not isinstance(count, int) or isinstance(count, bool) or not (0 <= count < 1 << 64):
-        raise ValueError("count must be a u64")
-    pool = blake3.derive_key(CTX_MIX, seed + count.to_bytes(8, "little") + system + clock)
-    return blake3.derive_key(CTX_NEXT_SEED, pool), blake3.derive_key(CTX_RUN_KEY, pool)
+    parts = []
+    for s in seeds:
+        sb = _to_bytes("seed", s)
+        if len(sb) > 32:
+            raise ValueError(f"seed file exceeds 32 bytes: {len(sb)}")
+        parts.append(bytes([len(sb)]) + sb)
+    material = b"".join(parts) + b"\xff" + system + clock
+    return blake3.derive_key(CTX_MIX, material)
 
 
-def draw(run_key, count):
-    run_key = _check_len("run_key", run_key, 32)
+def expand_pool(pool):
+    pool = _check_len("pool", pool, 32)
+    return (
+        blake3.derive_key(CTX_FILE_ID, pool)[:N],
+        blake3.derive_key(CTX_NEXT_SEED, pool),
+        blake3.derive_key(CTX_RUN_KEY, pool),
+        blake3.derive_key(CTX_KEYGEN_KEY, pool),
+    )
+
+
+def draw(key, count):
+    key = _check_len("key", key, 32)
     if not isinstance(count, int) or isinstance(count, bool) or not (0 <= count < 1 << 64):
         raise ValueError("count must be a u64")
-    return blake3.keyed_hash(run_key, count.to_bytes(8, "little"))
+    return blake3.keyed_hash(key, count.to_bytes(8, "little"))
 
 
 class SignetId:
@@ -178,12 +186,11 @@ class SignetId:
             fors_roots.append(cur)
         node = H(self.public, tweak(KIND_FEW_ROOT, 0, leaf_addr), b"".join(fors_roots))
 
-        # Hypertree verification
+        # Hypertree verification (5 uniform height-7 layers)
         addr = leaf_addr
         for layer in range(LAYERS):
-            height = TOP_HEIGHT if layer == LAYERS - 1 else LOWER_HEIGHT
-            leaf = addr & ((1 << height) - 1)
-            tree = addr >> height
+            leaf = addr & ((1 << TREE_HEIGHT) - 1)
+            tree = addr >> TREE_HEIGHT
             ds = digits(node)
             ends = []
             for c, d in enumerate(ds):
@@ -192,7 +199,7 @@ class SignetId:
                 ends.append(chain(self.public, layer, tree, leaf, c, val, d, CHAIN_STEPS - d))
             cur = H(self.public, tweak(KIND_ONE_TIME_KEY, layer, tree, leaf), b"".join(ends))
             idx = leaf
-            for level in range(1, height + 1):
+            for level in range(1, TREE_HEIGHT + 1):
                 sib = imprint[at : at + N]
                 at += N
                 pair = cur + sib if idx % 2 == 0 else sib + cur
@@ -212,15 +219,7 @@ class Signet:
         public_seed = blake3.derive_key(CTX_PUBLIC_SEED, seed)[:N]
         self.public = blake3.derive_key(CTX_PUBLIC_HASH, public_seed)
 
-        top_n = 1 << TOP_HEIGHT
-        workers = min(os.cpu_count() or 1, 12)
-        if workers > 1:
-            chunk = 512
-            tasks = [(self.secret, self.public, LAYERS - 1, 0, start, chunk) for start in range(0, top_n, chunk)]
-            with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as ex:
-                top_leaves = [leaf for batch in ex.map(_wots_leaf_range, tasks) for leaf in batch]
-        else:
-            top_leaves = _wots_leaf_range((self.secret, self.public, LAYERS - 1, 0, 0, top_n))
+        top_leaves = [one_time_leaf(self.secret, self.public, LAYERS - 1, 0, leaf) for leaf in range(1 << TREE_HEIGHT)]
         self.top_levels = merkle_tree(self.public, KIND_NODE, LAYERS - 1, 0, 0, top_leaves)
         self.id = SignetId(public_seed + self.top_levels[-1][0])
 
@@ -249,54 +248,48 @@ class Signet:
             fors_roots.append(levels[-1][0])
         node = H(public, tweak(KIND_FEW_ROOT, 0, leaf_addr), b"".join(fors_roots))
 
-        # Hypertree imprint
+        # Hypertree imprint (5 uniform height-7 layers)
         addr = leaf_addr
         for layer in range(LAYERS):
-            height = TOP_HEIGHT if layer == LAYERS - 1 else LOWER_HEIGHT
-            leaf = addr & ((1 << height) - 1)
-            tree = addr >> height
+            leaf = addr & ((1 << TREE_HEIGHT) - 1)
+            tree = addr >> TREE_HEIGHT
             if layer == LAYERS - 1:
                 levels = self.top_levels
             else:
-                leaves = [one_time_leaf(self.secret, public, layer, tree, i) for i in range(1 << height)]
+                leaves = [one_time_leaf(self.secret, public, layer, tree, i) for i in range(1 << TREE_HEIGHT)]
                 levels = merkle_tree(public, KIND_NODE, layer, tree, 0, leaves)
-            ds = digits(node)
-            for c, d in enumerate(ds):
+            for c, d in enumerate(digits(node)):
                 s = H(self.secret, tweak(KIND_CHAIN_SECRET, layer, tree, leaf, c, 0))
                 out += chain(public, layer, tree, leaf, c, s, 0, d)
-            for level in range(height):
+            for level in range(TREE_HEIGHT):
                 out += levels[level][(leaf >> level) ^ 1]
             node = levels[-1][0]
             addr = tree
-
-        imp = bytes(out)
-        if len(imp) != IMPRINT_LEN or not hmac.compare_digest(node, sid.root) or not sid.verify(message, imp):
-            raise RuntimeError("internal error: generated imprint failed self-check")
-        return imp
+        if len(out) != IMPRINT_LEN:
+            raise AssertionError(f"unexpected imprint length {len(out)}")
+        return bytes(out)
 
 
-def _cli():
-    args = sys.argv[1:]
-    if len(args) == 5 and args[0] == "imprint":
-        seed, draw_bytes = bytes.fromhex(args[1]), bytes.fromhex(args[2])
-        msg = open(args[3], "rb").read()
-        signet = Signet(seed)
-        imp = signet.imprint(msg, draw_bytes)
-        open(args[4], "wb").write(imp)
-        print(f"signet_id: {signet.id.bytes.hex()}")
-        print(f"imprint:   {len(imp)} bytes -> {args[4]}")
-    elif len(args) == 4 and args[0] == "verify":
-        sid = SignetId(bytes.fromhex(args[1]))
-        msg = open(args[2], "rb").read()
-        imp = open(args[3], "rb").read()
+def main(argv):
+    if len(argv) == 5 and argv[1] == "verify":
+        sid = SignetId(bytes.fromhex(argv[2]))
+        msg = open(argv[3], "rb").read()
+        imp = open(argv[4], "rb").read()
         ok = sid.verify(msg, imp)
-        print("OK" if ok else "INVALID")
-        sys.exit(0 if ok else 1)
-    else:
-        print("usage: blincs.py imprint <seed-hex> <draw-hex> <msg-file> <imprint-out>")
-        print("       blincs.py verify <signet-id-hex> <msg-file> <imprint-file>")
-        sys.exit(2)
+        print("VALID" if ok else "INVALID")
+        return 0 if ok else 1
+    if len(argv) == 6 and argv[1] == "imprint":
+        signet = Signet(bytes.fromhex(argv[2]))
+        draw_bytes = bytes.fromhex(argv[3])
+        msg = open(argv[4], "rb").read()
+        imp = signet.imprint(msg, draw_bytes)
+        open(argv[5], "wb").write(imp)
+        print(signet.id.bytes.hex())
+        return 0
+    print(f"usage: {argv[0]} verify <signet_id_hex> <msg_path> <imprint_path>", file=sys.stderr)
+    print(f"       {argv[0]} imprint <seed_hex> <draw_hex> <msg_path> <imprint_out_path>", file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":
-    _cli()
+    sys.exit(main(sys.argv))

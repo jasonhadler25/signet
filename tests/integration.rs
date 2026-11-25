@@ -25,22 +25,21 @@ fn to_hex(bytes: &[u8]) -> String {
 #[test]
 fn public_api_round_trip_and_python_reference_cross_check() {
     let dir = temp_dir("cross-check");
-    let state = dir.join("state.bin");
-    Randomness::create(&state).unwrap();
-    let rng = Randomness::initialize(&state).unwrap();
+    let state_dir = dir.join("state.d");
+    Randomness::create(&state_dir).unwrap();
+    let rng = Randomness::initialize(&state_dir).unwrap();
 
-    let seed = [0x5au8; SEED_LEN];
-    let sk = Signet::from_seed(&seed);
-    let vk = SignetId::from_bytes(sk.id().as_bytes());
-    let vk_hex = to_hex(vk.as_bytes());
+    let publisher = Signet::generate(&rng).unwrap();
+    let expected_publisher = SignetId::from_bytes(publisher.id().as_bytes());
+    let vk_hex = to_hex(expected_publisher.as_bytes());
 
     let py = concat!(env!("CARGO_MANIFEST_DIR"), "/reference/blincs.py");
 
     for (name, len) in [("empty", 0usize), ("small", 43), ("64k", 64 * 1024), ("512k-plus", 512 * 1024 + 123)] {
         let msg: Vec<u8> = (0..len).map(|i| u8::try_from((i * 73 + 11) & 0xff).unwrap()).collect();
-        let sig = sk.imprint(&rng, &msg);
-        assert!(vk.verify(&msg, &sig));
-        assert!(vk.verify_reader(Cursor::new(&msg), &sig).unwrap());
+        let sig = publisher.imprint(&rng, &msg);
+        assert!(expected_publisher.verify(&msg, &sig));
+        assert!(expected_publisher.verify_reader(Cursor::new(&msg), &sig).unwrap());
 
         let msg_path = dir.join(format!("{name}.msg"));
         let sig_path = dir.join(format!("{name}.sig"));
@@ -50,7 +49,6 @@ fn public_api_round_trip_and_python_reference_cross_check() {
         let out = Command::new("python3").args([py, "verify", &vk_hex, msg_path.to_str().unwrap(), sig_path.to_str().unwrap()]).output().unwrap();
         assert!(out.status.success(), "python reference rejected Rust signature for {name}: {}", String::from_utf8_lossy(&out.stderr));
 
-        // Flip one byte in the signature and confirm Python reference rejects it too.
         let mut bad = *sig.as_bytes();
         bad[100] ^= 1;
         let bad_path = dir.join(format!("{name}.bad.sig"));
@@ -62,11 +60,17 @@ fn public_api_round_trip_and_python_reference_cross_check() {
     }
 
     // Two signatures of the same message have distinct salts (different draws).
-    let s1 = sk.imprint(&rng, b"same message");
-    let s2 = sk.imprint_reader(&rng, Cursor::new(b"same message")).unwrap();
+    let s1 = publisher.imprint(&rng, b"same message");
+    let s2 = publisher.imprint_reader(&rng, Cursor::new(b"same message")).unwrap();
     assert_ne!(&s1.as_bytes()[..16], &s2.as_bytes()[..16]);
-    assert!(vk.verify(b"same message", &s1));
-    assert!(vk.verify(b"same message", &s2));
+    assert!(expected_publisher.verify(b"same message", &s1));
+    assert!(expected_publisher.verify(b"same message", &s2));
+
+    // A valid imprint from a different publisher must be rejected.
+    let other_publisher = Signet::generate(&rng).unwrap();
+    let other_imprint = other_publisher.imprint(&rng, b"same message");
+    assert!(other_publisher.id().verify(b"same message", &other_imprint));
+    assert!(!expected_publisher.verify(b"same message", &other_imprint));
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -76,7 +80,7 @@ fn reference_vector_verifies_via_public_api() {
     let raw = fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/test_vectors/reference-imprint-1.bin")).unwrap();
     let sig = Imprint::try_from(raw.as_slice()).unwrap();
     let seed: [u8; SEED_LEN] = core::array::from_fn(|i| u8::try_from(i).unwrap());
-    let vk = Signet::from_seed(&seed).id();
-    assert!(vk.verify(b"hello, BLINCS", &sig));
-    assert!(!vk.verify(b"hello, blincs", &sig));
+    let expected_publisher = Signet::from_seed(&seed).id();
+    assert!(expected_publisher.verify(b"hello, BLINCS", &sig));
+    assert!(!expected_publisher.verify(b"hello, blincs", &sig));
 }

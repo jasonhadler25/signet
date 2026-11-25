@@ -1,6 +1,6 @@
 # BLINCS
 
-**BLINCS** is a post-quantum digital signature library for Rust, based on BLAKE3 and SPHINCS. It is hash-based: it relies only on BLAKE3 and this SPHINCS-family construction, with no elliptic curves or lattices. Each signet (signing key) is sized for a budget of **2³² signatures**. That budget buys **5,616-byte imprints** (signatures) and **32-byte signet IDs** (verifying keys). Running strictly on a single core (`blake3-servil-core`, zero background worker threads), signing takes **~2.54 ms** and verifying takes **~21.3 µs** on an Apple M6.
+**BLINCS** is a post-quantum digital signature library for Rust, based on BLAKE3 and SPHINCS. It is hash-based: it relies only on BLAKE3 and this SPHINCS-family construction, with no elliptic curves or lattices. Each signet (signing key) is sized for a budget of **2³² signatures**. That budget — tuned for Good Enough UX on constrained signing hardware like Ledger Secure Elements while keeping desktop costs low — buys **5,888-byte imprints** (signatures), **32-byte signet IDs** (verifying keys), and a **4 KiB** top tree (`0.65 ms` startup). Running strictly on a single core (`blake3-servil-core`, zero background worker threads), signing takes **~3.47 ms** (`4.12 ms` cold 1-shot) and verifying takes **~26.3 µs** on an Apple M6.
 
 > **Pre-1.0: Experimental & Unsupported.**
 >
@@ -19,7 +19,7 @@
 | **ML-DSA-44** | 1,312 B | 2,420 B | not measured here | not measured here | No comparable per-key budget | Module lattices + hash | FIPS 204 (2024) |
 | **SLH-DSA-128s** | 32 B | 7,856 B | 75.5–548 ms (warm) | 74–509 µs | 2⁶⁴ | Hash function | FIPS 205 (2024) |
 | **SLH-DSA-128f** | 32 B | 17,088 B | 3.6–26.3 ms (warm) | 220–1,540 µs | 2⁶⁴ | Hash function | FIPS 205 (2024) |
-| **BLINCS** | **32 B** | **5,616 B** | **2.54 ms** (warm); 23.1 ms cold | **21.3 µs** | **2³²** (degrades gradually past it) | BLAKE3 + this SPHINCS-family construction | No standard; pre-1.0; no human audit |
+| **BLINCS** | **32 B** | **5,888 B** | **3.47 ms** (warm); **4.12 ms** cold | **26.3 µs** | **2³²** (degrades gradually past it) | BLAKE3 + this SPHINCS-family construction | No standard; pre-1.0; no human audit |
 
 **How to read the timings:**
 
@@ -28,14 +28,14 @@
 - SLH-DSA ranges span the SHA2, BLAKE3, and SHAKE variants of [PQC Suite B](https://github.com/PQC-Suite-B/signatures), which builds on RustCrypto's `slh-dsa`.
 - Full methodology and cycle counts are in [`BENCHMARKS.md`](BENCHMARKS.md).
 
-A BLINCS imprint is 7,488 bytes in Base64.
+A BLINCS imprint is 7,852 bytes in Base64.
 
 ### When to choose BLINCS — and when not to
 
 **BLINCS may fit when:**
 
 - you want hash-based post-quantum signatures without curve or lattice assumptions;
-- you want signatures smaller than SLH-DSA's (29% smaller than `128s`, 3× smaller than `128f`) and fast single-core signing and verification, with the same 32-byte verifying key;
+- you want signatures smaller than SLH-DSA's (25% smaller than `128s`, 2.9× smaller than `128f`), fast single-core signing and verification, and a tiny 4 KiB top tree that fits constrained signing hardware;
 - your volume fits 2³² signatures per signet;
 - you control both signer and verifier;
 - you are prototyping or experimenting while BLINCS is pre-1.0.
@@ -55,10 +55,10 @@ A BLINCS imprint is 7,488 bytes in Base64.
 A cryptographic key is a transferable bearer authority, not a person's handwritten signature, so BLINCS names its pieces accordingly:
 
 - a `Signet` is the signing key;
-- a `SignetId` is the 32-byte verifying key that names a signet and checks its work;
-- an `Imprint` is the 5,616-byte signature.
+- a `SignetId` is a publisher's self-certifying 32-byte identifier and its complete BLINCS verifying key;
+- an `Imprint` is the 5,888-byte signature.
 
-Whoever holds a signet's seed can sign as that signet, so guard the seed accordingly.
+Whoever holds a signet's seed can sign as that signet, so guard the seed accordingly. Receiving a `SignetId` does not authenticate the sender — obtain the expected `SignetId` from a pinned or authenticated channel.
 
 **Add the dependency.** BLINCS uses Rust 2024 edition:
 
@@ -72,21 +72,21 @@ Formats can change between pre-1.0 commits. Add `rev = "…"` with a commit you 
 **Provision once per signer host**, as a setup step before any signer starts:
 
 ```rust
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 
-use blincs::{Randomness, SEED_LEN};
+use blincs::{Randomness, Signet};
 
 fn main() -> io::Result<()> {
-    // The 48-byte randomness state file. Refuses to overwrite an existing file.
-    Randomness::create("blincs.state")?;
+    // Private seed directory (0700). Refuses to overwrite an existing path.
+    Randomness::create("blincs.state.d")?;
+    let rng = Randomness::initialize("blincs.state.d")?;
 
-    // The 32-byte seed, from the OS CSPRNG, is the only signing secret.
-    // Prefer a secrets manager; never derive it from a password.
-    let mut seed = [0u8; SEED_LEN];
-    File::open("/dev/urandom")?.read_exact(&mut seed)?;
-    OpenOptions::new().write(true).create_new(true).mode(0o600).open("signet.seed")?.write_all(&seed)
+    // Generates a fresh 32-byte seed mixing local persisted randomness + OS getrandom(2).
+    // Prefer a secrets manager; never derive a seed from a password.
+    let publisher = Signet::generate(&rng)?;
+    OpenOptions::new().write(true).create_new(true).mode(0o600).open("signet.seed")?.write_all(publisher.seed())
 }
 ```
 
@@ -99,23 +99,28 @@ use std::io::{self, Read};
 use blincs::{Imprint, Randomness, SEED_LEN, SIGNET_ID_LEN, Signet, SignetId};
 
 fn main() -> io::Result<()> {
-    let rng = Randomness::initialize("blincs.state")?; // once per process
+    let rng = Randomness::initialize("blincs.state.d")?; // once per process
     let mut seed = [0u8; SEED_LEN];
     File::open("signet.seed")?.read_exact(&mut seed)?;
-    let signet = Signet::from_seed(&seed); // ~20.5 ms: rebuilds the 128 KiB top tree in memory
+    let publisher = Signet::from_seed(&seed); // ~0.65 ms: rebuilds the 4 KiB top tree in memory
 
     // Publish these 32 bytes through a channel your verifiers can authenticate.
-    let id_bytes: [u8; SIGNET_ID_LEN] = *signet.id().as_bytes();
+    let pinned_id_bytes: [u8; SIGNET_ID_LEN] = *publisher.id().as_bytes();
 
-    // Sign and serialize: 5,616 raw bytes on the wire.
+    // Sign and serialize: 5,888 raw bytes on the wire.
     let message = b"hello, BLINCS";
-    let wire: Vec<u8> = signet.imprint(&rng, message).as_bytes().to_vec();
+    let wire: Vec<u8> = publisher.imprint(&rng, message).as_bytes().to_vec();
 
-    // Verify from received bytes; `try_from` rejects wrong lengths.
-    let id = SignetId::from_bytes(&id_bytes);
-    let imprint = Imprint::try_from(wire.as_slice()).expect("imprint must be 5,616 bytes");
-    assert!(id.verify(message, &imprint));
-    assert!(!id.verify(b"tampered", &imprint));
+    // Verify against the expected publisher's pinned SignetId.
+    let expected_publisher = SignetId::from_bytes(&pinned_id_bytes);
+    let imprint = Imprint::try_from(wire.as_slice()).expect("imprint must be 5,888 bytes");
+    assert!(expected_publisher.verify(message, &imprint));
+    assert!(!expected_publisher.verify(b"tampered", &imprint));
+
+    // A valid imprint made by a different signet must also be rejected.
+    let other_publisher = Signet::generate(&rng)?;
+    let other_imprint = other_publisher.imprint(&rng, message);
+    assert!(!expected_publisher.verify(message, &other_imprint));
     Ok(())
 }
 ```
@@ -123,8 +128,8 @@ fn main() -> io::Result<()> {
 **Stream large inputs** directly. This continues inside the same `main`:
 
 ```rust
-let file_imprint = signet.imprint_reader(&rng, File::open("artifact.bin")?)?;
-assert!(id.verify_reader(File::open("artifact.bin")?, &file_imprint)?);
+let file_imprint = publisher.imprint_reader(&rng, File::open("artifact.bin")?)?;
+assert!(expected_publisher.verify_reader(File::open("artifact.bin")?, &file_imprint)?);
 ```
 
 **Return types:**
@@ -134,32 +139,28 @@ assert!(id.verify_reader(File::open("artifact.bin")?, &file_imprint)?);
 
 ## Operational model
 
-### 1. The `Randomness` state file
+### 1. The lock-free `Randomness` seed directory
 
-The 48-byte file holds three things: a magic value, a startup count, and a 32-byte seed. Its only job is to keep per-imprint **content salts** fresh across restarts, even if boot-time OS randomness is weak or repeats. It holds no key index or one-time-key counter.
+BLINCS stores startup randomness in a private directory (created once with `Randomness::create`, mode `0700`) holding one or more small regular files named `blincs-r2-<32 hex>` (up to 32 raw seed bytes each). Its only job is to keep per-imprint **content salts** fresh across restarts and hedge `Signet::generate`, even if boot-time OS randomness is weak or repeats. It holds no key index or one-time-key counter.
 
-**The two calls:**
+**How `Randomness::initialize` works (~71 µs, zero `flock`, zero `fsync`):**
 
-- **`Randomness::create`** provisions the file once per host, with mode `0600`. Do not race it against `initialize`.
-- **`Randomness::initialize`** runs once per process.
-  - Under `flock`, it mixes four inputs into an in-memory run key: the stored seed, an incremented count, 32 bytes from `/dev/urandom`, and the monotonic clock.
-  - It writes a fresh seed back (~23 µs, no `fsync`).
-  - Each imprint then draws from the run key, with no syscalls or disk writes.
+- Reads every `blincs-r2-<32 hex>` regular file in the directory (rejecting unexpected files, symlinks, files `> 32` bytes, or empty directories without touching anything).
+- Mixes all read seeds with 32 bytes from OS `getrandom(2)` / `getentropy` and the monotonic clock.
+- Derives four independent, domain-separated keys from that pool: `file_id` (filename only — **reveals zero bits of the file's `next_seed`, `run_key`, or future salts/signets**), `next_seed` (32 bytes written inside the new `0600` file via atomic `O_CREAT | O_EXCL`), `run_key` (in-memory imprint draws), and `keygen_key` (in-memory draws for `Signet::generate`).
+- Unlinks the old filenames it read. If concurrent processes or crashes leave multiple files or a 0-byte partial file, the next `initialize` folds them all together into one fresh 32-byte file and cleans up the rest automatically.
+- Each subsequent imprint draws from `run_key` in memory, with no syscalls or disk writes.
 
-**Losing, cloning, or resetting the file does not cause XMSS/LMS-style one-time-key reuse.**
+**Losing, cloning, or resetting the seed directory does not cause XMSS/LMS-style one-time-key reuse.**
 
-- Signing secrets derive only from the seed.
+- Signing secrets derive only from the signet's 32-byte seed.
 - Signing positions come from the message digest.
 - Each hypertree one-time key always signs the same deterministic root.
 - Randomness is hedged: the salt is keyed by the signet, and the randomizer derives from the signet, the salt, and the message hash.
 
-**If the file, `/dev/urandom`, and the clock all repeat together**, salts repeat. Signing secrets stay hidden. Content hashing degrades from salted (randomized target-collision) security to the 128-bit collision resistance of keyed BLAKE3.
+**If the seed directory, OS randomness, and the clock all repeat together**, salts repeat. Signing secrets stay hidden. Content hashing degrades from salted (randomized target-collision) security to the 128-bit collision resistance of keyed BLAKE3.
 
-**Recovery and placement:**
-
-- **Lost or corrupted file (when no live signer is using it):** remove the damaged file and run `Randomness::create` again. Do not delete a file while running processes hold locks on it, and diagnose `AlreadyExists` or permission errors rather than deleting blindly. Signets and existing imprints are unaffected.
-- **Placement:** use one file per host, in a private local directory. Processes on one host serialize through `flock`. Network filesystems are unsupported.
-- **Forks and live VM snapshots:** after `fork()` (without `exec()`) or restoring a live VM snapshot, call `Randomness::initialize` again so cloned processes or images do not repeat `(run_key, count)`.
+**Forks and live VM snapshots:** after `fork()` (without `exec()`) or restoring a live VM snapshot, call `Randomness::initialize` again so cloned processes or images do not repeat `(run_key, count)`.
 
 ### 2. Per-signet signing budget
 
@@ -171,10 +172,11 @@ A BLINCS signet does **not** suddenly break at 4.3 billion imprints. Instead, ev
 
 | Signatures made by one signet | Brute-force security | Brute-force cost (ASIC electricity) | Brute-force time (800 EH/s, Bitcoin scale) | What that means in practice |
 |---:|---:|---:|---:|---|
-| Up to **4.3 billion** (2³²) | **128-bit** | ~$1.6 × 10²⁰ | ~13 billion years | Full strength (comparable to AES-128) |
-| **34 billion** (8×) | **111-bit** | ~$9.6 × 10¹⁴ | ~78,000 years | Still far beyond any practical attack |
-| **69 billion** (16×) | **100-bit** | ~$870 billion | ~71 years | Weakening, though still out of reach today |
-| **More than 69 billion** | **< 100-bit** | falls rapidly | falls rapidly | Potentially forgeable by a well-funded attacker |
+| Up to **4.3 billion** (2³²) | **128-bit** *(132.5 b cover)* | ~$1.6 × 10²⁰ | ~13 billion years | Full strength (comparable to AES-128) |
+| **8.6 billion** (2×) | **128-bit** *(128.5 b cover)* | ~$2.2 × 10²⁰ | ~18 billion years | Still above 128-bit FORS cover |
+| **34 billion** (8×) | **118-bit** | ~$1.9 × 10¹⁷ | ~16 million years | Still far beyond any practical attack |
+| **69 billion** (16×) | **112-bit** | ~$2.3 × 10¹⁵ | ~195,000 years | Weakening, though still out of reach today |
+| **137 billion** (32×) | **104-bit** | ~$1.3 × 10¹³ | ~1,100 years | Weakening rapidly; stay well clear |
 
 These numbers are the cost of a brute-force attack for that single-key ideal-hash event (not a full multi-user or complete scheme proof; see [`SPEC.md`](SPEC.md#security-target-model-and-limits)). There is no known reason to think that either quantum computers or super-intelligent AIs could generate forgeries any more efficiently than brute force; if they could, it would reduce the security level.
 
@@ -182,25 +184,25 @@ The library does not count imprints across runs or across copies of a seed. When
 
 ### 3. Startup, streaming, and authenticated IDs
 
-**Startup and memory.** `Signet::from_seed` derives the 128 KiB top tree in memory from the 32-byte seed in **~20.5 ms** on 1 core. Nothing is cached on disk, so the seed is all you store. A cold load-and-sign takes ~23.1 ms. Signing allocates a transient local workspace (~446 KiB) that is freed when signing returns; verification uses only stack buffers (~2.5 KiB, plus a 16 KiB stack buffer for `verify_reader`) with zero heap allocation.
+**Startup and memory.** `Signet::from_seed` derives the 4 KiB top tree inline from the 32-byte seed in **~0.65 ms** on 1 core. Nothing is cached on disk, so the seed is all you store. A cold load-and-sign takes **~4.12 ms**. Signing allocates a transient local workspace (~480 KiB) that is freed when signing returns; verification uses only stack buffers (~2.5 KiB, plus a 16 KiB stack buffer for `verify_reader`) with zero heap allocation.
 
-**Streaming.** `imprint`/`verify` take message bytes, and `imprint_reader`/`verify_reader` take a stream. Either way, BLINCS hashes every byte in a single salted keyed-BLAKE3 pass on the calling thread. The per-imprint salt is chosen before the message is read. On 1 Apple M6 core, 100 MiB hashes at ~6.0 GB/s signing and ~6.9 GB/s verifying (in-memory slice), or ~3.9–4.3 GB/s via `imprint_reader`/`verify_reader` using a local 16 KiB stack buffer.
+**Streaming.** `imprint`/`verify` take message bytes, and `imprint_reader`/`verify_reader` take a stream. Either way, BLINCS hashes every byte in a single salted keyed-BLAKE3 pass on the calling thread. The per-imprint salt is chosen before the message is read. On 1 Apple M6 core, 100 MiB hashes at ~5.6 GB/s signing and ~6.9 GB/s verifying (in-memory slice), or ~3.7–4.3 GB/s via `imprint_reader`/`verify_reader` using a local 16 KiB stack buffer.
 
-**Authenticated IDs.** Verifiers need an **authenticated** `SignetId`. A valid imprint proves only that it matches a given 32-byte ID. Deliver IDs through a channel that ties them to the signer, such as pinned configuration or signed release metadata.
+**Authenticated IDs.** Verifiers need an **authenticated** `SignetId`. Receiving a `SignetId` does not authenticate the sender; a valid imprint proves only that it matches a given 32-byte ID. Deliver IDs through a channel that ties them to the signer, such as pinned configuration or signed release metadata.
 
-### 4. Platform, dependencies, and caller obligations
-
-**Dependencies and code:**
-
-- **Hash dependency:** the single runtime dependency is pinned exactly, `blake3-servil-core = "=0.11.0"` (**2 external crates** total in `Cargo.lock`, both BLAKE3 + SHA-256 hashset-verified). It runs strictly single-threaded with zero background worker threads, supplying single-core SIMD/SME2 batch hashing through its assembly kernels.
-- **Rust code:** `blincs` itself is pure safe Rust (`#![forbid(unsafe_code)]`, zero `Drop` implementations, ~890 lines of shipped code). It requires `std` today.
+### 4. Supported platforms, dependencies, and caller obligations
 
 **Supported platforms:**
 
 - **Linux** (`x86_64`, `aarch64`)
 - **macOS** (`x86_64`, `aarch64`)
 
-If your platform is not on this list, this software is not expected to work for that use. (`Randomness` uses Unix `/dev/urandom`, `0600` file mode, and `flock`.)
+If your platform is not on this list, this software is not expected to work for that use.
+
+**Dependencies and code:**
+
+- **Runtime dependencies:** `blake3-servil-core = "=0.11.0"` (single-threaded SIMD/SME2 BLAKE3, zero background worker threads) and `getrandom = "=0.4.3"` (OS `getrandom(2)` / `getentropy`) — **6 external crates** total in `Cargo.lock`, all BLAKE3 + SHA-256 hashset-verified.
+- **Rust code:** `blincs` itself is pure safe Rust (`#![forbid(unsafe_code)]`, zero `Drop` implementations, ~930 lines of shipped code).
 
 **Other implementations:**
 
@@ -209,7 +211,7 @@ If your platform is not on this list, this software is not expected to work for 
 
 **Caller obligations:**
 
-- Seeds need full entropy; `from_seed` performs no entropy check.
+- Use `Signet::generate(&rng)` for new signets; `from_seed` performs no entropy check.
 - Secret memory (the seed, derived keys, and transient signing workspaces) is **not** wiped on drop.
 - Branches and memory indices depend only on public inputs or values published in the imprint. Hardware timing channels remain the platform's responsibility.
 - The full list is in [`SECURITY.md`](SECURITY.md).
@@ -220,19 +222,19 @@ Apple M6 (macOS arm64, Rust 1.100.0, `blake3-servil-core = "=0.11.0"`, strictly 
 
 | Operation (1 core) | Wall time | Throughput |
 |---|---:|---:|
-| Sign, 64 B (warm) | **2.54 ms** | **394 / s** |
-| Verify, 64 B | **21.3 µs** | **46,900 / s** |
-| Load key (`Signet::from_seed`, 128 KiB top tree) | 20.53 ms | 49 / s |
-| Sign / verify, 100 MiB (slice) | 17.61 ms / 15.16 ms | 5,953 / 6,917 MB/s |
-| Sign / verify, 100 MiB (`*_reader`, 16 KiB stack buf) | 27.00 ms / 24.45 ms | 3,884 / 4,288 MB/s |
-| `Randomness::initialize` | 23.0 µs | — |
+| Load key (`Signet::from_seed`, 4 KiB top tree) | **0.65 ms** | **1,539 / s** |
+| Sign, 64 B (warm / cold 1-shot) | **3.47 ms** / **4.12 ms** | **288 / s** |
+| Verify, 64 B | **26.3 µs** | **38,000 / s** |
+| Sign / verify, 100 MiB (slice) | 18.57 ms / 15.13 ms | 5,645 / 6,932 MB/s |
+| Sign / verify, 100 MiB (`*_reader`, 16 KiB stack buf) | 28.01 ms / 24.15 ms | 3,744 / 4,342 MB/s |
+| `Randomness::initialize` (lock-free seed dir) | 71.3 µs | — |
 
 Signing has no counter-grinding retry loop. Full cycle counts, IPC, and the 1-core SLH-DSA-B reproduction are in [`BENCHMARKS.md`](BENCHMARKS.md).
 
 ## Documentation & References
 
 - [`SPEC.md`](SPEC.md): normative byte-level specification and security estimates.
-- [`DESIGN.md`](DESIGN.md): rationale and the alternatives evaluated.
+- [`DESIGN.md`](DESIGN.md): rationale, constrained-device-first parameter search, and alternatives evaluated.
 - [`BENCHMARKS.md`](BENCHMARKS.md): methodology, cycle counts, and 1-core SLH-DSA-B comparison.
 - [`QUALITY.md`](QUALITY.md): verification layers, mutation testing, and known gaps.
 - [`SECURITY.md`](SECURITY.md): threat model, caller obligations, and private vulnerability reporting.
@@ -244,7 +246,7 @@ Signing has no counter-grinding retry loop. Full cycle counts, IPC, and the 1-co
 **[Project 11](https://research.projecteleven.com/)**
 
 - **Conor Deegan** gave feedback on an early `SPEC.md` draft, encouraged optimizing for signing time, and inspired BLINCS's constrained-device-first parameter search approach (targeting Good Enough UX on constrained signing hardware while minimizing desktop costs). With **julienif**, he co-authored [PQC Suite B](https://github.com/PQC-Suite-B/signatures), the SLH-DSA implementation and benchmark harness reproduced in `BENCHMARKS.md`. PQC Suite B builds on RustCrypto's `slh-dsa`.
-- **Alessandro Baiocchi, Matteo Vena, and Matteo Vicari** built the [SPHINCS+ Parameter Explorer](https://research.projecteleven.com/tools/sphincs-parameter). Their research on [taller cached top trees](https://research.projecteleven.com/articles/raising-sphincs-lifetime-budgets) shaped BLINCS's layout.
+- **Alessandro Baiocchi, Matteo Vena, and Matteo Vicari** built the [SPHINCS+ Parameter Explorer](https://research.projecteleven.com/tools/sphincs-parameter).
 
 **Foundations**
 

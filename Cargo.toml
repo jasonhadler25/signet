@@ -2,7 +2,7 @@
 name = "blincs"
 version = "0.1.0"
 edition = "2024"
-description = "Stateless hash-based signatures based on BLAKE3 and SPHINCS (5,616-byte imprints, single-pass salted content hash)"
+description = "Stateless hash-based signatures based on BLAKE3 and SPHINCS (5,888-byte imprints, single-pass salted content hash)"
 repository = "https://github.com/jasonhadler25/blincs"
 license = "MIT OR Apache-2.0 OR TGPPL-1.0" # OR BOSL-1.0, see LICENSE-BOSL.txt
 readme = "README.md"
@@ -10,6 +10,7 @@ include = ["/src", "/reference/*.py", "/reference/blake3_test_vectors.json", "/t
 
 [dependencies]
 blake3-servil-core = "=0.11.0"
+getrandom = "=0.4.3"
 
 # Tests run at release speed with debug assertions and overflow checks on.
 [profile.test]

@@ -6,21 +6,26 @@
 //! Designed for post-quantum use with a 128-bit classical security target (see `SPEC.md` for bounds).
 //! Runs strictly on the calling thread (`blake3-servil-core`; no background worker threads).
 //! Because a cryptographic key is a transferable bearer authority rather than a person's handwritten
-//! signature, this API calls the secret a [`Signet`], its 32-byte public identifier a [`SignetId`]
-//! (which names which signet you mean and verifies its imprints), and the 5,616-byte proof an
-//! [`Imprint`]. Pass message bytes or a stream directly: BLINCS hashes the input in a single
-//! salted keyed-BLAKE3 pass under a fresh per-imprint salt.
+//! signature, this API calls the secret a [`Signet`], its 32-byte self-certifying identifier a
+//! [`SignetId`] (which names which signet you mean and verifies its imprints), and the 5,888-byte
+//! proof an [`Imprint`]. Pass message bytes or a stream directly: BLINCS hashes the input in a
+//! single salted keyed-BLAKE3 pass under a fresh per-imprint salt.
 //!
 //! ```no_run
 //! use blincs::{Randomness, Signet, SignetId};
 //!
-//! Randomness::create("/path/to/blincs.state")?;
-//! let randomness = Randomness::initialize("/path/to/blincs.state")?;
-//! let signet = Signet::from_seed(&[0x42; 32]); // example only; use OS randomness in real code
-//! let id: SignetId = signet.id();
+//! Randomness::create("/path/to/blincs.state.d")?;
+//! let randomness = Randomness::initialize("/path/to/blincs.state.d")?;
+//! let publisher = Signet::generate(&randomness)?;
+//! let expected_publisher: SignetId = publisher.id();
 //!
-//! let imprint = signet.imprint(&randomness, b"hello, BLINCS");
-//! assert!(id.verify(b"hello, BLINCS", &imprint));
+//! let imprint = publisher.imprint(&randomness, b"hello, BLINCS");
+//! assert!(expected_publisher.verify(b"hello, BLINCS", &imprint));
+//!
+//! // A valid imprint from a different signet must be rejected.
+//! let other = Signet::generate(&randomness)?;
+//! let other_imprint = other.imprint(&randomness, b"hello, BLINCS");
+//! assert!(!expected_publisher.verify(b"hello, BLINCS", &other_imprint));
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
@@ -40,19 +45,16 @@ pub use randomness::Randomness;
 
 use content::{content_from_reader, content_from_slice};
 use few_time::{build_fors_tree, fors_root, fors_verify, parse_digest};
-use one_time::{Pos, SignWorkspace, WOTS_CHUNK_LEAVES, build_merkle_heap, build_wots_leaves_chunk, verify_layer, write_layer_signature};
+use one_time::{Pos, SignWorkspace, build_tree_heap, verify_layer, write_layer_signature};
 use params::{
-    CTX_CONTENT, CTX_CONTENT_SALT, CTX_PUBLIC_SEED, CTX_RANDOMIZER, FORS_LEN, FORS_TREES, LOWER_LEAVES, Layer, N, PublicKey, SHORT_LEN, SecretKey, TOP_LEAVES,
-    TweakKind, derive_key, ensure_init, first_n, keyed, tweak,
+    CTX_CONTENT, CTX_CONTENT_SALT, CTX_GENERATE_SIGNET, CTX_PUBLIC_SEED, CTX_RANDOMIZER, FORS_LEN, FORS_TREES, LAYER_LEN, Layer, N, PublicKey, SHORT_LEN,
+    SecretKey, TREE_LEAVES, TweakKind, derive_key, ensure_init, first_n, keyed, tweak,
 };
+use randomness::read_os_randomness;
 use std::array::TryFromSliceError;
 use std::fmt;
 use std::hint::black_box;
 use std::io::{self, Read};
-
-const _: () = {
-    assert!(TOP_LEAVES.is_multiple_of(WOTS_CHUNK_LEAVES) && LOWER_LEAVES == WOTS_CHUNK_LEAVES);
-};
 
 fn ct_eq_n(a: &[u8; N], b: &[u8; N]) -> bool {
     let mut diff = 0u8;
@@ -78,18 +80,18 @@ fn msg_digest_input(randomizer: &[u8; N], root: &[u8; N], short: &[u8; SHORT_LEN
     buf
 }
 
-/// A 5,616-byte BLINCS imprint (proof produced by pressing a [`Signet`] onto a message).
+/// A 5,888-byte BLINCS imprint (proof produced by pressing a [`Signet`] onto a message).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Imprint([u8; IMPRINT_LEN]);
 
 impl Imprint {
-    /// Wrap a raw 5,616-byte imprint array.
+    /// Wrap a raw 5,888-byte imprint array.
     #[must_use]
     pub fn from_bytes(bytes: &[u8; IMPRINT_LEN]) -> Self {
         Self(*bytes)
     }
 
-    /// Borrow the raw 5,616 imprint bytes.
+    /// Borrow the raw 5,888 imprint bytes.
     pub fn as_bytes(&self) -> &[u8; IMPRINT_LEN] {
         &self.0
     }
@@ -108,7 +110,7 @@ impl Imprint {
 
     fn layer(&self, layer: Layer) -> &[u8] {
         let off = layer.sig_offset();
-        &self.0[off..off + layer.sig_len()]
+        &self.0[off..off + LAYER_LEN]
     }
 }
 
@@ -128,10 +130,10 @@ impl fmt::Debug for Imprint {
     }
 }
 
-/// A 32-byte BLINCS signet identifier (`public_seed || top_root`).
+/// A publisher's self-certifying 32-byte identifier and its complete BLINCS verifying key (`public_seed || top_root`).
 ///
-/// A `SignetId` names which [`Signet`] you mean and lets anyone verify whether an [`Imprint`]
-/// came from that signet.
+/// Receiving a `SignetId` does not authenticate the sender: obtain the expected `SignetId` from a
+/// pinned or authenticated channel and call `expected_publisher.verify(message, &imprint)`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SignetId {
     bytes: [u8; SIGNET_ID_LEN],
@@ -206,14 +208,14 @@ impl SignetId {
     }
 }
 
-/// A BLINCS signet (bearer authority derived from a 32-byte seed, holding the 128 KiB top hypertree in memory).
+/// A BLINCS signet (bearer authority derived from a 32-byte seed, holding the 4 KiB top hypertree in memory).
 pub struct Signet {
     seed: [u8; SEED_LEN],
     secret_key: SecretKey,
     salt_key: [u8; 32],
     randomizer_key: [u8; 32],
     id: SignetId,
-    top_tree: Vec<[u8; N]>,
+    top_tree: [[u8; N]; 2 * TREE_LEAVES],
 }
 
 impl fmt::Debug for Signet {
@@ -223,7 +225,19 @@ impl fmt::Debug for Signet {
 }
 
 impl Signet {
-    /// Derive a signet from a 32-byte `seed`, building the 128 KiB top hypertree on the calling thread.
+    /// Generate a fresh signet by mixing a domain-separated draw from `randomness` with fresh OS
+    /// randomness (`getrandom`). Persist [`Signet::seed`] securely if you need to reload this signet.
+    pub fn generate(randomness: &Randomness) -> io::Result<Self> {
+        let local = randomness.draw_for_keygen();
+        let os_bytes = read_os_randomness()?;
+        let mut material = [0u8; 64];
+        material[..32].copy_from_slice(&local);
+        material[32..].copy_from_slice(&os_bytes);
+        let seed = derive_key(CTX_GENERATE_SIGNET, &material);
+        Ok(Self::from_seed(&seed))
+    }
+
+    /// Derive a signet from a 32-byte `seed`, building the 4 KiB top hypertree on the calling thread.
     #[must_use]
     pub fn from_seed(seed: &[u8; SEED_LEN]) -> Self {
         ensure_init();
@@ -234,12 +248,7 @@ impl Signet {
         let public_key = PublicKey::from_seed(&public_seed);
 
         let mut ws = SignWorkspace::new();
-        let mut top_leaves = vec![[0u8; N]; TOP_LEAVES];
-        for start in (0..TOP_LEAVES).step_by(WOTS_CHUNK_LEAVES) {
-            let leaf = u16::try_from(start).unwrap();
-            build_wots_leaves_chunk(&secret_key, &public_key, Pos::new(Layer::TOP, 0, leaf), &mut ws, &mut top_leaves[start..start + WOTS_CHUNK_LEAVES]);
-        }
-        let top_tree = build_merkle_heap(&public_key, Layer::TOP, 0, &top_leaves, &mut ws);
+        let top_tree = build_tree_heap(&secret_key, &public_key, Layer::TOP, 0, &mut ws);
 
         let mut id_bytes = [0u8; SIGNET_ID_LEN];
         id_bytes[..N].copy_from_slice(&public_seed);
@@ -269,7 +278,7 @@ impl Signet {
         let (sec, pubk) = (self.secret_key, self.id.public_key);
         let mut ws = SignWorkspace::new();
 
-        // Build all 16 FORS trees and compute the FORS root.
+        // Build all 13 FORS trees and compute the FORS root.
         let mut at = 2 * N;
         let mut fors_roots = [[0u8; N]; FORS_TREES];
         for t in 0..FORS_TREES {
@@ -284,20 +293,18 @@ impl Signet {
         }
         let mut node = fors_root(&pubk.hasher(false), leaf_addr, &fors_roots);
 
-        // Build the 3 lower Merkle heaps and imprint all 4 hypertree layers.
-        let mut leaves = [[0u8; N]; LOWER_LEAVES];
+        // Build the 4 lower Merkle heaps and imprint all 5 uniform hypertree layers.
         for layer in Layer::LOWER {
             let (tree, leaf) = coords[layer.index()];
-            build_wots_leaves_chunk(&sec, &pubk, Pos::new(layer, tree, 0), &mut ws, &mut leaves);
-            let heap = build_merkle_heap(&pubk, layer, tree, &leaves, &mut ws);
+            let heap = build_tree_heap(&sec, &pubk, layer, tree, &mut ws);
             let off = layer.sig_offset();
-            write_layer_signature(&sec, &pubk, Pos::new(layer, tree, leaf), &node, &heap, &mut sig[off..off + layer.sig_len()]);
+            write_layer_signature(&sec, &pubk, Pos::new(layer, tree, leaf), &node, &heap, &mut sig[off..off + LAYER_LEN]);
             node = heap[1];
         }
         let (top_tree_idx, top_leaf) = coords[Layer::TOP.index()];
         assert_eq!(top_tree_idx, 0);
         let off = Layer::TOP.sig_offset();
-        write_layer_signature(&sec, &pubk, Pos::new(Layer::TOP, top_tree_idx, top_leaf), &node, &self.top_tree, &mut sig[off..off + Layer::TOP.sig_len()]);
+        write_layer_signature(&sec, &pubk, Pos::new(Layer::TOP, top_tree_idx, top_leaf), &node, &self.top_tree, &mut sig[off..off + LAYER_LEN]);
 
         let imprint = Imprint(sig);
         assert!(self.id.verify_short(short, &imprint), "internal error: generated imprint failed self-verification");

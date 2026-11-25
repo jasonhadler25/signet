@@ -4,10 +4,13 @@ use crate::content::{checked_add_stream_len, content_from_reader};
 use crate::few_time::parse_digest;
 use crate::one_time::{Pos, advance_chains, digits};
 use crate::params::{
-    CHAIN_STEPS, CHAINS, CTX_CONTENT, FORS_HEIGHT, FORS_TREES, HYPER_BITS, IMPRINT_LEN, Layer, MSG_CHAINS, N, PublicKey, TweakKind, derive_key, ensure_init,
-    tweak,
+    CHAIN_STEPS, CHAINS, CTX_CONTENT, FORS_HEIGHT, FORS_TREES, HYPER_BITS, IMPRINT_LEN, LAYER_LEN, Layer, MSG_CHAINS, N, PublicKey, TREE_HEIGHT, TweakKind,
+    derive_key, ensure_init, tweak,
 };
-use crate::randomness::{STATE_LEN, mix, read_exact_or_reject, read_monotonic_clock};
+use crate::randomness::{
+    SEED_FILE_MAX_LEN, expand_pool, is_seed_filename, mix_pool, read_bounded_seed, read_monotonic_clock, read_os_randomness, read_seed_if_present,
+    remove_if_present, seed_filename, write_next_seed,
+};
 use crate::{Imprint, Randomness, SEED_LEN, SIGNET_ID_LEN, Signet, SignetId};
 use std::fs;
 use std::io::{self, Cursor, ErrorKind, Read};
@@ -16,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
-const REF_VK_HEX: &str = "8e15ddf8f53bf3066099aaa8b8c073a0b2955754ebc88c5be38e23f708c8f3e9";
+const REF_VK_HEX: &str = "db09192c50a65494941887b9c57895ab1d8c239fbfb22e021f3b8dcc8d5b3da2";
 
 fn from_hex(s: &str) -> Vec<u8> {
     assert_eq!(s.len() % 2, 0);
@@ -32,11 +35,11 @@ fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn temp_state_path(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("blincs-test-{}-{tag}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir.join("state.bin")
+fn temp_state_dir(tag: &str) -> PathBuf {
+    let base = std::env::temp_dir().join(format!("blincs-test-{}-{tag}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    base.join("state.d")
 }
 
 struct FragmentedReader<'a> {
@@ -85,7 +88,6 @@ impl Read for FailingReader {
     }
 }
 
-/// Yields `prefix_len` zero bytes and then returns `BrokenPipe` (exercises `Pipeline::abort`).
 struct FailAfterReader {
     remaining: usize,
     failed: bool,
@@ -144,23 +146,19 @@ fn verify_alone_initializes_blake3_in_fresh_process() {
 
 #[test]
 fn wots_digits_and_checksum_boundaries() {
-    // All zeros: 32 zero nibbles, checksum = 32 * 15 = 480 = 0x1e0 -> [0, 14, 1].
     let d0 = digits(&[0u8; N]);
     assert!(d0[..MSG_CHAINS].iter().all(|&x| x == 0));
     assert_eq!(&d0[MSG_CHAINS..], &[0, 14, 1]);
 
-    // All 0xff: 32 nibbles of 15, checksum = 0 -> [0, 0, 0].
     let dmax = digits(&[0xffu8; N]);
     assert!(dmax[..MSG_CHAINS].iter().all(|&x| x == 15));
     assert_eq!(&dmax[MSG_CHAINS..], &[0, 0, 0]);
 
-    // Single-bit message: csum = 480 - 1 = 479 = 0x1df -> nonzero low nibble [15, 13, 1].
     let mut one = [0u8; N];
     one[0] = 1;
     let d1 = digits(&one);
     assert_eq!(&d1[MSG_CHAINS..], &[15, 13, 1]);
 
-    // Mixed nibbles: verify little-endian nibble ordering and exact checksum.
     let node: [u8; N] = core::array::from_fn(|i| {
         let hi = u8::try_from(i).unwrap();
         let lo = u8::try_from(15 - i).unwrap();
@@ -172,26 +170,41 @@ fn wots_digits_and_checksum_boundaries() {
         assert_eq!(dm[2 * i + 1], u8::try_from(i).unwrap());
     }
     let expected_csum: u16 = dm[..MSG_CHAINS].iter().map(|&v| 15 - u16::from(v)).sum();
-    assert_eq!(expected_csum, 240); // 0x0f0 -> [0, 15, 0]
+    assert_eq!(expected_csum, 240);
     assert_eq!(&dm[MSG_CHAINS..], &[0, 15, 0]);
 }
 
 #[test]
-fn parse_digest_extracts_all_fors_indices_and_33bit_leaf_addr() {
+fn parse_digest_extracts_all_fors_indices_and_35bit_leaf_addr() {
     let mut d = [0u8; 32];
-    // Pack known distinct 10-bit values into bytes 0..20 (4 values per 5 bytes).
-    let expected_idx: [u16; FORS_TREES] = core::array::from_fn(|t| u16::try_from((t * 67 + 13) & 0x3ff).unwrap());
-    for group in 0..4 {
-        let mut bits = 0u64;
-        for j in 0..4 {
-            bits |= u64::from(expected_idx[group * 4 + j]) << (10 * j);
+    let expected_idx: [u16; FORS_TREES] = core::array::from_fn(|t| u16::try_from((t * 157 + 29) & 0x7ff).unwrap());
+    let mut acc = 0u128;
+    // Pack first 11 indices (121 bits) into bytes 0..16, remaining 2 indices into bits 121..143.
+    for (t, &idx) in expected_idx.iter().enumerate() {
+        let bit = FORS_HEIGHT * t;
+        if bit < 112 {
+            acc |= u128::from(idx) << bit;
         }
-        let le = bits.to_le_bytes();
-        d[group * 5..group * 5 + 5].copy_from_slice(&le[..5]);
     }
-    // Pack a 33-bit leaf_addr with bit 32 set AND junk in bits 33..63 to verify exact masking.
+    d[..16].copy_from_slice(&acc.to_le_bytes());
+    let mut hi_acc = 0u64;
+    for (t, &idx) in expected_idx.iter().enumerate() {
+        let bit = FORS_HEIGHT * t;
+        if bit >= 112 {
+            hi_acc |= u64::from(idx) << (bit - 112);
+        }
+    }
+    let hi_le = hi_acc.to_le_bytes();
+    for k in 0..4 {
+        d[14 + k] |= hi_le[k];
+    }
+    // Set unused bit 143 and bytes 18..20 to 0xff to prove they do not affect extraction.
+    d[17] |= 0x80;
+    d[18] = 0xff;
+    d[19] = 0xff;
+
     let expected_addr = (1u64 << (HYPER_BITS - 1)) | 0x0123_4567;
-    let raw_addr = expected_addr | (0x7fff_fffe_u64 << HYPER_BITS);
+    let raw_addr = expected_addr | (0x1fff_ffff_u64 << HYPER_BITS);
     d[20..28].copy_from_slice(&raw_addr.to_le_bytes());
 
     let (indices, addr) = parse_digest(&d);
@@ -225,7 +238,6 @@ fn advance_chains_handles_zero_partial_and_full_lengths() {
     advance_chains(&pub_core, Pos::new(Layer::L0, 0, 0), &mut noop, &[5u8; CHAINS], &[5u8; CHAINS]);
     assert_eq!(noop, initial);
 
-    // Early-finish case: every chain finishes by step 4 (< CHAIN_STEPS).
     let mut short = initial;
     let short_starts = [2u8; CHAINS];
     let short_ends: [u8; CHAINS] = core::array::from_fn(|i| 2 + u8::try_from(i % 5).unwrap());
@@ -245,6 +257,7 @@ fn every_signature_region_is_checked() {
     let seed: [u8; SEED_LEN] = core::array::from_fn(|i| u8::try_from(i).unwrap());
     let sk = Signet::from_seed(&seed);
     let vk = sk.id();
+
     let msg = b"hello, BLINCS";
     let base = sk.imprint_with_draw(&[7u8; 32], msg);
     assert!(vk.verify(msg, &base));
@@ -255,12 +268,10 @@ fn every_signature_region_is_checked() {
         vk.verify(msg, &Imprint::from_bytes(&raw))
     };
 
-    // Salt and randomizer boundaries.
     for &off in &[0, 15, 16, 31] {
         assert!(!flip(off), "accepted flip at offset {off}");
     }
 
-    // Every FORS tree: secret, first auth node, last auth node.
     let fors_stride = (1 + FORS_HEIGHT) * N;
     for t in 0..FORS_TREES {
         let base_off = 2 * N + t * fors_stride;
@@ -269,19 +280,16 @@ fn every_signature_region_is_checked() {
         assert!(!flip(base_off + FORS_HEIGHT * N), "accepted flip in FORS tree {t} last auth");
     }
 
-    // Every hypertree layer: every chain value, first auth node, and last auth node.
     for layer in Layer::ALL {
         let at = layer.sig_offset();
-        let height = layer.height();
         for c in 0..CHAINS {
             assert!(!flip(at + c * N), "accepted flip in layer {} chain {c}", layer.as_u8());
         }
         assert!(!flip(at + CHAINS * N), "accepted flip in layer {} auth 0", layer.as_u8());
-        assert!(!flip(at + (CHAINS + height - 1) * N), "accepted flip in layer {} last auth", layer.as_u8());
+        assert!(!flip(at + (CHAINS + TREE_HEIGHT - 1) * N), "accepted flip in layer {} last auth", layer.as_u8());
     }
-    assert_eq!(Layer::TOP.sig_offset() + Layer::TOP.sig_len(), IMPRINT_LEN);
+    assert_eq!(Layer::TOP.sig_offset() + LAYER_LEN, IMPRINT_LEN);
 
-    // Wrong verifying key (public_seed byte 0, root byte 31).
     let mut bad_vk = *vk.as_bytes();
     bad_vk[0] ^= 1;
     assert!(!SignetId::from_bytes(&bad_vk).verify(msg, &base));
@@ -289,7 +297,12 @@ fn every_signature_region_is_checked() {
     bad_root[31] ^= 1;
     assert!(!SignetId::from_bytes(&bad_root).verify(msg, &base));
 
-    // Imprint slice length checks.
+    // A valid imprint from a different signet must be rejected.
+    let other_sk = Signet::from_seed(&[0x99u8; SEED_LEN]);
+    let other_sig = other_sk.imprint_with_draw(&[7u8; 32], msg);
+    assert!(other_sk.id().verify(msg, &other_sig));
+    assert!(!vk.verify(msg, &other_sig));
+
     assert!(Imprint::try_from(&base.as_bytes()[..IMPRINT_LEN - 1]).is_err());
     let mut too_long = base.as_bytes().to_vec();
     too_long.push(0);
@@ -303,8 +316,6 @@ fn streaming_boundaries_and_fragmented_readers_match_slices() {
     let vk = sk.id();
     let draw = [0x22u8; 32];
 
-    // Covers small (< 16 KiB on-core path), exact 16 KiB and 64 KiB boundaries, Pipeline path (> 16 KiB),
-    // and multithreaded slice threshold (>= 512 KiB).
     for &len in &[0usize, 1, 63, 64, 65, 1024, 16_383, 16_384, 16_385, 65_535, 65_536, 65_537, 256 * 1024, 512 * 1024, 1024 * 1024 + 19] {
         let msg: Vec<u8> = (0..len).map(|i| u8::try_from((i.wrapping_mul(37) ^ (i >> 8)) & 0xff).unwrap()).collect();
         let sig = sk.imprint_with_draw(&draw, &msg);
@@ -328,14 +339,12 @@ fn streaming_boundaries_and_fragmented_readers_match_slices() {
     }
 
     let ck = derive_key(CTX_CONTENT, vk.as_bytes());
-    // Immediate I/O errors propagate cleanly.
     let err = content_from_reader(&ck, &[0u8; N], FailingReader::default()).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::BrokenPipe);
     assert_eq!(sk.imprint_reader_with_draw(&draw, FailingReader::default()).unwrap_err().kind(), ErrorKind::BrokenPipe);
     let sig = sk.imprint_with_draw(&draw, b"x");
     assert_eq!(vk.verify_reader(FailingReader::default(), &sig).unwrap_err().kind(), ErrorKind::BrokenPipe);
 
-    // Mid-stream I/O error AFTER 16 KiB cleanly aborts the Pipeline without panicking.
     let err_mid = content_from_reader(&ck, &[0u8; N], FailAfterReader { remaining: 90_000, failed: false }).unwrap_err();
     assert_eq!(err_mid.kind(), ErrorKind::BrokenPipe);
 }
@@ -362,107 +371,210 @@ fn concurrent_signing_threads_produce_identical_signatures() {
 #[test]
 fn randomness_mix_matches_python_reference() {
     ensure_init();
-    let seed = [0x01u8; 32];
+    let s1 = [0x01u8; 32];
+    let s2 = [0xaau8, 0xbb];
     let system = [0x02u8; 32];
     let clock = b"clock-reading";
-    let (next_seed, run_key) = mix(&seed, 42, &system, clock);
+    let pool = mix_pool(&[&s1, &s2], &system, clock);
+    let (file_id, next_seed, run_key, keygen_key) = expand_pool(&pool);
 
-    assert_eq!(to_hex(&next_seed), "4ca4eedbb4c7fcb17762c7790173965d261b210dcbdff5b8790e3ef9c40b8fb3");
-    assert_eq!(to_hex(&run_key), "162b1dd1afb6dae37df25cc7ca3340f12fe601badac915d1a1156f6a9f49cc8d");
+    assert_eq!(to_hex(&file_id), "25867ca5a64bc1144508c40dcf8811b3");
+    assert_eq!(to_hex(&next_seed), "faa9e83e7a6c973128ae3731f620be90cc9d5e041b851ceb66dd333f949a4e33");
+    assert_eq!(to_hex(&run_key), "e83d7320fb5db53ebb9b5ea8f04895e7936c56a11bc71681d201b2902426ebf8");
+    assert_eq!(to_hex(&keygen_key), "5ed0b294833d747b589829846d84c0ab0b15478d04b047a42a292c9891c8a4ab");
 
-    let r1 = Randomness::from_run_key_at(run_key, 0);
-    assert_eq!(to_hex(&r1.draw()), "fe6737eeeac0278aaefa8b3f86433cb934105cadb0b184686929dde0ca74ef77");
-    assert_eq!(to_hex(&r1.draw()), "b31a518d2110b139f42edb7309d0aa3b1c7fa40ad858d05cf3a19ad899381fc8");
+    // Distinct seeds/framing produce distinct pools.
+    assert_ne!(mix_pool(&[&s1], &system, clock), pool);
+    assert_ne!(mix_pool(&[&[0x01u8], &[0x02, 0x03]], &system, clock), mix_pool(&[&[0x01u8, 0x02], &[0x03]], &system, clock));
+
+    let r = Randomness::from_keys_at(run_key, keygen_key, 0);
+    assert_eq!(to_hex(&r.draw()), "4cf8c5e80dcee5740ccc5def4297a61106e66c759679878dfb79b6b00574b9fc");
+    assert_eq!(to_hex(&r.draw()), "39e6c944a4e723109e6d5405bd98d714268cdc267ea1bd349868e0216c8c8185");
+    let rk = Randomness::from_keys_at(run_key, keygen_key, 0);
+    assert_eq!(to_hex(&rk.draw_for_keygen()), "d1e76af88105198cefd2348e1fd3f969cebf1abe76a10ac7d27c6d380ae501e6");
 }
 
 #[test]
 #[should_panic(expected = "randomness draw counter exhausted")]
 fn randomness_draw_panics_on_counter_exhaustion() {
     ensure_init();
-    let r = Randomness::from_run_key_at([1u8; 32], u64::MAX);
+    let r = Randomness::from_keys_at([1u8; 32], [2u8; 32], u64::MAX);
     let _ = r.draw();
 }
 
 #[test]
-fn randomness_create_and_initialize_lifecycle_and_rejection() {
-    let path = temp_state_path("lifecycle");
-    assert_eq!(Randomness::initialize(&path).unwrap_err().kind(), ErrorKind::NotFound);
-    assert!(!path.exists());
+fn randomness_seed_directory_lifecycle_concurrency_and_self_healing() {
+    let dir = temp_state_dir("lifecycle");
+    assert_eq!(Randomness::initialize(&dir).unwrap_err().kind(), ErrorKind::NotFound);
+    assert!(!dir.exists());
 
-    assert_eq!(STATE_LEN, 48);
-    Randomness::create(&path).unwrap();
-    let initial = fs::read(&path).unwrap();
-    assert_eq!(initial.len(), 48);
-    assert_eq!(&initial[..8], b"BLINCSr1");
-    assert_eq!(u64::from_le_bytes(initial[8..16].try_into().unwrap()), 0);
-    assert_ne!(&initial[16..48], &[0u8; 32]);
-    assert_ne!(&initial[16..48], &[1u8; 32]);
-    assert_eq!(Randomness::create(&path).unwrap_err().kind(), ErrorKind::AlreadyExists);
-    assert_eq!(fs::read(&path).unwrap(), initial);
+    // Filename validator boundary checks.
+    assert!(is_seed_filename("blincs-r2-0123456789abcdef0123456789abcdef"));
+    assert!(!is_seed_filename("blincs-r2-0123456789ABCDEF0123456789abcdef"));
+    assert!(!is_seed_filename("blincs-r2-0123456789abcdef0123456789abcde"));
+    assert!(!is_seed_filename("other-r2-0123456789abcdef0123456789abcdef"));
 
-    let path_other = temp_state_path("lifecycle-other");
-    Randomness::create(&path_other).unwrap();
-    let other_initial = fs::read(&path_other).unwrap();
-    assert_ne!(&initial[16..48], &other_initial[16..48]);
-    let _ = fs::remove_dir_all(path_other.parent().unwrap());
+    Randomness::create(&dir).unwrap();
+    assert_eq!(Randomness::create(&dir).unwrap_err().kind(), ErrorKind::AlreadyExists);
+
+    let list_files = |d: &PathBuf| -> Vec<(String, Vec<u8>)> {
+        let mut v: Vec<_> = fs::read_dir(d)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (e.file_name().into_string().unwrap(), fs::read(e.path()).unwrap())
+            })
+            .collect();
+        v.sort();
+        v
+    };
+
+    let init_files = list_files(&dir);
+    assert_eq!(init_files.len(), 1);
+    assert!(is_seed_filename(&init_files[0].0));
+    assert_eq!(init_files[0].1.len(), 32);
+    assert_ne!(init_files[0].1.as_slice(), &[0u8; 32]);
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(dir.join(&init_files[0].0)).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
-    let rng1 = Randomness::initialize(&path).unwrap();
-    let after1 = fs::read(&path).unwrap();
-    assert_eq!(after1.len(), STATE_LEN);
-    assert_eq!(&after1[..8], b"BLINCSr1");
-    assert_eq!(u64::from_le_bytes(after1[8..16].try_into().unwrap()), 1);
-    assert_ne!(&after1[16..48], &initial[16..48]);
+    // Separate create() produces distinct seed and filename.
+    let dir_other = temp_state_dir("lifecycle-other");
+    Randomness::create(&dir_other).unwrap();
+    let other_files = list_files(&dir_other);
+    assert_ne!(init_files[0].0, other_files[0].0);
+    assert_ne!(init_files[0].1, other_files[0].1);
+    let _ = fs::remove_dir_all(dir_other.parent().unwrap());
 
-    let rng2 = Randomness::initialize(&path).unwrap();
-    let after2 = fs::read(&path).unwrap();
-    assert_eq!(u64::from_le_bytes(after2[8..16].try_into().unwrap()), 2);
-    assert_ne!(&after2[16..48], &after1[16..48]);
+    // Sequential initializations replace the seed file with a new content-addressed filename & seed.
+    let rng1 = Randomness::initialize(&dir).unwrap();
+    let after1 = list_files(&dir);
+    assert_eq!(after1.len(), 1);
+    assert_ne!(after1[0].0, init_files[0].0);
+    assert_ne!(after1[0].1, init_files[0].1);
+
+    let rng2 = Randomness::initialize(&dir).unwrap();
+    let after2 = list_files(&dir);
+    assert_eq!(after2.len(), 1);
+    assert_ne!(after2[0].0, after1[0].0);
     assert_ne!(rng1.draw(), rng2.draw());
 
-    let shared = Arc::new(path.clone());
+    // Self-healing: leave a simulated 0-byte crash file alongside the valid 32-byte seed file.
+    let crash_name = "blincs-r2-00000000000000000000000000000000";
+    fs::write(dir.join(crash_name), b"").unwrap();
+    assert_eq!(list_files(&dir).len(), 2);
+    let _rng3 = Randomness::initialize(&dir).unwrap();
+    let healed = list_files(&dir);
+    assert_eq!(healed.len(), 1);
+    assert_ne!(healed[0].0, crash_name);
+    assert_eq!(healed[0].1.len(), 32);
+
+    // Concurrent lock-free startups across 8 threads x 10 rounds (= 80 overlapping rotations) all succeed with distinct draws, and a follow-up startup collapses cleanly back to 1 file.
+    let shared = Arc::new(dir.clone());
     let handles: Vec<_> = (0..8)
         .map(|_| {
             let p = Arc::clone(&shared);
-            thread::spawn(move || Randomness::initialize(&*p).unwrap().draw())
+            thread::spawn(move || (0..10).map(|_| Randomness::initialize(&*p).unwrap().draw()).collect::<Vec<_>>())
         })
         .collect();
-    let mut draws: Vec<[u8; 32]> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let mut draws: Vec<[u8; 32]> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
     draws.sort_unstable();
     draws.dedup();
-    assert_eq!(draws.len(), 8);
-    let after10 = fs::read(&path).unwrap();
-    assert_eq!(u64::from_le_bytes(after10[8..16].try_into().unwrap()), 10);
+    assert_eq!(draws.len(), 80);
+    let _collapse = Randomness::initialize(&dir).unwrap();
+    assert_eq!(list_files(&dir).len(), 1);
 
-    for (name, bad) in [
-        ("empty", vec![]),
-        ("short", b"BLINCSr1short".to_vec()),
-        ("long", vec![b'x'; 49]),
-        ("long-valid-magic", [b"BLINCSr1".as_slice(), &[0u8; 41]].concat()),
-        ("wrong-magic", [b"NOTBLINC".as_slice(), &[0u8; 40]].concat()),
-        ("exhausted", [b"BLINCSr1".as_slice(), &u64::MAX.to_le_bytes(), &[9u8; 32]].concat()),
-    ] {
-        let p = temp_state_path(name);
-        fs::write(&p, &bad).unwrap();
-        assert_eq!(Randomness::initialize(&p).unwrap_err().kind(), ErrorKind::InvalidData, "accepted {name}");
-        assert_eq!(fs::read(&p).unwrap(), bad, "modified rejected file {name}");
-        let _ = fs::remove_dir_all(p.parent().unwrap());
+    // read_os_randomness returns fresh, non-constant 32-byte OS entropy.
+    let os_a = read_os_randomness().unwrap();
+    let os_b = read_os_randomness().unwrap();
+    assert_ne!(os_a, os_b);
+    assert_ne!(os_a, [0u8; 32]);
+    assert_ne!(os_a, [1u8; 32]);
+
+    // read_seed_if_present & remove_if_present ignore NotFound (concurrent deletion) but propagate other I/O errors (ENOTDIR).
+    let missing = dir.join("blincs-r2-00000000000000000000000000000000");
+    assert_eq!(read_seed_if_present(&missing).unwrap(), None);
+    remove_if_present(&missing).unwrap();
+    let existing_file = dir.join(&list_files(&dir)[0].0);
+    let impossible_child = existing_file.join("child");
+    assert!(read_seed_if_present(&impossible_child).is_err());
+    assert!(remove_if_present(&impossible_child).is_err());
+
+    // write_next_seed re-hashes pool with CTX_MIX on AlreadyExists without clobbering the colliding file.
+    let pool = [0x42u8; 32];
+    let (id1, _, _, _) = expand_pool(&pool);
+    let pool2 = derive_key(crate::params::CTX_MIX, &pool);
+    let (id2, seed2, rk2, kk2) = expand_pool(&pool2);
+    let collider = dir.join(seed_filename(&id1));
+    fs::write(&collider, [0xeeu8; 32]).unwrap();
+    let (got_rk, got_kk) = write_next_seed(&dir, pool).unwrap();
+    assert_eq!((got_rk, got_kk), (rk2, kk2));
+    assert_eq!(fs::read(&collider).unwrap(), vec![0xeeu8; 32]);
+    assert_eq!(fs::read(dir.join(seed_filename(&id2))).unwrap(), seed2.to_vec());
+
+    // read_bounded_seed accepts 0..=32 bytes and rejects 33 bytes.
+    let mut frag32 = FragmentedReader::new(&[0x55u8; SEED_FILE_MAX_LEN], 5, 2);
+    assert_eq!(read_bounded_seed(&mut frag32).unwrap(), vec![0x55u8; SEED_FILE_MAX_LEN]);
+    let mut frag33 = FragmentedReader::new(&[0x55u8; SEED_FILE_MAX_LEN + 1], 7, 3);
+    assert_eq!(read_bounded_seed(&mut frag33).unwrap_err().kind(), ErrorKind::InvalidData);
+    assert_eq!(read_bounded_seed(&mut FailingReader::default()).unwrap_err().kind(), ErrorKind::BrokenPipe);
+
+    let _ = fs::remove_dir_all(dir.parent().unwrap());
+}
+
+#[test]
+fn hostile_directory_and_unexpected_files_are_rejected_without_deletion() {
+    let base = std::env::temp_dir().join(format!("blincs-hostile-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+
+    // Regular file is not a directory.
+    let reg = base.join("regular.bin");
+    fs::write(&reg, b"not a dir").unwrap();
+    assert_eq!(Randomness::initialize(&reg).unwrap_err().kind(), ErrorKind::InvalidInput);
+
+    // Empty directory is rejected.
+    let empty_dir = base.join("empty.d");
+    fs::create_dir_all(&empty_dir).unwrap();
+    assert_eq!(Randomness::initialize(&empty_dir).unwrap_err().kind(), ErrorKind::InvalidData);
+
+    // Directory containing an unrelated file is rejected without touching it.
+    let mixed_dir = base.join("mixed.d");
+    Randomness::create(&mixed_dir).unwrap();
+    let unrelated = mixed_dir.join("notes.txt");
+    fs::write(&unrelated, b"keep me").unwrap();
+    assert_eq!(Randomness::initialize(&mixed_dir).unwrap_err().kind(), ErrorKind::InvalidData);
+    assert_eq!(fs::read(&unrelated).unwrap(), b"keep me");
+
+    // Directory containing an oversized (>32 B) seed-named file is rejected without touching it.
+    let over_dir = base.join("over.d");
+    Randomness::create(&over_dir).unwrap();
+    let big_seed = over_dir.join("blincs-r2-ffffffffffffffffffffffffffffffff");
+    fs::write(&big_seed, [0x77u8; 33]).unwrap();
+    assert_eq!(Randomness::initialize(&over_dir).unwrap_err().kind(), ErrorKind::InvalidData);
+    assert!(big_seed.exists());
+
+    // Symlink to directory or symlink inside directory is rejected.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let real_dir = base.join("real.d");
+        Randomness::create(&real_dir).unwrap();
+        let dir_link = base.join("link.d");
+        symlink(&real_dir, &dir_link).unwrap();
+        assert_eq!(Randomness::initialize(&dir_link).unwrap_err().kind(), ErrorKind::InvalidInput);
+
+        let sym_inside = base.join("sym-inside.d");
+        Randomness::create(&sym_inside).unwrap();
+        symlink(&reg, sym_inside.join("blincs-r2-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")).unwrap();
+        assert_eq!(Randomness::initialize(&sym_inside).unwrap_err().kind(), ErrorKind::InvalidData);
     }
 
-    let valid_raw = [b"BLINCSr1".as_slice(), &7u64.to_le_bytes(), &[0x55u8; 32]].concat();
-    let mut frag = FragmentedReader::new(&valid_raw, 5, 2);
-    assert_eq!(read_exact_or_reject(&mut frag).unwrap().as_slice(), valid_raw.as_slice());
-    let long_raw = [valid_raw.as_slice(), &[0u8]].concat();
-    let mut frag_long = FragmentedReader::new(&long_raw, 7, 3);
-    assert_eq!(read_exact_or_reject(&mut frag_long).unwrap_err().kind(), ErrorKind::InvalidData);
-    assert_eq!(read_exact_or_reject(&mut FailingReader::default()).unwrap_err().kind(), ErrorKind::BrokenPipe);
-
-    let _ = fs::remove_dir_all(path.parent().unwrap());
+    let _ = fs::remove_dir_all(&base);
 }
 
 #[test]
@@ -470,21 +582,28 @@ fn monotonic_clock_advances_and_is_nontrivial() {
     ensure_init();
     let c1 = read_monotonic_clock();
     assert!(c1.len() >= 8);
-    let (s1, k1) = mix(&[0x10u8; 32], 1, &[0x20u8; 32], b"clock-a");
-    let (s2, k2) = mix(&[0x10u8; 32], 1, &[0x20u8; 32], b"clock-b");
-    assert_ne!(s1, s2);
-    assert_ne!(k1, k2);
+    let p1 = mix_pool(&[&[0x10u8; 32]], &[0x20u8; 32], b"clock-a");
+    let p2 = mix_pool(&[&[0x10u8; 32]], &[0x20u8; 32], b"clock-b");
+    assert_ne!(p1, p2);
 }
 
 #[test]
-fn create_works_with_bare_relative_filename() {
-    let dir = std::env::temp_dir().join(format!("blincs-rel-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    std::env::set_current_dir(&dir).unwrap();
-    Randomness::create("state.bin").unwrap();
-    assert_eq!(fs::read("state.bin").unwrap().len(), 48);
-    let _ = fs::remove_dir_all(&dir);
+fn signet_generate_produces_distinct_valid_signets() {
+    let dir = temp_state_dir("generate");
+    Randomness::create(&dir).unwrap();
+    let rng = Randomness::initialize(&dir).unwrap();
+
+    let s1 = Signet::generate(&rng).unwrap();
+    let s2 = Signet::generate(&rng).unwrap();
+    assert_ne!(s1.seed(), s2.seed());
+    assert_ne!(s1.id(), s2.id());
+    assert_eq!(Signet::from_seed(s1.seed()).id(), s1.id());
+
+    let imp1 = s1.imprint(&rng, b"release-1");
+    assert!(s1.id().verify(b"release-1", &imp1));
+    assert!(!s2.id().verify(b"release-1", &imp1));
+
+    let _ = fs::remove_dir_all(dir.parent().unwrap());
 }
 
 #[test]
@@ -495,31 +614,30 @@ fn debug_redacts_secrets() {
     assert!(!s.contains("abababab"), "Signet Debug leaked seed: {s}");
     assert!(s.contains(&to_hex(sk.id().as_bytes())));
 
-    let rng = Randomness::from_run_key_at([0xcdu8; 32], 0);
+    let rng = Randomness::from_keys_at([0xcdu8; 32], [0xefu8; 32], 0);
     assert_eq!(format!("{rng:?}"), "Randomness { .. }");
 
     let sig = sk.imprint_with_draw(&[1u8; 32], b"dbg");
     let sd = format!("{sig:?}");
-    assert!(sd.contains("5616 bytes") && sd.contains(&to_hex(&sig.as_bytes()[..N])));
+    assert!(sd.contains("5888 bytes") && sd.contains(&to_hex(&sig.as_bytes()[..N])));
 }
 
 #[test]
 fn create_alone_initializes_blake3_in_fresh_process() {
-    let path = temp_state_path("create-only");
-    Randomness::create(&path).unwrap();
-    assert_eq!(fs::read(&path).unwrap().len(), STATE_LEN);
-    let _ = fs::remove_dir_all(path.parent().unwrap());
+    let dir = temp_state_dir("create-only");
+    Randomness::create(&dir).unwrap();
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+    let _ = fs::remove_dir_all(dir.parent().unwrap());
 }
 
 #[test]
 fn initialize_alone_initializes_blake3_in_fresh_process() {
-    let path = temp_state_path("init-only");
-    let mut raw = [0u8; STATE_LEN];
-    raw[..8].copy_from_slice(b"BLINCSr1");
-    fs::write(&path, raw).unwrap();
-    let rng = Randomness::initialize(&path).unwrap();
+    let dir = temp_state_dir("init-only");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("blincs-r2-0123456789abcdef0123456789abcdef"), [0x42u8; 32]).unwrap();
+    let rng = Randomness::initialize(&dir).unwrap();
     let _ = rng.draw();
-    let _ = fs::remove_dir_all(path.parent().unwrap());
+    let _ = fs::remove_dir_all(dir.parent().unwrap());
 }
 
 #[test]
@@ -537,7 +655,6 @@ fn reader_never_sees_previous_callers_bytes() {
     }
     impl Read for SnoopingReader<'_> {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            // Every newly exposed slice (both stack buffer and Pipeline rooms) must be zeroed.
             if buf.iter().any(|&b| b != 0) {
                 self.saw_nonzero = true;
             }
@@ -567,27 +684,24 @@ fn reader_never_sees_previous_callers_bytes() {
     let vk = sk.id();
     let secret_msg = vec![0xAAu8; 256 * 1024];
 
-    // First call dirties stack buffer AND multiple Pipeline rooms (256 KiB).
     let sig = sk.imprint_reader_with_draw(&[1u8; 32], Cursor::new(&secret_msg)).unwrap();
 
-    // Small snooping reader inspects stack fast path.
     let mut snoop_small = SnoopingReader { data: b"second", pos: 0, saw_nonzero: false };
     let sig2 = sk.imprint_reader_with_draw(&[2u8; 32], &mut snoop_small).unwrap();
     assert!(!snoop_small.saw_nonzero, "small sign_reader observed previous caller's bytes");
     assert!(vk.verify(b"second", &sig2));
 
-    // Large snooping reader (200 KiB > 16 KiB and > 3 rooms) inspects newly acquired & recycled Pipeline rooms.
     let big_data = vec![0x55u8; 200 * 1024];
     let mut snoop_big_sign = SnoopingReader { data: &big_data, pos: 0, saw_nonzero: false };
     let sig_big = sk.imprint_reader_with_draw(&[3u8; 32], &mut snoop_big_sign).unwrap();
-    assert!(!snoop_big_sign.saw_nonzero, "Pipeline sign_reader observed nonzero room bytes");
+    assert!(!snoop_big_sign.saw_nonzero, "stream sign_reader observed nonzero buffer bytes");
     assert!(vk.verify(&big_data, &sig_big));
 
     assert!(vk.verify_reader(Cursor::new(&secret_msg), &sig).unwrap());
     assert!(vk.verify_reader(DirtyThenFail::default(), &sig).is_err());
     let mut snoop_ver = SnoopingReader { data: &big_data, pos: 0, saw_nonzero: false };
     assert!(vk.verify_reader(&mut snoop_ver, &sig_big).unwrap());
-    assert!(!snoop_ver.saw_nonzero, "Pipeline verify_reader observed nonzero room bytes");
+    assert!(!snoop_ver.saw_nonzero, "stream verify_reader observed nonzero buffer bytes");
 }
 
 #[test]
@@ -624,12 +738,10 @@ fn reentrant_reader_can_sign_and_verify_without_borrowing_panic() {
         }
     }
 
-    // Re-enter from the < 16 KiB stack path.
     let outer = sk.imprint_reader_with_draw(&[7u8; 32], ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, prefix_remaining: 0, done: false }).unwrap();
     assert!(vk.verify(b"outer", &outer));
     assert!(vk.verify_reader(ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, prefix_remaining: 0, done: false }, &outer).unwrap());
 
-    // Re-enter from the >= 16 KiB Pipeline room path.
     let mut expected_big = vec![0x41u8; 32 * 1024];
     expected_big.extend_from_slice(b"outer");
     let outer_big =
@@ -644,23 +756,22 @@ fn checked_constructors_reject_out_of_range_values() {
     assert_eq!(&max_t[2..8], &[0xff; 6]);
     assert!(catch_unwind(|| tweak(TweakKind::Node, 0, 1u64 << 48, 0, 0, 0)).is_err());
 
-    // Exact per-layer hypertree bounds: L0 < 2^26, L1 < 2^19, L2 < 2^12, L3 == 0.
-    for (layer, max_trees, max_leaves) in [(Layer::L0, 1u64 << 26, 128u16), (Layer::L1, 1u64 << 19, 128), (Layer::L2, 1u64 << 12, 128), (Layer::L3, 1, 4096)] {
-        let _ = Pos::new(layer, max_trees - 1, max_leaves - 1);
+    // Exact per-layer hypertree bounds: L0 < 2^28, L1 < 2^21, L2 < 2^14, L3 < 2^7, L4 == 0 (all 128 leaves).
+    for (layer, max_trees) in [(Layer::L0, 1u64 << 28), (Layer::L1, 1u64 << 21), (Layer::L2, 1u64 << 14), (Layer::L3, 1u64 << 7), (Layer::L4, 1)] {
+        let _ = Pos::new(layer, max_trees - 1, 127);
         assert!(catch_unwind(|| Pos::new(layer, max_trees, 0)).is_err());
-        assert!(catch_unwind(|| Pos::new(layer, 0, max_leaves)).is_err());
+        assert!(catch_unwind(|| Pos::new(layer, 0, 128)).is_err());
     }
 
-    // Stream length overflow helper (u64::MAX boundary).
     assert_eq!(checked_add_stream_len(u64::MAX - 10, 10).unwrap(), u64::MAX);
     assert_eq!(checked_add_stream_len(u64::MAX - 10, 11).unwrap_err().kind(), ErrorKind::InvalidData);
 }
 
 #[test]
 fn public_sign_with_shared_randomness_works_on_fresh_thread() {
-    let state_path = temp_state_path("fresh-thread-sign");
-    Randomness::create(&state_path).unwrap();
-    let rng = Arc::new(Randomness::initialize(&state_path).unwrap());
+    let dir = temp_state_dir("fresh-thread-sign");
+    Randomness::create(&dir).unwrap();
+    let rng = Arc::new(Randomness::initialize(&dir).unwrap());
     let sk = Arc::new(Signet::from_seed(&[0x77u8; SEED_LEN]));
     let vk = sk.id();
 
@@ -668,37 +779,7 @@ fn public_sign_with_shared_randomness_works_on_fresh_thread() {
     let sk_t = Arc::clone(&sk);
     let sig = thread::spawn(move || sk_t.imprint(&rng_t, b"fresh thread message")).join().unwrap();
     assert!(vk.verify(b"fresh thread message", &sig));
-    let _ = fs::remove_dir_all(state_path.parent().unwrap());
-}
-
-#[test]
-fn hostile_filesystem_and_non_regular_state_paths_are_rejected() {
-    let dir = std::env::temp_dir().join(format!("blincs-hostile-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-
-    // Directory is not a regular state file.
-    assert!(Randomness::initialize(&dir).is_err());
-
-    // Dangling symlink must never be followed by create().
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::symlink;
-        let target = dir.join("never-created.bin");
-        let link = dir.join("dangling.state");
-        symlink(&target, &link).unwrap();
-        assert_eq!(Randomness::create(&link).unwrap_err().kind(), ErrorKind::AlreadyExists);
-        assert!(!target.exists());
-    }
-
-    // Special device (/dev/null) is not a regular file and must be rejected cleanly with InvalidInput.
-    #[cfg(unix)]
-    {
-        let err = Randomness::initialize("/dev/null").unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
-    }
-
-    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(dir.parent().unwrap());
 }
 
 #[test]
@@ -722,10 +803,9 @@ fn oversized_read_return_fails_stop() {
     let vk = sk.id();
     let ck = derive_key(CTX_CONTENT, vk.as_bytes());
 
-    // Oversized Read return panics fail-stop in small path, Pipeline path, and state reader.
     assert!(catch_unwind(|| content_from_reader(&ck, &[0u8; N], OversizedReader { prefix: 0 })).is_err());
     assert!(catch_unwind(|| content_from_reader(&ck, &[0u8; N], OversizedReader { prefix: 32_768 })).is_err());
-    assert!(catch_unwind(|| read_exact_or_reject(&mut OversizedReader { prefix: 0 })).is_err());
+    assert!(catch_unwind(|| read_bounded_seed(&mut OversizedReader { prefix: 0 })).is_err());
 }
 
 #[test]
@@ -734,10 +814,10 @@ fn all_public_operations_fit_within_128kib_stack_budget() {
         .name("blincs-stack-budget".to_owned())
         .stack_size(128 * 1024)
         .spawn(|| {
-            let state_path = temp_state_path("stack-128k");
-            Randomness::create(&state_path).unwrap();
-            let rng = Randomness::initialize(&state_path).unwrap();
-            let sk = Signet::from_seed(&[0x88u8; SEED_LEN]);
+            let dir = temp_state_dir("stack-128k");
+            Randomness::create(&dir).unwrap();
+            let rng = Randomness::initialize(&dir).unwrap();
+            let sk = Signet::generate(&rng).unwrap();
             let vk = SignetId::from_bytes(sk.id().as_bytes());
 
             let small = b"bounded stack budget check";
@@ -751,14 +831,14 @@ fn all_public_operations_fit_within_128kib_stack_budget() {
             assert!(vk.verify_reader(Cursor::new(&big), &s_big).unwrap());
             assert!(vk.verify(&big, &s_big));
 
-            let _ = fs::remove_dir_all(state_path.parent().unwrap());
+            let _ = fs::remove_dir_all(dir.parent().unwrap());
         })
         .unwrap();
     handle.join().unwrap();
 }
 
 #[test]
-fn edge_vectors_match_python_and_ts_byte_for_byte() {
+fn edge_vectors_match_python_byte_for_byte() {
     let json = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/test_vectors/edge-vectors.json")).unwrap();
     let extract = |block: &str, key: &str| -> String {
         let pat = format!("\"{key}\": \"");
@@ -775,7 +855,7 @@ fn edge_vectors_match_python_and_ts_byte_for_byte() {
         ("empty", vec![]),
         ("one-byte-zero", vec![0u8]),
         ("chunk-1024", (0..1024usize).map(|i| u8::try_from((i * 31) & 0xff).unwrap()).collect()),
-        ("pipeline-16385-high-leaf", (0..16385usize).map(|i| u8::try_from((i * 37 + 5) & 0xff).unwrap()).collect()),
+        ("stream-16385-high-leaf", (0..16385usize).map(|i| u8::try_from((i * 37 + 5) & 0xff).unwrap()).collect()),
     ];
 
     let blocks: Vec<&str> = json.split("\"name\": \"").skip(1).collect();
@@ -808,12 +888,12 @@ fn stateful_lifecycle_and_trait_contracts() {
     assert_send_sync::<Imprint>();
     assert_send_sync::<Randomness>();
 
-    let p1 = temp_state_path("lifecycle-contract-1");
-    let p2 = temp_state_path("lifecycle-contract-2");
-    Randomness::create(&p1).unwrap();
-    Randomness::create(&p2).unwrap();
-    let r1 = Randomness::initialize(&p1).unwrap();
-    let r2 = Randomness::initialize(&p2).unwrap();
+    let d1 = temp_state_dir("lifecycle-contract-1");
+    let d2 = temp_state_dir("lifecycle-contract-2");
+    Randomness::create(&d1).unwrap();
+    Randomness::create(&d2).unwrap();
+    let r1 = Randomness::initialize(&d1).unwrap();
+    let r2 = Randomness::initialize(&d2).unwrap();
 
     let sk1 = Signet::from_seed(&[0x10u8; SEED_LEN]);
     let sk2 = Signet::from_seed(&[0x20u8; SEED_LEN]);
@@ -825,7 +905,6 @@ fn stateful_lifecycle_and_trait_contracts() {
     assert_eq!(vk1, vk1_rt);
     assert_ne!(vk1, vk2);
 
-    // Interleaved operations across two keys, two randomness states, slice & reader APIs, and Imprint traits.
     let s1a = sk1.imprint(&r1, b"alpha");
     let s1b = sk1.imprint(&r1, b"alpha");
     assert_ne!(s1a, s1b, "distinct draws must yield distinct signatures");
@@ -840,6 +919,6 @@ fn stateful_lifecycle_and_trait_contracts() {
     assert!(!vk1.verify(b"beta", &s2));
     assert!(!vk2.verify(b"alpha", &s1a));
 
-    let _ = fs::remove_dir_all(p1.parent().unwrap());
-    let _ = fs::remove_dir_all(p2.parent().unwrap());
+    let _ = fs::remove_dir_all(d1.parent().unwrap());
+    let _ = fs::remove_dir_all(d2.parent().unwrap());
 }

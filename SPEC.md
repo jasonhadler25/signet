@@ -1,8 +1,8 @@
 # BLINCS specification (draft)
 
-*Status: pre-1.0 design under active development (0.1.0, formats and context strings may still change before 1.0). Written by an AI assistant at the direction of this repository's owner; no independent cryptographic review or security audit has been performed. Builds on BLAKE3 (O'Connor, Aumasson, Neves, Wilcox-O'Hearn) and SPHINCS / SPHINCS+ / FIPS 205 SLH-DSA (Bernstein, Hopwood, Hülsing, Kölbl, Lange, Niederhagen, Papachristodoulou, Rijneveld, Schneider, Schwabe, Wilcox-O'Hearn, and the NIST SLH-DSA team). Thanks to [Project 11](https://research.projecteleven.com/) — especially **Conor Deegan**, **Alessandro Baiocchi**, **Matteo Vena**, and **Matteo Vicari** — for direct review feedback on this specification, benchmarks, and irregular-hypertree/caching ideas (full credits in [`README.md`](README.md#credits-and-thanks)).*
+*Status: pre-1.0 design under active development (0.1.0, formats and context strings may still change before 1.0). Written by an AI assistant at the direction of this repository's owner; no independent cryptographic review or security audit has been performed. Builds on BLAKE3 (O'Connor, Aumasson, Neves, Wilcox-O'Hearn) and SPHINCS / SPHINCS+ / FIPS 205 SLH-DSA (Bernstein, Hopwood, Hülsing, Kölbl, Lange, Niederhagen, Papachristodoulou, Rijneveld, Schneider, Schwabe, Wilcox-O'Hearn, and the NIST SLH-DSA team). Thanks to [Project 11](https://research.projecteleven.com/) — especially **Conor Deegan**, **Alessandro Baiocchi**, **Matteo Vena**, and **Matteo Vicari** — for direct review feedback, benchmarks, and constrained-device design inspiration (full credits in [`README.md`](README.md#credits-and-thanks)).*
 
-BLINCS is a stateless hash-based signature scheme based on BLAKE3 and SPHINCS, using a **WOTS+** (nibbles, `w = 16`) and **FORS** (`16` trees of `1,024` leaves) structure on a 4-layer hypertree (`12 + 3×7`, total height `33`) with **zero counter grinding** and single-pass salted content hashing (BLINCS-specific nibble/tweak encodings and BLAKE3 instantiation; not FIPS 205 interoperable or validated). A signature is **5,616 bytes** (`7,488` bytes Base64 — fitting cleanly under default Apache/nginx 8 KiB HTTP headers), a verifying key is **32 bytes**, and a signing key is a **32-byte seed**. Its design target is **128-bit classical security** (128-bit root) at up to **$2^{32}$ signatures** per signing key (4,294,967,296: ten signatures a second for 13.6 years), with an estimated single-query FORS cover exponent of **133.2 bits** at $q = 2^{32}$, degrading gracefully past the budget (`126.8` bits at $2^{33}$, `119.3` bits at $2^{34}$, `110.6` bits at $2^{35}$).
+BLINCS is a stateless hash-based signature scheme based on BLAKE3 and SPHINCS, using a **WOTS+** (nibbles, `w = 16`) and **FORS** (`13` trees of `2,048` leaves) structure on a uniform 5-layer hypertree (`5×7`, total height `35`) with **zero counter grinding** and single-pass salted content hashing (BLINCS-specific nibble/tweak encodings and BLAKE3 instantiation; not FIPS 205 interoperable or validated). An imprint is **5,888 bytes** (`7,852` bytes Base64 — fitting under default Apache/nginx 8 KiB HTTP headers), a `SignetId` is **32 bytes**, and a `Signet` derives from a **32-byte seed** (holding a 4 KiB top tree in memory). Its design target is **128-bit classical security** (128-bit root) at up to **$2^{32}$ imprints** per signet (4,294,967,296: ten imprints a second for 13.6 years), with an estimated single-query FORS cover exponent of **132.5 bits** at $q = 2^{32}$, degrading gradually past the budget (`128.5` bits at $2^{33}$, `123.8` bits at $2^{34}$, `118.3` bits at $2^{35}$, `111.9` bits at $2^{36}$).
 
 Messages are hashed in a single salted keyed-BLAKE3 pass under a fresh per-imprint salt `e` derived from the signet and per-imprint randomness before reading the message. Pass the original message bytes or stream directly to BLINCS so the entire input is covered by the salted pass at full BLAKE3 streaming speed without relying on unsalted collision resistance.
 
@@ -20,22 +20,20 @@ BLINCS uses two 32-byte modes of BLAKE3:
 | Symbol | Value | Meaning |
 |---|---:|---|
 | `N` | 16 | Byte length of truncated tree, chain, salt, and randomizer values (`h_msg`, `D`, and derived keys are 32 bytes) |
-| `LAYERS` | 4 | Layers of the hypertree (`d`) |
-| `LOWER_HEIGHT` | 7 | Height of lower hypertree layers `0, 1, 2` ($2^7 = 128$ leaves per tree) |
-| `TOP_HEIGHT` | 12 | Height of top hypertree layer `3` ($2^{12} = 4{,}096$ leaves; total `HYPER_BITS = 12 + 3 * 7 = 33`) |
+| `LAYERS` | 5 | Uniform layers of the hypertree (`d`) |
+| `TREE_HEIGHT` | 7 | Height of every hypertree layer `0..5` ($2^7 = 128$ leaves per tree; total `HYPER_BITS = 5 * 7 = 35`) |
 | `W` | 16 | WOTS+ Winternitz parameter (`CHAIN_STEPS = 15`, 4-bit nibbles in `0..=15`) |
 | `MSG_CHAINS` | 32 | WOTS+ message chains (`128 / 4 = 32` nibbles) |
 | `CSUM_CHAINS` | 3 | WOTS+ checksum chains (`max checksum = 32 * 15 = 480 < 16^3`) |
 | `CHAINS` | 35 | Total WOTS+ chains per one-time signature (`32 + 3`) |
-| `FORS_HEIGHT` | 10 | Height of each FORS tree ($2^{10} = 1{,}024$ leaves per tree) |
-| `FORS_TREES` | 16 | Number of independent FORS trees (`k`; `16 * 10 = 160` bits) |
+| `FORS_HEIGHT` | 11 | Height of each FORS tree ($2^{11} = 2{,}048$ leaves per tree) |
+| `FORS_TREES` | 13 | Number of independent FORS trees (`k`; `13 * 11 = 143` bits) |
 
 Derived lengths:
 
-- `FORS_LEN = FORS_TREES * (1 + FORS_HEIGHT) * N = 2,816` bytes.
-- `LOWER_LAYER_LEN = (CHAINS + LOWER_HEIGHT) * N = 672` bytes.
-- `TOP_LAYER_LEN = (CHAINS + TOP_HEIGHT) * N = 752` bytes.
-- `IMPRINT_LEN = 2 * N + FORS_LEN + 3 * LOWER_LAYER_LEN + TOP_LAYER_LEN = 5,616` bytes.
+- `FORS_LEN = FORS_TREES * (1 + FORS_HEIGHT) * N = 2,496` bytes.
+- `LAYER_LEN = (CHAINS + TREE_HEIGHT) * N = 672` bytes (identical on all 5 layers).
+- `IMPRINT_LEN = 2 * N + FORS_LEN + LAYERS * LAYER_LEN = 5,888` bytes.
 
 ## Key-derivation contexts
 
@@ -43,15 +41,18 @@ Every derived 32-byte key uses a distinct UTF-8 context string:
 
 | Name | Context string |
 |---|---|
-| `SECRET_VALUES` | `"BLINCS 2026-11-24 signet: secret values"` |
-| `CONTENT_SALT` | `"BLINCS 2026-11-24 signet: content salt"` |
-| `RANDOMIZER` | `"BLINCS 2026-11-24 signet: randomizer"` |
-| `PUBLIC_SEED` | `"BLINCS 2026-11-24 signet: public seed"` |
-| `PUBLIC_HASH` | `"BLINCS 2026-11-24 public hash"` |
-| `CONTENT` | `"BLINCS 2026-11-24 content"` |
-| `MIX` | `"BLINCS 2026-11-24 randomness: mix"` |
-| `NEXT_SEED` | `"BLINCS 2026-11-24 randomness: seed kept in the file"` |
-| `RUN_KEY` | `"BLINCS 2026-11-24 randomness: key of this run"` |
+| `SECRET_VALUES` | `"BLINCS 2026-11-25 signet: secret values"` |
+| `CONTENT_SALT` | `"BLINCS 2026-11-25 signet: content salt"` |
+| `RANDOMIZER` | `"BLINCS 2026-11-25 signet: randomizer"` |
+| `PUBLIC_SEED` | `"BLINCS 2026-11-25 signet: public seed"` |
+| `GENERATE_SIGNET` | `"BLINCS 2026-11-25 signet: generate"` |
+| `PUBLIC_HASH` | `"BLINCS 2026-11-25 public hash"` |
+| `CONTENT` | `"BLINCS 2026-11-25 content"` |
+| `MIX` | `"BLINCS 2026-11-25 randomness: mix"` |
+| `FILE_ID` | `"BLINCS 2026-11-25 randomness: file id"` |
+| `NEXT_SEED` | `"BLINCS 2026-11-25 randomness: next seed"` |
+| `RUN_KEY` | `"BLINCS 2026-11-25 randomness: key of this run"` |
+| `KEYGEN_KEY` | `"BLINCS 2026-11-25 randomness: keygen key"` |
 
 ## Tweaks
 
@@ -78,14 +79,14 @@ Unused fields are zero. The nine kinds are:
 | 5 | `FEW_SECRET` | `K_sec` | *(empty)* | 16 |
 | 6 | `FEW_LEAF` | `K_pub` | 16-byte leaf secret | 16 |
 | 7 | `FEW_NODE` | `K_pub` | `left (16) \|\| right (16)` | 16 |
-| 8 | `FEW_ROOT` | `K_pub` | 16 FORS tree roots (`256` bytes) | 16 |
+| 8 | `FEW_ROOT` | `K_pub` | 16 × 13 FORS tree roots (`208` bytes) | 16 |
 | 9 | `MESSAGE` | `K_pub` | `R (16) \|\| root (16) \|\| short (48)` | 32 |
 
 Define `ShortHash(K, T, data) = Keyed(K, T || data)[..16]`.
 
 ## Signet and SignetId
 
-A `Signet` is derived from a 32-byte `seed` supplied by the caller:
+A `Signet` is derived from a 32-byte `seed`:
 
 ```text
 K_sec   = Derive(SECRET_VALUES, seed)
@@ -93,7 +94,7 @@ K_salt  = Derive(CONTENT_SALT,  seed)
 K_R     = Derive(RANDOMIZER,    seed)
 pk_seed = Derive(PUBLIC_SEED,   seed)[..16]
 K_pub   = Derive(PUBLIC_HASH,   pk_seed)
-root    = top hypertree root at layer = 3, tree = 0 (height 12, 4,096 leaves)
+root    = top hypertree root at layer = 4, tree = 0 (height 7, 128 leaves)
 ```
 
 The 32-byte signet identifier (`SignetId`) is `id = pk_seed || root`. A verifier derives from `id`:
@@ -106,138 +107,118 @@ K_content = Derive(CONTENT,     id)
 
 ## Content
 
-When signing with a 32-byte per-signature draw `draw`:
+When imprinting with a 32-byte per-imprint draw `draw`:
 
 ```text
-e = Keyed(K_salt, draw)[..16]                     # 16-byte per-signature content salt
+e = Keyed(K_salt, draw)[..16]                     # 16-byte per-imprint content salt
 ```
 
 Given the 16-byte content salt `e` and message `M` (any length in `0..2^64`):
 
 ```text
-K_msg = Keyed(K_content, e)                       # 32-byte per-signature message key
+K_msg = Keyed(K_content, e)                       # 32-byte per-imprint message key (public once e is known)
 h_msg = Keyed(K_msg, M)                           # 32-byte keyed BLAKE3 hash of M (single pass)
 short = e || h_msg                                # 48 bytes
 ```
 
-Because BLAKE3 authenticates exact message length internally, `Keyed(K_msg, M)` binds the exact message length across all supported lengths (`0..2^64`) in a single streaming pass with no chunking layer.
+BLAKE3 commits to message length under its standard hash assumptions, and `K_msg` is derived from both `id` (via `K_content`) and the fresh per-imprint salt `e`.
 
 ## Message digest and index extraction
 
-Given `short` (48 bytes):
+The signer computes the deterministic per-imprint randomizer and 32-byte digest `D`:
 
-- The signer computes `R = Keyed(K_R, short)[..16]`.
-- Signer and verifier both compute the 32-byte (256-bit) message digest:
-  `D = Keyed(K_pub, tweak(MESSAGE, 0, 0, 0, 0, 0) || R || root || short)`.
-  *(193 bits of `D` are consumed directly as the 160 FORS index bits and 33 hypertree address bits; the upper 63 bits are unused.)*
-- Extract the 16 FORS leaf indices and 33-bit hypertree leaf address directly from `D` (no counter grinding):
-  - `fors_bits = u160_le(D[0..20])`; for `t = 0..16`, `idx[t] = (fors_bits >> (10 * t)) & 0x3FF` (`0..1024`).
-  - `leaf_addr = u64_le(D[20..28]) & ((1 << 33) - 1)` (`0..2^33`).
+```text
+R = Keyed(K_R, short)[..16]
+D = Keyed(K_pub, tweak(MESSAGE, 0, 0, 0, 0, 0) || R || root || short)
+```
+
+From `D` (32 bytes):
+
+- **FORS leaf indices** `indices[0..13]`: view `D[0..18]` as a 144-bit little-endian unsigned integer; for `t in 0..13`, `indices[t] = (u144(D[0..18]) >> (11 * t)) & 0x7ff` (each in `0..2048`; bit 143 and bytes `D[18..20]` are unused).
+- **Hypertree leaf address** `leaf_addr`: low 35 bits of `u64_le(D[20..28])`, i.e., `u64_le(D[20..28]) & ((1 << 35) - 1)` (the remaining high bits of `D[24..32]` are unused).
 
 ## Few-time signatures (FORS)
 
-At hypertree bottom-layer leaf address `leaf_addr` (`0 <= leaf_addr < 2^33`), for each tree `t` in `0..16`:
+At hypertree address `leaf_addr` (`0..2^35`), FORS consists of `FORS_TREES = 13` independent binary Merkle trees, each of height `FORS_HEIGHT = 11` (`2,048` leaves):
 
-- Leaf secret `i` (`0 <= i < 1024`):
-  `s_{t,i} = ShortHash(K_sec, tweak(FEW_SECRET, 0, leaf_addr, t, 0, i), "")`.
-- Leaf hash `i`:
-  `L_{t,i} = ShortHash(K_pub, tweak(FEW_LEAF, 0, leaf_addr, t, 0, i), s_{t,i})`.
-- Internal node at `height = 1..=10`, `index = 0..2^(10 - height)`:
-  `node(t, height, index) = ShortHash(K_pub, tweak(FEW_NODE, 0, leaf_addr, t, height, index), left || right)`.
-- The FORS root compresses all 16 tree roots (where each `root_t` is `node(t, 10, 0)`):
-  `fors_root = ShortHash(K_pub, tweak(FEW_ROOT, 0, leaf_addr, 0, 0, 0), root_0 || ... || root_15)`.
+- For tree `t in 0..13` and leaf `i in 0..2048`:
+  - `secret[t][i] = ShortHash(K_sec, tweak(FEW_SECRET, 0, leaf_addr, t, 0, i), empty)`
+  - `leaf[t][i]   = ShortHash(K_pub, tweak(FEW_LEAF,   0, leaf_addr, t, 0, i), secret[t][i])`
+- Internal node at height `level in 1..=11`, index `p in 0..(2048 >> level)`:
+  - `node = ShortHash(K_pub, tweak(FEW_NODE, 0, leaf_addr, t, level, p), left || right)`
+- The 13 tree roots `root[0..13]` are compressed into the 16-byte FORS root:
+  - `fors_root = ShortHash(K_pub, tweak(FEW_ROOT, 0, leaf_addr, 0, 0, 0), root[0] || ... || root[12])`
 
-For each `t = 0..16`, the signer emits `s_{t, idx[t]}` followed by the 10 sibling nodes `auth[0..10]` along `idx[t]`'s authentication path (bottom level `j = 0` first). The verifier hashes each secret to `L_{t, idx[t]}`, climbs `j = 0..10` using `tweak(FEW_NODE, 0, leaf_addr, t, j + 1, idx[t] >> (j + 1))` (putting the running value on the left when `(idx[t] >> j) & 1 == 0`, on the right otherwise) to obtain `root_t`, and compresses `root_0 || ... || root_15` to `fors_root`.
+The FORS section of the imprint (`2,496` bytes) is the concatenation for `t = 0..13` of:
+`secret[t][indices[t]]` (16 bytes) followed by its 11 authentication-path siblings from leaf level `0` up to level `10` (`176` bytes). On verification, at each level `h in 0..11`, if bit `h` of `indices[t]` is `0`, `cur` is the left child and `auth[h]` is the right child; otherwise `auth[h]` is left and `cur` is right, hashed with `tweak(FEW_NODE, 0, leaf_addr, t, h + 1, indices[t] >> (h + 1))`.
 
 ## One-time signatures (WOTS+)
 
-At hypertree position `(layer, tree, leaf)` (`height = 7` for `layer in 0..3`, `height = 12` for `layer = 3`):
+Given a 16-byte message `node` to sign at `(layer, tree, leaf)`:
 
-- Chain `c` (`0 <= c < 35`) starts at:
-  `start_c = ShortHash(K_sec, tweak(CHAIN_SECRET, layer, tree, leaf, c, 0), "")`.
-- Advancing a chain value `v` from step `s` to step `t` (`0 <= s <= t <= 15`):
-  for `step` in `s..t`: `v = ShortHash(K_pub, tweak(CHAIN, layer, tree, leaf, c, step), v)`.
-- The leaf's one-time verifying key compresses all 35 chain ends (`step = 15`):
-  `pk_leaf = ShortHash(K_pub, tweak(ONE_TIME_KEY, layer, tree, leaf, 0, 0), end_0 || ... || end_34)`.
-- The tree over `pk_0, ..., pk_{2^height - 1}` combines siblings at `level = 1..=height`, `index = 0..2^(height - level)`:
-  `node(level, index) = ShortHash(K_pub, tweak(NODE, layer, tree, 0, level, index), left || right)`.
+- **Digits `digits(node)`** (`35` nibbles in `0..=15`):
+  - For `i in 0..16`: `d[2*i] = node[i] & 0x0f`, `d[2*i + 1] = node[i] >> 4`.
+  - Checksum `csum = sum_{j=0..32} (15 - d[j])` (in `0..=480`).
+  - `d[32] = csum & 0x0f`, `d[33] = (csum >> 4) & 0x0f`, `d[34] = (csum >> 8) & 0x0f`.
+- **Chain `c in 0..35`:**
+  - Start value: `x_0 = ShortHash(K_sec, tweak(CHAIN_SECRET, layer, tree, leaf, c, 0), empty)`.
+  - Step `s -> s + 1` (for `s in 0..15`): `x_{s+1} = ShortHash(K_pub, tweak(CHAIN, layer, tree, leaf, c, s), x_s)`.
+  - Signature value for chain `c`: `x_{d[c]}`. Verifier completes steps `s = d[c]..15` to recover `x_15`.
+- **One-time verifying key (Merkle leaf):**
+  - `leaf_hash = ShortHash(K_pub, tweak(ONE_TIME_KEY, layer, tree, leaf, 0, 0), x_15[0] || ... || x_15[34])`.
 
-To encode a 16-byte `node` into 35 nibble digits `d[0..35]` (each in `0..=15`):
+## Hypertree and imprint layout
 
-```text
-for i in 0..16:
-    d[2 * i]     = node[i] & 0x0F
-    d[2 * i + 1] = node[i] >> 4
-csum = sum_{j=0}^{31} (15 - d[j])            # in 0..=480
-d[32] =  csum       & 0x0F
-d[33] = (csum >> 4) & 0x0F
-d[34] = (csum >> 8) & 0x0F
-```
+The hypertree has `5` uniform layers (`layer = 0, 1, 2, 3, 4`), each of height `TREE_HEIGHT = 7` (`128` leaves per tree):
 
-The signer advances each chain `c` from `0` to `d[c]` and emits the 35 chain values followed by the `height` sibling nodes `auth[0..height]` along `leaf`'s authentication path (bottom level `j = 0` first). The verifier advances each signature chain value from `d[c]` to `15`, compresses the 35 ends to `pk_leaf`, and climbs `j = 0..height` using `tweak(NODE, layer, tree, 0, j + 1, leaf >> (j + 1))` (putting the running value on the left when `(leaf >> j) & 1 == 0`, on the right otherwise) to obtain the tree root.
+- Starting with `addr = leaf_addr` and `node = fors_root`:
+  - For `layer = 0..5`:
+    - `leaf = addr & 0x7f` (`7` low bits)
+    - `tree = addr >> 7` (at `layer = 4`, `tree == 0`)
+    - Sign `node` with WOTS+ at `(layer, tree, leaf)` (`35 * 16 = 560` bytes) and append the `7` Merkle authentication-path siblings from leaf level `0` up to level `6` (`112` bytes), using `tweak(NODE, layer, tree, 0, level, p)` for `level in 1..=7`.
+    - On verification, at each `level in 1..=7`, if bit `level - 1` of `leaf` is `0`, `cur` is the left child and `auth[level - 1]` is right; otherwise `auth[level - 1]` is left and `cur` is right, hashed with `tweak(NODE, layer, tree, 0, level, leaf >> level)`.
+    - Set `node = tree_root` and `addr = tree`.
+- Verification succeeds iff the reconstructed layer-4 root equals `id[16..32]` in constant time.
 
-## Hypertree and signature layout
-
-Verification rejects any verifying key not of length 32 bytes or signature not of length 5,616 bytes. Starting from `node = fors_root` and `addr = leaf_addr`, for `layer = 0, 1, 2, 3`:
-
-- Let `height = 12` if `layer == 3`, else `7`.
-- Let `leaf = addr & ((1 << height) - 1)` and `tree = addr >> height`.
-- The signer produces the WOTS+ signature on `node` at `(layer, tree, leaf)` and the `height`-node authentication path in tree `(layer, tree)`.
-- `node` becomes the root of tree `(layer, tree)`; then `addr = tree`.
-
-After `layer = 3`, `node` must equal `vk.root` (compared across all 16 bytes by both signer and verifier).
-
-A signature is 5,616 bytes:
+Wire layout of an `Imprint` (`5,888` bytes):
 
 ```text
-Offset   Length  Field
-     0       16  e                  content salt
-    16       16  R                  randomizer
-    32     2816  fors               16 trees x (16 B secret || 10 x 16 B auth path)
-  2848      672  layer 0 (h=7)      35 x 16 B WOTS+ values ||  7 x 16 B auth path
-  3520      672  layer 1 (h=7)      35 x 16 B WOTS+ values ||  7 x 16 B auth path
-  4192      672  layer 2 (h=7)      35 x 16 B WOTS+ values ||  7 x 16 B auth path
-  4864      752  layer 3 (h=12)     35 x 16 B WOTS+ values || 12 x 16 B auth path
-  Total: 5616 bytes
+0..16        salt e (16 B)
+16..32       randomizer R (16 B)
+32..2528     FORS: 13 trees x (16 B secret + 11 x 16 B auth path) = 2,496 B
+2528..3200   Layer 0: 35 x 16 B WOTS+ + 7 x 16 B auth path = 672 B
+3200..3872   Layer 1: 35 x 16 B WOTS+ + 7 x 16 B auth path = 672 B
+3872..4544   Layer 2: 35 x 16 B WOTS+ + 7 x 16 B auth path = 672 B
+4544..5216   Layer 3: 35 x 16 B WOTS+ + 7 x 16 B auth path = 672 B
+5216..5888   Layer 4: 35 x 16 B WOTS+ + 7 x 16 B auth path = 672 B
 ```
 
 ## Signer randomness (local policy)
 
-The wire format and verification rules above depend only on `e`, not on how the signer chose `draw`. The Rust crate implements the following local randomness policy so signing needs no per-signature disk write or clock read.
+The wire format does not depend on how the signer chooses `draw`; the scheme below is BLINCS's local host policy for keeping `draw` non-repeating across restarts without file locking (`flock`).
 
-A persistent state file is exactly 48 bytes:
+State lives in a private directory (created once with `Randomness::create`, `0700` on Unix) containing one or more regular files named `blincs-r2-<32 lowercase hex chars>`, each holding `0..=32` raw bytes:
 
-```text
-Offset  Length  Field
-     0       8  magic   ASCII "BLINCSr1"
-     8       8  count   u64 LE (starts at 0 on creation; incremented on each initialize)
-    16      32  seed    32 bytes
-```
-
-- **Creation (`create`)**: creates a new file (refusing to overwrite an existing file; mode `0600` on Unix, subject to umask), writes `BLINCSr1 || u64_le(0) || os_bytes(32)` where `os_bytes` comes from `/dev/urandom`, and syncs the file and its parent directory once. Provision the file before starting signers; do not race `create` against `initialize`.
-- **Startup (`initialize`)**: opens an existing state file in a private local directory owned by the signer, takes an exclusive advisory lock (`flock`), checks exact length 48 and magic `BLINCSr1`, reads `(count, seed)`, checks `new_count = count + 1` does not overflow, reads 32 bytes from `/dev/urandom` and opaque local diversification bytes `clock_bytes` from the system's monotonic clock (`Instant::hash` in Rust; not a portable time encoding), and computes:
-  ```text
-  pool      = Derive(MIX,       seed || u64_le(new_count) || os_bytes || clock_bytes)
-  next_seed = Derive(NEXT_SEED, pool)
-  run_key   = Derive(RUN_KEY,   pool)
-  ```
-  It overwrites bytes `8..48` (`u64_le(new_count) || next_seed`) in place without calling `fsync`, releases the lock, and keeps `(run_key, sig_count = 0)` in memory.
-- **Platform scope**: the persistent `Randomness` state file implementation targets Unix (`/dev/urandom`, `0600` mode, POSIX advisory `flock`). `SignetId` has no OS filesystem dependency.
-- **Per signature (`draw`)**: atomically fetches and increments `sig_count` (`0..u64::MAX`, panicking if exhausted so it never wraps) and returns `Keyed(run_key, u64_le(n))` (ensuring distinct PRF inputs within one run; truncated 128-bit salts still have birthday collision probability $\approx 2^{-65}$ over $2^{32}$ signatures).
-- **Fork and live VM snapshots**: after `fork()` (without `exec()`) or restoring a live VM snapshot, call `Randomness::initialize` again so cloned processes or images do not repeat `(run_key, sig_count)`.
-- **Crash and error recovery**: `initialize` overwrites bytes `8..48` via `write_all` (serialized under `flock`, not transactional across power loss), and `create` may leave a partial file if write or sync fails. If `create` or `initialize` returns an error or a host crashes mid-update, remove and re-provision the state file with `Randomness::create` (or verify it passes `initialize` cleanly) before resuming signing.
-- **Path boundary**: `initialize` follows symlinks and relies on cooperating writers using compatible advisory locks on a local filesystem. Keep the state file in a private local directory owned by the signer.
-
-Even if the state file, `/dev/urandom`, and the monotonic clock are all rolled back together so `draw` repeats identically:
-
-- The signing key is never leaked, and `R = Keyed(K_R, e || h_msg)[..16]` still limits advance steering of the honest signer on distinct messages (WOTS+ safety on hypertree address collisions comes from signing the same FORS/subtree root at that position); only content hashing downgrades from randomized target-collision resistance to 128-bit known-key collision resistance of single-pass 256-bit keyed BLAKE3 `Keyed(K_msg, M)`.
+1. **State mixing (`mix_pool` and `expand_pool`):**
+   Given sorted seed file contents `s_0, ..., s_{m-1}` (each `len <= 32`), 32 bytes `system` from OS cryptographic randomness (`getrandom(2)` / `getentropy`), and opaque `clock` bytes from the monotonic clock:
+   ```text
+   material   = (u8(len(s_0)) || s_0) || ... || (u8(len(s_{m-1})) || s_{m-1}) || 0xff || system || clock
+   pool       = Derive(MIX,        material)
+   file_id    = Derive(FILE_ID,    pool)[..16]    # filename only; reveals zero bits of secrets below
+   next_seed  = Derive(NEXT_SEED,  pool)          # 32 bytes written inside blincs-r2-<hex(file_id)>
+   run_key    = Derive(RUN_KEY,    pool)          # in-memory key for per-imprint draws
+   keygen_key = Derive(KEYGEN_KEY, pool)          # in-memory key for Signet::generate
+   ```
+2. **Lock-free directory update (`Randomness::initialize`):**
+   Read all `blincs-r2-<32hex>` regular files in the directory (rejecting unexpected entries, symlinks, files `> 32` bytes, or an empty directory without modifying anything). Compute `pool`, and create `blincs-r2-<hex(file_id)>` with `O_CREAT | O_EXCL` (`0600`) writing `next_seed` (no `fsync`). If `AlreadyExists` occurs, advance `pool = Derive(MIX, pool)` and retry. After writing the new file, unlink the old filenames that were read (ignoring `NotFound`).
+3. **Per-imprint draw and signet generation:**
+   Each `draw` or `generate` increments an in-memory 64-bit counter `n` (panicking before overflow):
+   - Imprint draw: `draw = Keyed(run_key, u64_le(n))`.
+   - New signet generation (`Signet::generate`): `seed = Derive(GENERATE_SIGNET, Keyed(keygen_key, u64_le(n)) || os_getrandom_32)`.
+4. **Fork and live VM snapshots:** after `fork()` (without `exec()`) or restoring a live VM snapshot, call `Randomness::initialize` again so cloned processes or images do not repeat `(run_key, n)`.
 
 ## Security target, model, and limits
 
-- **Design target and FORS cover-probability estimate (classical single-key ideal-hash model):** BLINCS targets **128-bit classical security** (matching the 128-bit verifying-key root and 128-bit internal hashes). Over $q$ signatures with hypertree height $h = 33$, $k = 16$ FORS trees, and $t = 2^a = 2^{10} = 1{,}024$ leaves per tree ($a = 10$), the probability that a single fresh adversary query lands on a hypertree leaf hit $r$ times and finds all $k$ selected leaves already revealed is:
-  $$P(q) = \sum_{r=0}^{q} \binom{q}{r} 2^{-hr} \left(1 - 2^{-h}\right)^{q-r} \left(1 - (1 - 2^{-a})^r\right)^k.$$
-  Evaluating $-\log_2 P(q)$ gives a FORS cover exponent of **133.2 bits** at $q = 2^{32}$, **126.8 bits** at $2^{33}$, **119.3 bits** at $2^{34}$, and **110.6 bits** at $2^{35}$. This estimates the single-query FORS cover event under independent ideal-hash assumptions; it is not a full multi-user or quantum proof of the entire signature scheme, and no independent human cryptographic audit has been performed.
-- **Zero counter grinding & bounded chain work:** signing performs no rejection sampling or counter grinding, eliminating grinding-induced tail-latency spikes (individual chain lengths still depend on the public signed roots, so execution is not globally constant-time).
-- **Operational signing budget:** the $2^{32}$ per-signing-key budget is an operational requirement not enforced by the library (the state-file counter counts startups, and `Randomness` counts draws in one instance, not total signatures across copies of a seed).
-- **Memory retention:** `Signet` retains its 32-byte seed and derived keys, and signing allocates a transient local `SignWorkspace` freed on return. Neither BLINCS nor `blake3-servil-core` wipes secret key memory on drop. Verification uses only local stack buffers (zero heap allocation). Streaming readers use a fresh local zero-initialized 16 KiB stack buffer, zeroing each slice before calling `Read::read`.
-- **Self-check on imprinting:** in Rust, `Signet::imprint` / `imprint_reader` runs `SignetId::verify_short` over the assembled imprint before returning it, independently checking the serialized salt (`imprint[..16]`) against `short[..16]` and recomputing the FORS and hypertree paths against `id.root` (it does not re-read external streams).
+- **Design target:** 128-bit classical security at up to $q = 2^{32}$ imprints per signet (single-query FORS leaf-cover exponent under ideal hashes: **132.5 bits** at $2^{32}$, **128.5 bits** at $2^{33}$, **123.8 bits** at $2^{34}$, **118.3 bits** at $2^{35}$, **111.9 bits** at $2^{36}$; verified by `python3 tools/optimize.py --check`). These are single-key ideal-hash cover estimates, not a complete multi-user or quantum proof of BLINCS.
+- **Unenforced budget:** BLINCS does not count imprints across runs or across copies of a seed. Do not imprint more than $2^{32}$ things with one signet.
+- **Memory retention:** `Signet` retains its 32-byte seed, derived keys, and 4 KiB top tree; signing allocates a transient local `SignWorkspace` freed on return. Neither BLINCS nor `blake3-servil-core` wipes secret key memory on drop. Verification uses only local stack buffers (zero heap allocation). Streaming readers use a fresh local zero-initialized 16 KiB stack buffer, zeroing each slice before calling `Read::read`.

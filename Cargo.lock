@@ -22,8 +22,42 @@ name = "blincs"
 version = "0.1.0"
 dependencies = [
  "blake3-servil-core",
+ "getrandom",
 ]
+
+[[package]]
+name = "cfg-if"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
+
+[[package]]
+name = "getrandom"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "r-efi",
+]
+
+[[package]]
+name = "libc"
+version = "0.2.191"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
+name = "r-efi"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [metadata]
 "hashset blake3-servil-core 0.11.0+2c43b150bd18c89b6c08a133446c51a3fe6981bc (registry+https://github.com/rust-lang/crates.io-index)" = "blake3-xkkkyze74shiwlp4vbqldwbenb2v4cp2j5uxr7kdtrvzjtfiekva.sha256-xltirxuwethq5pkb4awy6mxuk6qca7n2pgm3pjzebl63nhizsrvq"
 "hashset blake3-servil-version 0.11.0+2c43b150bd18c89b6c08a133446c51a3fe6981bc (registry+https://github.com/rust-lang/crates.io-index)" = "blake3-tfksjy5bqzyorjcffn5ycdwjuuhfyte76dhv2hzvp4klbideqv5q.sha256-zjjsckveah62xljliwjiwcqpvcqm7g6cqqxgsgwnmvp53wl3mzba"
+"hashset cfg-if 1.0.5 (registry+https://github.com/rust-lang/crates.io-index)" = "blake3-saxcuq22o3gkmnnpte46pfpfi6z3iyguzogg367koehspl7tmumq.sha256-jz3eqf23iwu2jbjw2z3pndmrqjygteicvkg2wvew34djateriyaa"
+"hashset getrandom 0.4.3 (registry+https://github.com/rust-lang/crates.io-index)" = "blake3-47zjhna3samnxyhbucgb62hu3irzx27liqco2bge42k3ja6kfihq.sha256-gahiqplvnmxe5skoaj4r6onqjnjce5qtrbjm7ra5t636sbaqmcmq"
+"hashset libc 0.2.191 (registry+https://github.com/rust-lang/crates.io-index)" = "blake3-bjc2nu6lylhgft3bu7iskyyd2icn5nz2jxgjvn22q4lfxlpcbuqq.sha256-mxgypsng2yctmwalgfvntblsmechgcsrkhezqrpsjeccr34reqfa"
+"hashset r-efi 6.0.0 (registry+https://github.com/rust-lang/crates.io-index)" = "blake3-35hrk7xyqa7gw5ms6l5e3rp2tlabkkkqjih737bfn2j4hgtwdywa.sha256-7domtr6vfkarnf6scuohahqnbckw7evq4jatnt2m6j5vpjva3g7q"

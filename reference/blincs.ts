@@ -1,10 +1,9 @@
 // EDUCATIONAL / SPECIFICATION-CONFORMANCE REFERENCE ONLY — FOR READING, NOT PRODUCTION EXECUTION.
 //
-// Written blindly from SPEC.md alone (with no access to src/, reference/blincs.py, or test_vectors/)
-// by anthropic/claude-opus-5.5 on 2026-11-24 as an independent specification-completeness check.
 // Runs without dependencies under Node 24 native TypeScript type-stripping.
 
 import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 
 // ---------------- BLAKE3 ----------------
 const IV = new Uint32Array([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
@@ -71,16 +70,20 @@ function b3(key: Uint32Array, flags: number, input: Uint8Array): Uint8Array {
   return o;
 }
 export const blake3 = (m: Uint8Array): Uint8Array => b3(IV, 0, m);
-export const keyed = (k: Uint8Array, m: Uint8Array): Uint8Array => b3(toWords(k, 0, 32, 8), KEYED_HASH, m);
+export function keyed(k: Uint8Array, m: Uint8Array): Uint8Array {
+  if (k.length !== 32) throw new Error("key must be 32 bytes");
+  return b3(toWords(k, 0, 32, 8), KEYED_HASH, m);
+}
 const enc = new TextEncoder();
 export const derive = (ctx: string, m: Uint8Array): Uint8Array =>
   b3(toWords(b3(IV, DK_CTX, enc.encode(ctx)), 0, 32, 8), DK_MAT, m);
 
 // ---------------- BLINCS ----------------
-const N = 16, CHAINS = 35, FORS_TREES = 16, FORS_HEIGHT = 10, SIG_LEN = 5616;
-const P = "BLINCS 2026-11-24 ";
+const N = 16, LAYERS = 5, TREE_HEIGHT = 7, CHAINS = 35, FORS_TREES = 13, FORS_HEIGHT = 11, SIG_LEN = 5888;
+const P = "BLINCS 2026-11-25 ";
 const CTX_PUBLIC_HASH = P + "public hash", CTX_CONTENT = P + "content", CTX_MIX = P + "randomness: mix",
-  CTX_NEXT_SEED = P + "randomness: seed kept in the file", CTX_RUN_KEY = P + "randomness: key of this run";
+  CTX_FILE_ID = P + "randomness: file id", CTX_NEXT_SEED = P + "randomness: next seed",
+  CTX_RUN_KEY = P + "randomness: key of this run", CTX_KEYGEN_KEY = P + "randomness: keygen key";
 const CHAIN = 2, ONE_TIME_KEY = 3, NODE = 4, FEW_LEAF = 6, FEW_NODE = 7, FEW_ROOT = 8, MESSAGE = 9;
 
 function cat(...xs: Uint8Array[]): Uint8Array {
@@ -98,6 +101,7 @@ function tweak(kind: number, layer: number, tree: number, leaf: number, a: numbe
 }
 const shortHash = (k: Uint8Array, t: Uint8Array, d: Uint8Array): Uint8Array => keyed(k, cat(t, d)).slice(0, N);
 function u64le(x: bigint): Uint8Array {
+  if (x < 0n || x >= (1n << 64n)) throw new Error("u64 out of range");
   const r = new Uint8Array(8); for (let i = 0; i < 8; i++) r[i] = Number((x >> BigInt(8 * i)) & 0xffn); return r;
 }
 function digits(node: Uint8Array): number[] {
@@ -117,14 +121,14 @@ export function verify(vk: Uint8Array, message: Uint8Array, sig: Uint8Array): bo
   const kMsg = keyed(kContent, e);
   const short = cat(e, keyed(kMsg, message));
   const D = keyed(kPub, cat(tweak(MESSAGE, 0, 0, 0, 0, 0), R, root, short));
-  let fb = 0n; for (let i = 19; i >= 0; i--) fb = (fb << 8n) | BigInt(D[i]);
+  let fb = 0n; for (let i = 17; i >= 0; i--) fb = (fb << 8n) | BigInt(D[i]);
   let la = 0n; for (let i = 27; i >= 20; i--) la = (la << 8n) | BigInt(D[i]);
-  const leafAddr = Number(la & ((1n << 33n) - 1n));
+  const leafAddr = Number(la & ((1n << 35n) - 1n));
 
-  // FORS
+  // FORS (13 trees x 2,048 leaves)
   const roots: Uint8Array[] = [];
   for (let t = 0; t < FORS_TREES; t++) {
-    const idx = Number((fb >> BigInt(10 * t)) & 0x3ffn);
+    const idx = Number((fb >> BigInt(FORS_HEIGHT * t)) & 0x7ffn);
     const off = 32 + t * (1 + FORS_HEIGHT) * N;
     let v = shortHash(kPub, tweak(FEW_LEAF, 0, leafAddr, t, 0, idx), sig.subarray(off, off + N));
     for (let h = 0; h < FORS_HEIGHT; h++) {
@@ -136,11 +140,10 @@ export function verify(vk: Uint8Array, message: Uint8Array, sig: Uint8Array): bo
   }
   let node = shortHash(kPub, tweak(FEW_ROOT, 0, leafAddr, 0, 0, 0), cat(...roots));
 
-  // Hypertree
+  // Hypertree (5 uniform height-7 layers)
   let addr = leafAddr, off = 32 + FORS_TREES * (1 + FORS_HEIGHT) * N;
-  for (let layer = 0; layer < 4; layer++) {
-    const height = layer === 3 ? 12 : 7;
-    const leaf = addr % 2 ** height, tree = Math.floor(addr / 2 ** height);
+  for (let layer = 0; layer < LAYERS; layer++) {
+    const leaf = addr % (1 << TREE_HEIGHT), tree = Math.floor(addr / (1 << TREE_HEIGHT));
     const d = digits(node);
     const ends: Uint8Array[] = [];
     for (let c = 0; c < CHAINS; c++) {
@@ -149,23 +152,33 @@ export function verify(vk: Uint8Array, message: Uint8Array, sig: Uint8Array): bo
       ends.push(v);
     }
     let v = shortHash(kPub, tweak(ONE_TIME_KEY, layer, tree, leaf, 0, 0), cat(...ends));
-    for (let lv = 1; lv <= height; lv++) {
+    for (let lv = 1; lv <= TREE_HEIGHT; lv++) {
       const a0 = off + (CHAINS + lv - 1) * N;
       const auth = sig.subarray(a0, a0 + N);
       const tw = tweak(NODE, layer, tree, 0, lv, leaf >> lv);
       v = shortHash(kPub, tw, ((leaf >> (lv - 1)) & 1) === 0 ? cat(v, auth) : cat(auth, v));
     }
-    node = v; addr = tree; off += (CHAINS + height) * N;
+    node = v; addr = tree; off += (CHAINS + TREE_HEIGHT) * N;
   }
   let diff = 0; for (let i = 0; i < 16; i++) diff |= node[i] ^ root[i];
   return diff === 0;
 }
 
-export function mix(seed: Uint8Array, count: bigint, system: Uint8Array, clock: Uint8Array): [Uint8Array, Uint8Array] {
-  const pool = derive(CTX_MIX, cat(seed, u64le(count), system, clock));
-  return [derive(CTX_NEXT_SEED, pool), derive(CTX_RUN_KEY, pool)];
+export function mixPool(seeds: Uint8Array[], system: Uint8Array, clock: Uint8Array): Uint8Array {
+  if (system.length !== 32) throw new Error("system randomness must be 32 bytes");
+  const parts: Uint8Array[] = [];
+  for (const s of seeds) {
+    if (s.length > 32) throw new Error("seed file exceeds 32 bytes");
+    parts.push(new Uint8Array([s.length]), s);
+  }
+  parts.push(new Uint8Array([0xff]), system, clock);
+  return derive(CTX_MIX, cat(...parts));
 }
-export function draw(runKey: Uint8Array, n: bigint): Uint8Array { return keyed(runKey, u64le(n)); }
+export function expandPool(pool: Uint8Array): [Uint8Array, Uint8Array, Uint8Array, Uint8Array] {
+  if (pool.length !== 32) throw new Error("pool must be 32 bytes");
+  return [derive(CTX_FILE_ID, pool).slice(0, N), derive(CTX_NEXT_SEED, pool), derive(CTX_RUN_KEY, pool), derive(CTX_KEYGEN_KEY, pool)];
+}
+export function draw(key: Uint8Array, n: bigint): Uint8Array { return keyed(key, u64le(n)); }
 
 // ---------------- CLI ----------------
 function hex(s: string, len?: number): Uint8Array {
@@ -181,21 +194,23 @@ function u64arg(s: string): bigint {
 }
 
 const proc = (globalThis as any).process;
-if (proc && Array.isArray(proc.argv)) {
+const isMain = proc && Array.isArray(proc.argv) && proc.argv[1] && import.meta.url === pathToFileURL(proc.argv[1]).href;
+if (isMain) {
   const a: string[] = proc.argv.slice(2);
   try {
     if (a[0] === "--verify" && a.length === 4) {
-      let ok = false;
-      try { ok = verify(hex(a[1]), new Uint8Array(readFileSync(a[3])), new Uint8Array(readFileSync(a[2]))); } catch { ok = false; }
+      const ok = verify(hex(a[1], 32), new Uint8Array(readFileSync(a[3])), new Uint8Array(readFileSync(a[2])));
       console.log(ok ? "true" : "false");
       proc.exit(ok ? 0 : 1);
     } else if (a[0] === "--mix" && a.length === 5) {
-      const [ns, rk] = mix(hex(a[1], 32), u64arg(a[2]), hex(a[3]), enc.encode(a[4]));
-      console.log(toHex(ns) + " " + toHex(rk));
+      const seeds = a[1] === "" ? [] : a[1].split(",").map((s) => hex(s));
+      const [fid, ns, rk, kk] = expandPool(mixPool(seeds, hex(a[2], 32), enc.encode(a[3])));
+      console.log([fid, ns, rk, kk].map(toHex).join(" "));
+      if (a[4] !== "-") console.log(toHex(draw(rk, u64arg(a[4]))));
     } else if (a[0] === "--draw" && a.length === 3) {
       console.log(toHex(draw(hex(a[1], 32), u64arg(a[2]))));
-    } else if (a.length > 0) {
-      console.error("usage: --verify <vk_hex> <sig_path> <msg_path> | --mix <seed_hex> <count> <sys_hex> <clock_utf8> | --draw <run_key_hex> <n>");
+    } else {
+      console.error("usage: --verify <vk_hex> <sig_path> <msg_path> | --mix <csv_seed_hex> <sys_hex> <clock_utf8> <draw_n|-> | --draw <key_hex> <n>");
       proc.exit(2);
     }
   } catch (err) {

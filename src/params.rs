@@ -5,11 +5,9 @@ pub const SEED_LEN: usize = 32;
 pub const SIGNET_ID_LEN: usize = 32;
 
 pub(crate) const N: usize = 16;
-pub(crate) const LAYERS: usize = 4;
-pub(crate) const LOWER_HEIGHT: usize = 7;
-pub(crate) const LOWER_LEAVES: usize = 1 << LOWER_HEIGHT;
-pub(crate) const TOP_HEIGHT: usize = 12;
-pub(crate) const TOP_LEAVES: usize = 1 << TOP_HEIGHT;
+pub(crate) const LAYERS: usize = 5;
+pub(crate) const TREE_HEIGHT: usize = 7;
+pub(crate) const TREE_LEAVES: usize = 1 << TREE_HEIGHT;
 
 pub(crate) const W: usize = 16;
 pub(crate) const CHAIN_STEPS: u8 = 15;
@@ -17,34 +15,35 @@ pub(crate) const MSG_CHAINS: usize = 2 * N;
 pub(crate) const CSUM_CHAINS: usize = 3;
 pub(crate) const CHAINS: usize = MSG_CHAINS + CSUM_CHAINS;
 
-pub(crate) const FORS_HEIGHT: usize = 10;
+pub(crate) const FORS_HEIGHT: usize = 11;
 pub(crate) const FORS_LEAVES: usize = 1 << FORS_HEIGHT;
-pub(crate) const FORS_TREES: usize = 16;
-pub(crate) const HYPER_BITS: usize = TOP_HEIGHT + (LAYERS - 1) * LOWER_HEIGHT;
+pub(crate) const FORS_TREES: usize = 13;
+pub(crate) const HYPER_BITS: usize = LAYERS * TREE_HEIGHT;
 
 pub(crate) const SHORT_LEN: usize = N + 32;
 pub(crate) const FORS_LEN: usize = FORS_TREES * (1 + FORS_HEIGHT) * N;
-pub(crate) const LOWER_LAYER_LEN: usize = (CHAINS + LOWER_HEIGHT) * N;
-pub(crate) const TOP_LAYER_LEN: usize = (CHAINS + TOP_HEIGHT) * N;
-pub const IMPRINT_LEN: usize = 2 * N + FORS_LEN + (LAYERS - 1) * LOWER_LAYER_LEN + TOP_LAYER_LEN;
+pub(crate) const LAYER_LEN: usize = (CHAINS + TREE_HEIGHT) * N;
+pub const IMPRINT_LEN: usize = 2 * N + FORS_LEN + LAYERS * LAYER_LEN;
 
 const _: () = {
     assert!(W == (CHAIN_STEPS as usize) + 1 && CHAINS == 35 && MSG_CHAINS * 4 == N * 8);
-    assert!(FORS_TREES * FORS_HEIGHT == 160 && HYPER_BITS == 33 && HYPER_BITS < 48);
-    assert!(FORS_TREES * FORS_HEIGHT + HYPER_BITS <= 256);
-    assert!(IMPRINT_LEN == 5616 && 2 * N + FORS_LEN + 3 * LOWER_LAYER_LEN + TOP_LAYER_LEN == IMPRINT_LEN);
+    assert!(FORS_TREES * FORS_HEIGHT == 143 && HYPER_BITS == 35 && HYPER_BITS < 48);
+    assert!(IMPRINT_LEN == 5888 && 2 * N + FORS_LEN + 5 * LAYER_LEN == IMPRINT_LEN);
 };
 
 // Key-derivation contexts (SPEC.md, "Key-derivation contexts").
-pub(crate) const CTX_SECRET_VALUES: &str = "BLINCS 2026-11-24 signet: secret values";
-pub(crate) const CTX_CONTENT_SALT: &str = "BLINCS 2026-11-24 signet: content salt";
-pub(crate) const CTX_RANDOMIZER: &str = "BLINCS 2026-11-24 signet: randomizer";
-pub(crate) const CTX_PUBLIC_SEED: &str = "BLINCS 2026-11-24 signet: public seed";
-pub(crate) const CTX_PUBLIC_HASH: &str = "BLINCS 2026-11-24 public hash";
-pub(crate) const CTX_CONTENT: &str = "BLINCS 2026-11-24 content";
-pub(crate) const CTX_MIX: &str = "BLINCS 2026-11-24 randomness: mix";
-pub(crate) const CTX_NEXT_SEED: &str = "BLINCS 2026-11-24 randomness: seed kept in the file";
-pub(crate) const CTX_RUN_KEY: &str = "BLINCS 2026-11-24 randomness: key of this run";
+pub(crate) const CTX_SECRET_VALUES: &str = "BLINCS 2026-11-25 signet: secret values";
+pub(crate) const CTX_CONTENT_SALT: &str = "BLINCS 2026-11-25 signet: content salt";
+pub(crate) const CTX_RANDOMIZER: &str = "BLINCS 2026-11-25 signet: randomizer";
+pub(crate) const CTX_PUBLIC_SEED: &str = "BLINCS 2026-11-25 signet: public seed";
+pub(crate) const CTX_GENERATE_SIGNET: &str = "BLINCS 2026-11-25 signet: generate";
+pub(crate) const CTX_PUBLIC_HASH: &str = "BLINCS 2026-11-25 public hash";
+pub(crate) const CTX_CONTENT: &str = "BLINCS 2026-11-25 content";
+pub(crate) const CTX_MIX: &str = "BLINCS 2026-11-25 randomness: mix";
+pub(crate) const CTX_FILE_ID: &str = "BLINCS 2026-11-25 randomness: file id";
+pub(crate) const CTX_NEXT_SEED: &str = "BLINCS 2026-11-25 randomness: next seed";
+pub(crate) const CTX_RUN_KEY: &str = "BLINCS 2026-11-25 randomness: key of this run";
+pub(crate) const CTX_KEYGEN_KEY: &str = "BLINCS 2026-11-25 randomness: keygen key";
 
 #[inline]
 pub(crate) fn ensure_init() {
@@ -129,7 +128,7 @@ pub(crate) enum TweakKind {
     Message = 9,
 }
 
-/// Hypertree layer (`0..4`), single source of truth for height, leaf count, and signature slice layout.
+/// Uniform hypertree layer (`0..5`), each of height `TREE_HEIGHT = 7` (`128` leaves).
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Layer {
@@ -137,12 +136,13 @@ pub(crate) enum Layer {
     L1 = 1,
     L2 = 2,
     L3 = 3,
+    L4 = 4,
 }
 
 impl Layer {
-    pub(crate) const ALL: [Self; LAYERS] = [Self::L0, Self::L1, Self::L2, Self::L3];
-    pub(crate) const LOWER: [Self; LAYERS - 1] = [Self::L0, Self::L1, Self::L2];
-    pub(crate) const TOP: Self = Self::L3;
+    pub(crate) const ALL: [Self; LAYERS] = [Self::L0, Self::L1, Self::L2, Self::L3, Self::L4];
+    pub(crate) const LOWER: [Self; LAYERS - 1] = [Self::L0, Self::L1, Self::L2, Self::L3];
+    pub(crate) const TOP: Self = Self::L4;
 
     pub(crate) const fn index(self) -> usize {
         self as usize
@@ -152,34 +152,17 @@ impl Layer {
         self as u8
     }
 
-    pub(crate) const fn height(self) -> usize {
-        if matches!(self, Self::L3) { TOP_HEIGHT } else { LOWER_HEIGHT }
-    }
-
-    pub(crate) const fn leaves(self) -> usize {
-        if matches!(self, Self::L3) { TOP_LEAVES } else { LOWER_LEAVES }
-    }
-
-    /// Number of trees at this layer (`2^26`, `2^19`, `2^12`, `1` for layers 0..=3).
+    /// Number of trees at this layer (`2^28`, `2^21`, `2^14`, `2^7`, `1` for layers 0..=4).
     pub(crate) const fn trees(self) -> u64 {
-        match self {
-            Self::L0 => 1u64 << (HYPER_BITS - LOWER_HEIGHT),
-            Self::L1 => 1u64 << (HYPER_BITS - 2 * LOWER_HEIGHT),
-            Self::L2 => 1u64 << (HYPER_BITS - 3 * LOWER_HEIGHT),
-            Self::L3 => 1,
-        }
-    }
-
-    pub(crate) const fn sig_len(self) -> usize {
-        if matches!(self, Self::L3) { TOP_LAYER_LEN } else { LOWER_LAYER_LEN }
+        1u64 << (HYPER_BITS - (self.index() + 1) * TREE_HEIGHT)
     }
 
     pub(crate) const fn sig_offset(self) -> usize {
-        2 * N + FORS_LEN + self.index() * LOWER_LAYER_LEN
+        2 * N + FORS_LEN + self.index() * LAYER_LEN
     }
 }
 
-/// Validated 33-bit hypertree leaf address (`< 2^33`).
+/// Validated 35-bit hypertree leaf address (`< 2^35`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LeafAddr(u64);
 
@@ -192,14 +175,14 @@ impl LeafAddr {
         self.0
     }
 
-    /// Decompose this 33-bit address into `(tree, leaf)` for each of the 4 hypertree layers.
+    /// Decompose this 35-bit address into `(tree, leaf)` for each of the 5 uniform hypertree layers.
     pub(crate) fn split_layers(self) -> [(u64, u16); LAYERS] {
         let mut out = [(0u64, 0u16); LAYERS];
         let mut addr = self.0;
+        let mask = (1u64 << TREE_HEIGHT) - 1;
         for layer in Layer::ALL {
-            let h = layer.height();
-            let leaf = u16::try_from(addr & ((1u64 << h) - 1)).unwrap();
-            addr >>= h;
+            let leaf = u16::try_from(addr & mask).unwrap();
+            addr >>= TREE_HEIGHT;
             out[layer.index()] = (addr, leaf);
         }
         out

@@ -1,12 +1,14 @@
-use crate::params::{CHAIN_STEPS, CHAINS, FORS_LEAVES, Layer, MSG_CHAINS, N, PublicKey, SecretKey, TweakKind, first_n, pack_pair, pack_tagged, tweak};
+use crate::params::{
+    CHAIN_STEPS, CHAINS, FORS_LEAVES, LAYER_LEN, Layer, MSG_CHAINS, N, PublicKey, SecretKey, TREE_HEIGHT, TREE_LEAVES, TweakKind, first_n, pack_pair,
+    pack_tagged, tweak,
+};
 use blake3_servil_core::throughput::{Batch, Prepared, TreeHasher};
 
-pub(crate) const WOTS_CHUNK_LEAVES: usize = 128;
-const WOTS_BATCH_SLOTS: usize = WOTS_CHUNK_LEAVES * CHAINS;
+const WOTS_BATCH_SLOTS: usize = TREE_LEAVES * CHAINS;
 const MERKLE_BATCH_SLOTS: usize = FORS_LEAVES / 2;
 
 const _: () = {
-    assert!(WOTS_BATCH_SLOTS >= FORS_LEAVES && MERKLE_BATCH_SLOTS == 512);
+    assert!(WOTS_BATCH_SLOTS == 4480 && WOTS_BATCH_SLOTS >= FORS_LEAVES && MERKLE_BATCH_SLOTS == 1024);
 };
 
 /// Transient heap workspace owned by a single `Signet::from_seed` or `Signet::imprint` call.
@@ -24,13 +26,13 @@ impl SignWorkspace {
             b16: vec![[0u8; 16]; WOTS_BATCH_SLOTS],
             b32: vec![[0u8; 32]; WOTS_BATCH_SLOTS],
             b48: vec![[0u8; 48]; MERKLE_BATCH_SLOTS],
-            b_pk: Batch::new(16 + N * CHAINS, WOTS_CHUNK_LEAVES),
+            b_pk: Batch::new(16 + N * CHAINS, TREE_LEAVES),
             out: vec![[0u8; 32]; WOTS_BATCH_SLOTS],
         }
     }
 }
 
-/// Checked position of a one-time signature in the hypertree (`tree < layer.trees()` and `leaf < layer.leaves()`).
+/// Checked position of a one-time signature in the hypertree (`tree < layer.trees()` and `leaf < TREE_LEAVES`).
 #[derive(Clone, Copy)]
 pub(crate) struct Pos {
     layer: Layer,
@@ -40,7 +42,7 @@ pub(crate) struct Pos {
 
 impl Pos {
     pub(crate) fn new(layer: Layer, tree: u64, leaf: u16) -> Self {
-        assert!(tree < layer.trees() && usize::from(leaf) < layer.leaves());
+        assert!(tree < layer.trees() && usize::from(leaf) < TREE_LEAVES);
         Self { layer, tree, leaf }
     }
 }
@@ -99,100 +101,81 @@ pub(crate) fn advance_chains(public: &TreeHasher, pos: Pos, values: &mut [[u8; N
     }
 }
 
-/// Build `out_leaves.len()` consecutive WOTS+ verifying-key leaves starting at `pos.leaf`.
-pub(crate) fn build_wots_leaves_chunk(secret: &SecretKey, public: &PublicKey, pos: Pos, ws: &mut SignWorkspace, out_leaves: &mut [[u8; N]]) {
-    let count = out_leaves.len();
-    assert!(count > 0 && count <= WOTS_CHUNK_LEAVES && usize::from(pos.leaf) + count <= pos.layer.leaves());
-    let total = count * CHAINS;
-    let layer = pos.layer.as_u8();
+/// Build all `TREE_LEAVES` (128) WOTS+ verifying-key leaves for `(layer, tree)` and its 1-indexed
+/// binary Merkle heap (`2 * TREE_LEAVES` nodes; index `1` is the root).
+pub(crate) fn build_tree_heap(secret: &SecretKey, public: &PublicKey, layer: Layer, tree: u64, ws: &mut SignWorkspace) -> [[u8; N]; 2 * TREE_LEAVES] {
+    assert!(tree < layer.trees());
+    let layer_u8 = layer.as_u8();
     let (sec_h, pub_h) = (secret.hasher(true), public.hasher(true));
 
-    for i in 0..count {
-        let leaf = pos.leaf + u16::try_from(i).unwrap();
+    for i in 0..TREE_LEAVES {
+        let leaf = u16::try_from(i).unwrap();
         for c in 0..CHAINS {
-            ws.b16[i * CHAINS + c] = tweak(TweakKind::ChainSecret, layer, pos.tree, leaf, u16::try_from(c).unwrap(), 0);
+            ws.b16[i * CHAINS + c] = tweak(TweakKind::ChainSecret, layer_u8, tree, leaf, u16::try_from(c).unwrap(), 0);
         }
     }
-    sec_h.hash_many(&ws.b16[..total], &mut ws.out[..total]);
+    sec_h.hash_many(&ws.b16[..WOTS_BATCH_SLOTS], &mut ws.out[..WOTS_BATCH_SLOTS]);
 
-    for i in 0..count {
-        let leaf = pos.leaf + u16::try_from(i).unwrap();
+    for i in 0..TREE_LEAVES {
+        let leaf = u16::try_from(i).unwrap();
         for c in 0..CHAINS {
             let slot = i * CHAINS + c;
-            pack_tagged(&mut ws.b32[slot], tweak(TweakKind::Chain, layer, pos.tree, leaf, u16::try_from(c).unwrap(), 0), &ws.out[slot][..N]);
+            pack_tagged(&mut ws.b32[slot], tweak(TweakKind::Chain, layer_u8, tree, leaf, u16::try_from(c).unwrap(), 0), &ws.out[slot][..N]);
         }
     }
-    pub_h.hash_many(&ws.b32[..total], &mut ws.out[..total]);
+    pub_h.hash_many(&ws.b32[..WOTS_BATCH_SLOTS], &mut ws.out[..WOTS_BATCH_SLOTS]);
     for step in 1..CHAIN_STEPS {
         let next = u32::from(step).to_le_bytes();
-        for slot in 0..total {
+        for slot in 0..WOTS_BATCH_SLOTS {
             let m = &mut ws.b32[slot];
             m[12..16].copy_from_slice(&next);
             m[16..32].copy_from_slice(&ws.out[slot][..N]);
         }
-        pub_h.hash_many(&ws.b32[..total], &mut ws.out[..total]);
+        pub_h.hash_many(&ws.b32[..WOTS_BATCH_SLOTS], &mut ws.out[..WOTS_BATCH_SLOTS]);
     }
 
-    for i in 0..count {
-        let leaf = pos.leaf + u16::try_from(i).unwrap();
+    for i in 0..TREE_LEAVES {
+        let leaf = u16::try_from(i).unwrap();
         let m = ws.b_pk.message_mut(i);
-        m[..16].copy_from_slice(&tweak(TweakKind::OneTimeKey, layer, pos.tree, leaf, 0, 0));
+        m[..16].copy_from_slice(&tweak(TweakKind::OneTimeKey, layer_u8, tree, leaf, 0, 0));
         for c in 0..CHAINS {
             m[16 + c * N..16 + (c + 1) * N].copy_from_slice(&ws.out[i * CHAINS + c][..N]);
         }
     }
-    pub_h.hash_many(&ws.b_pk.part(0..count), &mut ws.out[..count]);
-    for i in 0..count {
-        out_leaves[i] = first_n(&ws.out[i]);
+    pub_h.hash_many(&ws.b_pk.part(0..TREE_LEAVES), &mut ws.out[..TREE_LEAVES]);
+
+    let mut nodes = [[0u8; N]; 2 * TREE_LEAVES];
+    for i in 0..TREE_LEAVES {
+        nodes[TREE_LEAVES + i] = first_n(&ws.out[i]);
     }
-}
 
-/// Build the 1-indexed binary Merkle heap (`2 * layer.leaves()` nodes; index `1` is the root).
-pub(crate) fn build_merkle_heap(public: &PublicKey, layer: Layer, tree: u64, leaves: &[[u8; N]], ws: &mut SignWorkspace) -> Vec<[u8; N]> {
-    let n_leaves = layer.leaves();
-    assert_eq!(leaves.len(), n_leaves);
-    let mut nodes = vec![[0u8; N]; 2 * n_leaves];
-    nodes[n_leaves..].copy_from_slice(leaves);
-
-    let pub_h = public.hasher(true);
-    let layer_u8 = layer.as_u8();
-    let (mut level_start, mut count) = (n_leaves, n_leaves);
-
-    for level in 1..=layer.height() {
+    let (mut level_start, mut count) = (TREE_LEAVES, TREE_LEAVES);
+    for level in 1..=TREE_HEIGHT {
         let level_u16 = u16::try_from(level).unwrap();
         let (parents, parent_start) = (count / 2, level_start / 2);
-        let chunk = parents.min(ws.b48.len());
-        assert_eq!(parents % chunk, 0);
-        let mut offset = 0usize;
-        while offset < parents {
-            for (j, slot) in ws.b48[..chunk].iter_mut().enumerate() {
-                let idx = offset + j;
-                pack_pair(
-                    slot,
-                    tweak(TweakKind::Node, layer_u8, tree, 0, level_u16, u32::try_from(idx).unwrap()),
-                    &nodes[level_start + 2 * idx],
-                    &nodes[level_start + 2 * idx + 1],
-                );
-            }
-            pub_h.hash_many(&ws.b48[..chunk], &mut ws.out[..chunk]);
-            for j in 0..chunk {
-                nodes[parent_start + offset + j] = first_n(&ws.out[j]);
-            }
-            offset += chunk;
+        for (j, slot) in ws.b48[..parents].iter_mut().enumerate() {
+            pack_pair(
+                slot,
+                tweak(TweakKind::Node, layer_u8, tree, 0, level_u16, u32::try_from(j).unwrap()),
+                &nodes[level_start + 2 * j],
+                &nodes[level_start + 2 * j + 1],
+            );
+        }
+        pub_h.hash_many(&ws.b48[..parents], &mut ws.out[..parents]);
+        for j in 0..parents {
+            nodes[parent_start + j] = first_n(&ws.out[j]);
         }
         (level_start, count) = (parent_start, parents);
     }
     nodes
 }
 
-/// Write a WOTS+ signature (35 chains) and authentication path (`pos.layer.height()` nodes) into `out`.
-pub(crate) fn write_layer_signature(secret: &SecretKey, public: &PublicKey, pos: Pos, node: &[u8; N], tree_nodes: &[[u8; N]], out: &mut [u8]) {
-    let layer = pos.layer;
-    assert_eq!(out.len(), layer.sig_len());
-    assert_eq!(tree_nodes.len(), 2 * layer.leaves());
+/// Write a WOTS+ signature (35 chains) and authentication path (`TREE_HEIGHT` nodes) into `out`.
+pub(crate) fn write_layer_signature(secret: &SecretKey, public: &PublicKey, pos: Pos, node: &[u8; N], tree_nodes: &[[u8; N]; 2 * TREE_LEAVES], out: &mut [u8]) {
+    assert_eq!(out.len(), LAYER_LEN);
 
     let (sec_h, pub_h) = (secret.hasher(false), public.hasher(false));
-    let layer_u8 = layer.as_u8();
+    let layer_u8 = pos.layer.as_u8();
     let mut b16 = [[0u8; 16]; CHAINS];
     let mut hashes = [[0u8; 32]; CHAINS];
     for (c, slot) in b16.iter_mut().enumerate() {
@@ -205,9 +188,9 @@ pub(crate) fn write_layer_signature(secret: &SecretKey, public: &PublicKey, pos:
     for c in 0..CHAINS {
         out[c * N..(c + 1) * N].copy_from_slice(&values[c]);
     }
-    let mut cursor = layer.leaves() + usize::from(pos.leaf);
+    let mut cursor = TREE_LEAVES + usize::from(pos.leaf);
     let auth_off = CHAINS * N;
-    for level in 0..layer.height() {
+    for level in 0..TREE_HEIGHT {
         out[auth_off + level * N..auth_off + (level + 1) * N].copy_from_slice(&tree_nodes[cursor ^ 1]);
         cursor >>= 1;
     }
@@ -215,13 +198,12 @@ pub(crate) fn write_layer_signature(secret: &SecretKey, public: &PublicKey, pos:
 
 /// Verify one hypertree layer signature and return its reconstructed Merkle root.
 pub(crate) fn verify_layer(public: &TreeHasher, pos: Pos, node: &[u8; N], layer_sig: &[u8]) -> [u8; N] {
-    let layer = pos.layer;
-    assert_eq!(layer_sig.len(), layer.sig_len());
+    assert_eq!(layer_sig.len(), LAYER_LEN);
 
     let mut values: [[u8; N]; CHAINS] = core::array::from_fn(|c| layer_sig[c * N..(c + 1) * N].try_into().unwrap());
     advance_chains(public, pos, &mut values, &digits(node), &[CHAIN_STEPS; CHAINS]);
 
-    let layer_u8 = layer.as_u8();
+    let layer_u8 = pos.layer.as_u8();
     let mut pk_in = [0u8; 16 + N * CHAINS];
     pk_in[..16].copy_from_slice(&tweak(TweakKind::OneTimeKey, layer_u8, pos.tree, pos.leaf, 0, 0));
     for c in 0..CHAINS {
@@ -232,7 +214,7 @@ pub(crate) fn verify_layer(public: &TreeHasher, pos: Pos, node: &[u8; N], layer_
     let auth_off = CHAINS * N;
     let mut index = u32::from(pos.leaf);
     let mut pair = [0u8; 48];
-    for level in 1..=layer.height() {
+    for level in 1..=TREE_HEIGHT {
         let sib = &layer_sig[auth_off + (level - 1) * N..auth_off + level * N];
         let (left, right) = if index & 1 == 0 { (&cur[..], sib) } else { (sib, &cur[..]) };
         pack_pair(&mut pair, tweak(TweakKind::Node, layer_u8, pos.tree, 0, u16::try_from(level).unwrap(), index >> 1), left, right);
