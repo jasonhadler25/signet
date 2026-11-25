@@ -47,7 +47,7 @@ A BLINCS imprint is 7,488 bytes in Base64.
 - **You need the smallest post-quantum signatures and accept lattices.** ML-DSA-44 signatures are 2,420 B.
 - **You do not need quantum resistance.** Ed25519 signatures are 64 B.
 - **You cannot stay within 2³² signatures per signet.**
-- **You must sign on a non-Unix platform today.**
+- **Your platform is not on the supported platforms list below.**
 - **Anything valuable depends on it.**
 
 ## Quick Start
@@ -195,10 +195,12 @@ The library does not count imprints across runs or across copies of a seed. When
 - **Hash dependency:** the single runtime dependency is pinned exactly, `blake3-servil-core = "=0.11.0"` (**2 external crates** total in `Cargo.lock`, both BLAKE3 + SHA-256 hashset-verified). It runs strictly single-threaded with zero background worker threads, supplying single-core SIMD/SME2 batch hashing through its assembly kernels.
 - **Rust code:** `blincs` itself is pure safe Rust (`#![forbid(unsafe_code)]`, zero `Drop` implementations, ~890 lines of shipped code). It requires `std` today.
 
-**Where it runs:**
+**Supported platforms:**
 
-- **Signing:** `Randomness` is Unix-only today (`/dev/urandom`, `flock`).
-- **Verification:** `SignetId` uses no OS or filesystem facilities and zero heap allocations.
+- **Linux** (`x86_64`, `aarch64`)
+- **macOS** (`x86_64`, `aarch64`)
+
+If your platform is not on this list, this software is not expected to work for that use. (`Randomness` uses Unix `/dev/urandom`, `0600` file mode, and `flock`.)
 
 **Other implementations:**
 
@@ -241,7 +243,7 @@ Signing has no counter-grinding retry loop. Full cycle counts, IPC, and the 1-co
 
 **[Project 11](https://research.projecteleven.com/)**
 
-- **Conor Deegan** gave feedback on an early `SPEC.md` draft. He encouraged a taller, in-memory top layer and optimizing for signing time. With **julienif**, he co-authored [PQC Suite B](https://github.com/PQC-Suite-B/signatures), the SLH-DSA implementation and benchmark harness reproduced in `BENCHMARKS.md`. PQC Suite B builds on RustCrypto's `slh-dsa`.
+- **Conor Deegan** gave feedback on an early `SPEC.md` draft, encouraged optimizing for signing time, and inspired BLINCS's constrained-device-first parameter search approach (targeting Good Enough UX on constrained signing hardware while minimizing desktop costs). With **julienif**, he co-authored [PQC Suite B](https://github.com/PQC-Suite-B/signatures), the SLH-DSA implementation and benchmark harness reproduced in `BENCHMARKS.md`. PQC Suite B builds on RustCrypto's `slh-dsa`.
 - **Alessandro Baiocchi, Matteo Vena, and Matteo Vicari** built the [SPHINCS+ Parameter Explorer](https://research.projecteleven.com/tools/sphincs-parameter). Their research on [taller cached top trees](https://research.projecteleven.com/articles/raising-sphincs-lifetime-budgets) shaped BLINCS's layout.
 
 **Foundations**

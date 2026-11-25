@@ -30,7 +30,7 @@ tools/
   controls.py           16 planted-fault controls
   counts.py             Shipped-code safety counts (0 unsafe, 0 debug_assert!, 0 truncation allows, 0 Drop)
   domain_sep.py         Static & dynamic domain-separation and tweak-uniqueness check
-  optimize.py           Reproducible parameter optimizer (unknown-thresholds model)
+  optimize.py           Reproducible constrained-device-first parameter search (inspired by Conor Deegan, Project 11)
   mutants/              cargo-mutants runner and known-survivors list
   land.py               Exact-commit landing gate
 bench/                  Standalone benchmark crate using bench-hashes' `clocks`

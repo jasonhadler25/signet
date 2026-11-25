@@ -44,29 +44,49 @@ Under the single-key ideal-hash FORS leaf-cover model (`h = 33`, `k = 16` trees 
 
 ---
 
-## 3. Minimax tradeoff and why `12 + 3×7` won
+## 3. Parameter search: constrained-device-first UX while minimizing desktop costs
 
-Stateless hash-based signatures trade off three costs with completely different units:
+*Design approach inspired by **Conor Deegan** of [Project 11](https://research.projecteleven.com/), who pointed out that tuning solely for an implicit desktop CPU can leave constrained signing hardware (such as a Ledger hardware wallet) with poor keygen or signing latency.*
 
-1. **Signature size $B$** (bytes — packets, commits, headers, certificates, logs),
-2. **Signing time $S$** (milliseconds — interactive latency, release pipelines, servers), and
-3. **Verification time $V$** (microseconds — high-fanout verifiers, package registries, constrained clients).
+Instead of optimizing solely on a desktop machine, BLINCS's reproducible parameter search (`python3 tools/optimize.py`) works in three transparent steps:
 
-Following Ron Rivest's "minimax strategy" ([`docs/history/manifesto.md`](docs/history/manifesto.md)) — *perform well enough for many use cases instead of maximizing one metric to the detriment of others* — we use **Leximin $L_\infty$ ratio above the candidate-family Pareto floor** (`python3 tools/optimize.py`):
+### Step 1 — Fix security target and construction family
 
-1. **Fix the hard requirements first:** $\ge 128$-bit single-query FORS cover exponent at $q = 2^{32}$ and a top-tree height cap.
-2. **Compute the Pareto floor** $(B_{\min}, S_{\min}, V_{\min})$ over the enumerated `WOTS+` + `FORS` candidate family under single-core Apple M6 `blake3-servil-core = "=0.11.0"` timings.
-3. **Measure each dimension dimensionlessly** as its blowup above that floor: $r_B = B / B_{\min}$, $r_S = S / S_{\min}$, $r_V = V / V_{\min}$.
-4. **Minimize the worst blowup first (Leximin $L_\infty$):** sort $(r_{(1)} \ge r_{(2)} \ge r_{(3)})$ and minimize lexicographically.
+- Standard `WOTS+` ($w \in \{8, 16, 32\}$) + `FORS` (zero counter grinding, zero Octopus path merging).
+- Per-signet budget $q = 2^{32}$, with $\ge 128$-bit single-query FORS leaf-cover exponent under ideal hashes (`h + a * k <= 256`).
 
-### Protocol simplifications that led to `12 + 3×7`
+### Step 2 — Enforce "Good Enough UX" on the most constrained feasible signing devices
 
-1. **Standard `WOTS+` (`w = 16`, 35 chains) + `FORS` (`16` trees × `1,024` leaves) instead of `WOTS+C` + `PORS+FP`:**
-   - Our earliest draft squeezed below 4 KiB (`3,988 B`) using `w = 32` + `WOTS+C` + `PORS+FP` + Octopus path merging, requiring counter grinding loops, deduplication/sorting, and trailing-zero padding checks.
-   - Moving into the `~5.5 KiB` band (`5,616 B`, `7,488 B` Base64) eliminated every piece of counter-grinding and path-merging machinery while cutting signing time dramatically, raising the FORS cover margin (`133.2` bits at $2^{32}$), and shrinking specification and code complexity.
-2. **Irregular hypertree `12 + 3×7` (128 KiB top tree, zero disk cache) instead of `15 + 3×6` (1 MiB disk cache):**
-   - Moving 3 levels from the top tree down to the 3 lower layers keeps identical wire size (`5,616 B`), identical FORS cover exponent (`133.2` bits), and slightly faster verification (`21.3 µs` on 1 core), while cutting top-tree RAM 8× (`1 MiB` → `128 KiB`) and cold `Signet::from_seed` ~8× (`20.53 ms` on 1 core, `23.07 ms` cold 1-shot sign) — fast enough for interactive CLIs with **zero on-disk cache format or API**.
-   - Compared to uniform hypertrees at similar size (such as `5×7` at `5,888 B` or `4×8` at `5,488 B`), `12 + 3×7` stays noticeably faster on single-core warm signing (`2.54 ms`) while keeping `TOP_HEIGHT = 12` as a single constant.
+Not every hardware security device can run custom BLAKE3/BLINCS code:
+
+- **Closed-firmware silicon (cannot run custom algorithms unless added by the vendor):** Apple Secure Enclave (SEP), Android StrongBox / Titan M2 / Knox Vault / Qualcomm SPU, YubiKey 5 / Bio / FIPS, and TPM 2.0. Generic JavaCard 3.x smartcards lack native BLAKE3 and run interpreted bytecode too slowly.
+- **Programmable constrained signing hardware (within reach today):**
+  - **Ledger Nano S+ / Flex / Stax** (`ST33K1M5` Secure Element: ~60 MHz ARM SC300/Cortex-M33, 160 KB RAM, 1.5 MB Flash, Rust `no_std`) — **our reference constrained signer**.
+  - **Nitrokey 3 / SoloKey 2** (`LPC55S69` Cortex-M33 @ 150 MHz, 320 KB RAM, Rust `trussed`) and **Trezor Safe 3 / Safe 5** (`STM32U585` Cortex-M33 @ 160 MHz, 786 KB RAM, 2 MB Flash) — ~2.6× faster than `ST33K1M5`.
+  - **Coldcard Mk4 / Q, Keystone 3 Pro, Passport, Jade** (`STM32L4/H7` @ 80–480 MHz or `ESP32-S3` @ 240 MHz) and **TrustZone OP-TEE / Nitro Enclaves / NetHSM**.
+
+Using streaming Merkle `TreeHash` (`O(h)` stack), working RAM on embedded devices is only **~1.5 KiB** with **zero per-key Flash cache** (important for multi-account BIP-32/SLIP-10 wallets). At ~1,500 cycles per scalar Thumb-2 BLAKE3 compression (~25 µs/comp on 60 MHz `ST33K1M5`, ~9.4 µs/comp on 150–160 MHz Cortex-M33), the constrained-device constraint is **compute time**, not RAM: we filter to candidates that satisfy explicit **keygen (`SignetId`)** and **uncached signing** latency caps on `ST33K1M5`.
+
+### Step 3 — Minimize desktop costs over the feasible set
+
+Among all parameter sets that satisfy Steps 1 and 2 (optionally enforcing an 8 KiB Base64 HTTP-header ceiling `<= 5,950 B` or `< 7,856 B` `SLH-DSA-128s`), `tools/optimize.py` computes the desktop Pareto frontier on **signature bytes $B$**, **single-core warm signing $S_{\text{1T}}$**, and **single-core verification $V_{\text{1T}}$** (calibrated to Apple M6 `blake3-servil-core = "=0.11.0"`), and selects the **Leximin $L_\infty$** winner minimizing the worst desktop cost ratio $\max_i (x_i / x_{i,\min})$:
+
+| Profile (`q = 2^32`, `>= 128b` FORS, zero grinding) | Size (Base64) | FORS ($2^{32}/2^{33}$) | Top tree | Ledger `ST33` kg / **uncached sign** | Nitrokey 3 / Trezor uncached | M6 1-core kg / warm / cold / verify |
+|---|---:|---|---:|---|---|---|
+| **Current `SPEC.md` (`12+3×7`, `w=16`, `F(10,16)`)** | **5,616 B** (`7,488`) | 133.2 / 126.8 b | 128 KiB | 58.4 s / **65.1 s** | 24.5 s | 20.5 ms / **2.54 ms** / 23.1 ms / **21.3 µs** |
+| **8 KiB HTTP + Ledger ≤ 12 s winner (`5×7`, `w=16`, `F(11,13)`)** | **5,888 B** (`7,852`) | **132.5 / 128.5 b** | **4 KiB** | **1.8 s / 11.2 s** | **4.2 s** | **0.6 ms** / 3.4 ms / **4.0 ms** / 24.2 µs |
+| **Ledger ≤ 10 s smallest (`6×6`, `w=32`, `F(10,14)`)** | 5,760 B (`7,680`) | 131.3 / 127.6 b | **2 KiB** | **1.4 s / 9.8 s** | **3.7 s** | **0.5 ms** / 3.0 ms / **3.5 ms** / 43.1 µs |
+| **Ledger ≤ 7 s nibble (`6×6`, `w=16`, `F(10,14)`)** | 6,432 B (`8,576`) | 131.3 / 127.6 b | **2 KiB** | **0.9 s / 6.5 s** | **2.5 s** | **0.3 ms** / **2.1 ms** / **2.4 ms** / 28.4 µs |
+| **Ledger ≤ 5 s nibble (`6+6×5`, `w=16`, `F(9,16)`)** | 7,088 B (`9,452`) | 131.6 / 127.4 b | **2 KiB** | **0.9 s / 4.3 s** | **1.6 s** | **0.3 ms** / **1.2 ms** / **1.6 ms** / 32.6 µs |
+
+Reproduce any target envelope directly:
+
+```sh
+python3 tools/optimize.py --max-bytes 5950 --max-ledger-keygen 3.0 --max-ledger-sign 12.0
+python3 tools/optimize.py --max-bytes 7856 --max-ledger-keygen 2.0 --max-ledger-sign 5.0
+```
+
+*(The current `0.1.0` draft in `SPEC.md` still implements `12+3×7` while this constrained-device-first trade-off is evaluated before freezing 1.0.)*
 
 ---
 
