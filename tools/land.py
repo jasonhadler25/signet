@@ -18,12 +18,12 @@ import blake3  # noqa: E402
 import blincs  # noqa: E402
 
 REF_IMP = os.path.join(ROOT, "test_vectors", "reference-imprint-1.bin")
-REF_SHA256 = "965c4bf2ccc1b670f17f26d1ecaeda126f6de57839c8cf964ef2f6ffac749bb0"
-REF_BLAKE3 = "9f88101241de2493b0c2e3584e2cef5c8463d64e606040086f2d602e4bed8351"
+REF_SHA256 = "ab9d2c8bf1e375e49ef57c3df2fe0c3700ffd5553d5085bd2f48abaac4e2386d"
+REF_BLAKE3 = "b72623d86ea8e954b39604329aeb2694c701f1e2043f6ca62285fbd770af9421"
 EDGE_VEC = os.path.join(ROOT, "test_vectors", "edge-vectors.json")
-EDGE_SHA256 = "f5d6ab2ee23c650231e8098fc28e5684b0d1522196e9e6b5929ba6b1128c301e"
-EDGE_BLAKE3 = "57d7af23421b796c128f9c012a41cc22951d6db6e220bcaffea8c319a429aa52"
-REF_SIGNET_ID = "db09192c50a65494941887b9c57895ab1d8c239fbfb22e021f3b8dcc8d5b3da2"
+EDGE_SHA256 = "bd46fb9730fcaa11be294f6ed7e5d6ad931906cb89957681fe6315af4b1ca4e8"
+EDGE_BLAKE3 = "dc3ba2d0b4094aed404ec293994deded59294c970cf5de0d23eb6c21bdd124bf"
+REF_SIGNET_ID = "db09192c50a65494941887b9c57895ab817750c6dacc82855e914ae9adca39da"
 
 
 def fail(msg):
@@ -41,7 +41,7 @@ def run(label, cmd):
 def check_vectors_and_python():
     print("==> Checking reference-imprint-1.bin digests (SHA-256 + BLAKE3)")
     raw = open(REF_IMP, "rb").read()
-    if len(raw) != 5888:
+    if len(raw) != 7392:
         fail(f"unexpected length {len(raw)}")
     got_sha256 = hashlib.sha256(raw).hexdigest()
     got_blake3 = blake3.hash(raw).hex()

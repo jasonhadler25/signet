@@ -6,7 +6,7 @@ All local measurements below ran on an **Apple M6** (macOS arm64, Rust 1.100.0).
 
 ## 1. Single-core comparison: Project 11 SLH-DSA-B reproduction vs. BLINCS
 
-Source reproduced for SLH-DSA: [`PQC-Suite-B/signatures`](https://github.com/PQC-Suite-B/signatures) branch `b3`, commit `b392fe82d2d9770142477a576a758a233888bc0a` (Criterion 0.5, `sample_size(10)`, `measurement_time(10s)` for `sign_large` over 64 B, 1 MiB, and 100 MiB, and `verify` over 64 B). Because `PQC-Suite-B/signatures` enables `blake3/rayon` for message segments $\ge 256$ KiB, we measured `SLH-DSA-BLAKE3` with `RAYON_NUM_THREADS=1` so every row below compares **1 core vs. 1 core** cleanly. BLINCS (`5×7` uniform, `5,888 B`, `WOTS+` + `FORS(11, 13)`, 4 KiB top tree, no disk cache, `blake3-servil-core = "=0.11.0"`) was measured with `bench/` (`clocks`, 0% E-cores).
+Source reproduced for SLH-DSA: [`PQC-Suite-B/signatures`](https://github.com/PQC-Suite-B/signatures) branch `b3`, commit `b392fe82d2d9770142477a576a758a233888bc0a` (Criterion 0.5, `sample_size(10)`, `measurement_time(10s)` for `sign_large` over 64 B, 1 MiB, and 100 MiB, and `verify` over 64 B). Because `PQC-Suite-B/signatures` enables `blake3/rayon` for message segments $\ge 256$ KiB, we measured `SLH-DSA-BLAKE3` with `RAYON_NUM_THREADS=1` so every row below compares **1 core vs. 1 core** cleanly. BLINCS (`7×5` uniform, `7,392 B`, `WOTS+` + byte-aligned `FORS(8, 20)`, 1 KiB top tree, zero grinding so `p99 = mean`, no disk cache, `blake3-servil-core = "=0.11.0"`) was measured with `bench/` (`clocks`, 0% E-cores).
 
 | Scheme (Apple M6, **1 core**) | Sig bytes | Per-key budget | Verify 64 B | Sign 64 B (warm) | Sign 1 MiB | Sign 100 MiB |
 |---|---:|---:|---:|---:|---:|---:|
@@ -16,15 +16,15 @@ Source reproduced for SLH-DSA: [`PQC-Suite-B/signatures`](https://github.com/PQC
 | SLH-DSA-SHAKE-128f | 17,088 B | $2^{64}$ | 1,539.9 µs | 26.3 ms | 28.2 ms | 215.5 ms |
 | SLH-DSA-SHA2-128f | 17,088 B | $2^{64}$ | 219.9 µs | 3.63 ms | 4.19 ms | 60.6 ms |
 | SLH-DSA-BLAKE3-128f *(1 thread)* | 17,088 B | $2^{64}$ | 353.7 µs | 5.81 ms | 6.26 ms | 89.1 ms |
-| **BLINCS (`5×7`, `blake3-servil-core 0.11.0`)** | **5,888 B** | **$2^{32}$** | **26.3 µs** | **3.47 ms** | **3.60 ms** | **18.57 ms** |
+| **BLINCS (`7×5`, `blake3-servil-core 0.11.0`)** | **7,392 B** | **$2^{32}$** | **34.9 µs** | **1.31 ms** | **1.45 ms** | **16.36 ms** |
 
 Key takeaways on 1 Apple M6 core:
 
-- **Size:** BLINCS (`5,888 B`, `7,852 B` Base64) is **25% smaller** than `SLH-DSA-128s` (`7,856 B`) and **2.9× smaller** than `SLH-DSA-128f` (`17,088 B`).
-- **Verification (64 B, 1 core):** BLINCS (**26.3 µs**, `38,000 / s`) is **2.8× faster** than hardware-accelerated `SLH-DSA-SHA2-128s` (`74.4 µs`), **4.8× faster** than `SLH-DSA-BLAKE3-128s` (`126.6 µs`), **13.4× faster** than `SLH-DSA-BLAKE3-128f` (`353.7 µs`), and **19.4× faster** than `SLH-DSA-SHAKE-128s` (`509.0 µs`).
-- **Signing (64 B, 1 core):** BLINCS (**3.47 ms** warm, **4.12 ms** cold 1-shot with no disk cache) is **35× faster** than `SLH-DSA-BLAKE3-128s` (`121.7 ms`), **22× faster** than `SLH-DSA-SHA2-128s` (`75.5 ms`), **1.67× faster** than `SLH-DSA-BLAKE3-128f` (`5.81 ms`) while 2.9× smaller, and faster than `SLH-DSA-SHA2-128f` (`3.63 ms`) — with zero counter grinding.
-- **Cold startup (`Signet::from_seed`):** **649.7 µs** (`0.65 ms`, 4 KiB top tree — no disk cache needed).
-- **Signing (100 MiB, 1 core):** BLINCS (**18.57 ms** slice / **28.01 ms** zero-allocation 16 KiB streaming reader) is **12.0× faster** than 1-core `SLH-DSA-BLAKE3-128s` (`222.8 ms`) and **4.8× faster** than 1-core `SLH-DSA-BLAKE3-128f` (`89.1 ms`), hashing the message in a single salted BLAKE3 pass (~5.6 GB/s signing, ~6.9 GB/s verifying on 1 core).
+- **Size:** BLINCS (`7,392 B`, `9,856 B` Base64) is **464 B smaller** than `SLH-DSA-128s` (`7,856 B`) and **2.31× smaller** than `SLH-DSA-128f` (`17,088 B`).
+- **Signing (64 B, 1 core, constant `p99 = mean`):** BLINCS (**1.31 ms** warm, **1.48 ms** cold 1-shot with no disk cache) is **93× faster** than `SLH-DSA-BLAKE3-128s` (`121.7 ms`), **58× faster** than `SLH-DSA-SHA2-128s` (`75.5 ms`), **4.4× faster** than `SLH-DSA-BLAKE3-128f` (`5.81 ms`) while 2.3× smaller, and **2.8× faster** than hardware-accelerated `SLH-DSA-SHA2-128f` (`3.63 ms`) — with zero counter grinding and zero tail spikes.
+- **Verification (64 B, 1 core):** BLINCS (**34.9 µs**, `28,700 / s`) is **2.1× faster** than hardware-accelerated `SLH-DSA-SHA2-128s` (`74.4 µs`), **3.6× faster** than `SLH-DSA-BLAKE3-128s` (`126.6 µs`), **10.1× faster** than `SLH-DSA-BLAKE3-128f` (`353.7 µs`), and **14.6× faster** than `SLH-DSA-SHAKE-128s` (`509.0 µs`).
+- **Cold startup (`Signet::from_seed`):** **170.1 µs** (`0.17 ms`, `5,879 / s`, 1 KiB top tree — no disk cache needed).
+- **Signing (100 MiB, 1 core):** BLINCS (**16.36 ms** slice / **25.47 ms** zero-allocation 16 KiB streaming reader) is **13.6× faster** than 1-core `SLH-DSA-BLAKE3-128s` (`222.8 ms`) and **5.4× faster** than 1-core `SLH-DSA-BLAKE3-128f` (`89.1 ms`), hashing the message in a single salted BLAKE3 pass (~6.4 GB/s signing, ~7.0 GB/s verifying on 1 core).
 
 ## 2. Wall time, core cycles, and IPC (`bench/`, `clocks` crate)
 
@@ -32,25 +32,25 @@ Measured on a quiet Apple M6 (`bench/`, `blake3-servil-core = "=0.11.0"`, single
 
 | Operation (1 core) | Wall time | Core cycles | Instructions | IPC | Clock | Throughput |
 |---|---:|---:|---:|---:|---:|---:|
-| `Signet::from_seed` (4 KiB top tree, no disk cache) | **649.7 µs** | 2.68M | 3.56M | 1.33 | 4,122 MHz | **1,539 / s** |
-| `Signet::imprint` 64 B | **3.47 ms** | 14.29M | 19.72M | 1.38 | 4,125 MHz | **288 / s** |
-| `Signet::imprint_reader` 64 B | **3.47 ms** | 14.30M | 19.72M | 1.38 | 4,123 MHz | **288 / s** |
-| `SignetId::verify` 64 B | **26.3 µs** | 120.9k | 850.4k | **7.03** | 4,607 MHz | **38,000 / s** |
-| `SignetId::verify_reader` 64 B | **26.4 µs** | 121.5k | 851.8k | **7.01** | 4,601 MHz | **37,900 / s** |
-| `SignetId::verify` 1 KiB | 26.5 µs | 121.8k | 855.6k | 7.02 | 4,601 MHz | — |
-| `SignetId::verify` 64 KiB | 38.5 µs | 159.0k | 854.5k | 5.38 | 4,133 MHz | 1,703 MB/s |
-| `SignetId::verify` 256 KiB | 62.5 µs | 274.3k | 1.24M | 4.51 | 4,394 MHz | 4,198 MB/s |
-| `SignetId::verify_reader` 256 KiB | 90.3 µs | 381.2k | 1.23M | 3.22 | 4,223 MHz | 2,903 MB/s |
-| `Signet::imprint` 1 MiB | 3.60 ms | 14.89M | 22.01M | 1.48 | 4,138 MHz | 291 MB/s |
-| `SignetId::verify` 1 MiB | 164.0 µs | 729.2k | 3.20M | 4.39 | 4,448 MHz | 6,395 MB/s |
-| `SignetId::verify_reader` 1 MiB | 288.3 µs | 1.18M | 2.50M | 2.12 | 4,089 MHz | 3,637 MB/s |
-| `Signet::imprint` 16 MiB | **5.72 ms** | 24.12M | 56.92M | 2.36 | 4,219 MHz | **2,934 MB/s** |
-| `SignetId::verify` 16 MiB | **2.27 ms** | 9.90M | 38.00M | 3.84 | 4,371 MHz | **7,407 MB/s** |
-| `Signet::imprint` 100 MiB | **18.57 ms** | 80.46M | 252.36M | 3.14 | 4,334 MHz | **5,645 MB/s** |
-| `Signet::imprint_reader` 100 MiB (16 KiB stack buf) | 28.01 ms | 113.48M | 179.69M | 1.58 | 4,054 MHz | 3,744 MB/s |
-| `SignetId::verify` 100 MiB | **15.13 ms** | 66.25M | 233.49M | 3.52 | 4,383 MHz | **6,932 MB/s** |
-| `SignetId::verify_reader` 100 MiB (16 KiB stack buf) | 24.15 ms | 97.59M | 160.80M | 1.65 | 4,043 MHz | 4,342 MB/s |
-| `Randomness::initialize` (lock-free seed dir) | 71.3 µs | 323.2k | 1.54M | 4.75 | 4,536 MHz | — |
+| `Signet::from_seed` (1 KiB top tree, no disk cache) | **170.1 µs** | 695.9k | 912.6k | 1.31 | 4,092 MHz | **5,879 / s** |
+| `Signet::imprint` 64 B | **1.31 ms** | 5.40M | 8.44M | 1.56 | 4,110 MHz | **763 / s** |
+| `Signet::imprint_reader` 64 B | **1.31 ms** | 5.40M | 8.45M | 1.57 | 4,111 MHz | **763 / s** |
+| `SignetId::verify` 64 B | **34.9 µs** | 161.5k | 1.14M | **7.05** | 4,632 MHz | **28,700 / s** |
+| `SignetId::verify_reader` 64 B | **35.1 µs** | 162.1k | 1.14M | **7.03** | 4,619 MHz | **28,500 / s** |
+| `SignetId::verify` 1 KiB | 36.8 µs | 169.9k | 1.20M | 7.08 | 4,622 MHz | — |
+| `SignetId::verify` 64 KiB | 49.1 µs | 209.9k | 1.24M | 5.89 | 4,274 MHz | 1,334 MB/s |
+| `SignetId::verify` 256 KiB | 72.2 µs | 321.0k | 1.57M | 4.88 | 4,447 MHz | 3,630 MB/s |
+| `SignetId::verify_reader` 256 KiB | 100.2 µs | 427.9k | 1.56M | 3.64 | 4,272 MHz | 2,616 MB/s |
+| `Signet::imprint` 1 MiB | **1.45 ms** | 6.01M | 10.74M | 1.79 | 4,133 MHz | 721 MB/s |
+| `SignetId::verify` 1 MiB | 171.9 µs | 766.9k | 3.48M | 4.54 | 4,464 MHz | 6,100 MB/s |
+| `SignetId::verify_reader` 1 MiB | 296.9 µs | 1.22M | 2.79M | 2.28 | 4,110 MHz | 3,532 MB/s |
+| `Signet::imprint` 16 MiB | **3.56 ms** | 15.21M | 45.64M | 3.00 | 4,273 MHz | **4,712 MB/s** |
+| `SignetId::verify` 16 MiB | **2.28 ms** | 9.97M | 38.35M | 3.84 | 4,373 MHz | **7,352 MB/s** |
+| `Signet::imprint` 100 MiB | **16.36 ms** | 71.29M | 241.08M | 3.38 | 4,360 MHz | **6,409 MB/s** |
+| `Signet::imprint_reader` 100 MiB (16 KiB stack buf) | 25.47 ms | 103.05M | 168.40M | 1.63 | 4,047 MHz | 4,117 MB/s |
+| `SignetId::verify` 100 MiB | **15.05 ms** | 65.93M | 233.74M | 3.55 | 4,382 MHz | **6,966 MB/s** |
+| `SignetId::verify_reader` 100 MiB (16 KiB stack buf) | 24.30 ms | 98.25M | 161.06M | 1.64 | 4,045 MHz | 4,315 MB/s |
+| `Randomness::initialize` (lock-free seed dir) | 72.9 µs | 324.7k | 1.53M | 4.71 | 4,543 MHz | — |
 
 ## 3. Reproducing
 

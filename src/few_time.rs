@@ -2,17 +2,11 @@ use crate::one_time::SignWorkspace;
 use crate::params::{FORS_HEIGHT, FORS_LEAVES, FORS_LEN, FORS_TREES, LeafAddr, N, PublicKey, SecretKey, TweakKind, first_n, pack_pair, pack_tagged, tweak};
 use blake3_servil_core::throughput::TreeHasher;
 
-/// Unpack the 13 eleven-bit FORS leaf indices (`digest[0..18]`, low 143 bits) and 35-bit hypertree
-/// leaf address (`digest[20..28]`, low 35 bits) directly from the 32-byte message digest `D`.
-pub(crate) fn parse_digest(digest: &[u8; 32]) -> ([u16; FORS_TREES], LeafAddr) {
-    let mut indices = [0u16; FORS_TREES];
-    for (i, slot) in indices.iter_mut().enumerate() {
-        let bit = FORS_HEIGHT * i;
-        let byte = bit / 8;
-        let shift = bit % 8;
-        let word = u32::from_le_bytes([digest[byte], digest[byte + 1], digest[byte + 2], 0]);
-        *slot = u16::try_from((word >> shift) & 0x7ff).unwrap();
-    }
+/// Extract the 20 byte-aligned FORS leaf indices (`digest[0..20]`, one byte per tree) and 35-bit
+/// hypertree leaf address (`digest[20..28]`, low 35 bits) directly from the 32-byte digest `D`.
+pub(crate) fn parse_digest(digest: &[u8; 32]) -> ([u8; FORS_TREES], LeafAddr) {
+    let mut indices = [0u8; FORS_TREES];
+    indices.copy_from_slice(&digest[..FORS_TREES]);
     let leaf_addr = LeafAddr::from_digest_word(u64::from_le_bytes(digest[20..28].try_into().unwrap()));
     (indices, leaf_addr)
 }
@@ -25,16 +19,16 @@ pub(crate) struct ForsTreeOut {
     pub root: [u8; N],
 }
 
-/// Build one FORS tree `tree_idx` (0..13, 2,048 leaves) for `leaf_addr` and extract `chosen_leaf`'s path.
+/// Build one FORS tree `tree_idx` (0..20, 256 leaves) for `leaf_addr` and extract `chosen_leaf`'s path.
 pub(crate) fn build_fors_tree(
     secret: &SecretKey,
     public: &PublicKey,
     leaf_addr: LeafAddr,
     tree_idx: u16,
-    chosen_leaf: u16,
+    chosen_leaf: u8,
     ws: &mut SignWorkspace,
 ) -> ForsTreeOut {
-    assert!(usize::from(tree_idx) < FORS_TREES && usize::from(chosen_leaf) < FORS_LEAVES);
+    assert!(usize::from(tree_idx) < FORS_TREES);
     let tree = leaf_addr.as_u64();
     let (sec_h, pub_h) = (secret.hasher(true), public.hasher(true));
 
@@ -68,7 +62,7 @@ pub(crate) fn build_fors_tree(
     ForsTreeOut { secret: chosen_secret, auth, root: nodes[0] }
 }
 
-/// Compress the 13 FORS tree roots into the 16-byte FORS root signed by hypertree layer 0.
+/// Compress the 20 FORS tree roots into the 16-byte FORS root signed by hypertree layer 0.
 pub(crate) fn fors_root(public: &TreeHasher, leaf_addr: LeafAddr, roots: &[[u8; N]; FORS_TREES]) -> [u8; N] {
     let mut input = [0u8; 16 + N * FORS_TREES];
     input[..16].copy_from_slice(&tweak(TweakKind::FewRoot, 0, leaf_addr.as_u64(), 0, 0, 0));
@@ -78,8 +72,8 @@ pub(crate) fn fors_root(public: &TreeHasher, leaf_addr: LeafAddr, roots: &[[u8; 
     first_n(public.hash(&input).as_bytes())
 }
 
-/// Verify a FORS signature and return its reconstructed 16-byte FORS root (batching all 13 trees per level).
-pub(crate) fn fors_verify(public: &TreeHasher, leaf_addr: LeafAddr, indices: &[u16; FORS_TREES], sig: &[u8; FORS_LEN]) -> [u8; N] {
+/// Verify a FORS signature and return its reconstructed 16-byte FORS root (batching all 20 trees per level).
+pub(crate) fn fors_verify(public: &TreeHasher, leaf_addr: LeafAddr, indices: &[u8; FORS_TREES], sig: &[u8; FORS_LEN]) -> [u8; N] {
     let tree = leaf_addr.as_u64();
     let stride = (1 + FORS_HEIGHT) * N;
     let mut b32 = [[0u8; 32]; FORS_TREES];

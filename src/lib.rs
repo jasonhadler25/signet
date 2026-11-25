@@ -7,7 +7,7 @@
 //! Runs strictly on the calling thread (`blake3-servil-core`; no background worker threads).
 //! Because a cryptographic key is a transferable bearer authority rather than a person's handwritten
 //! signature, this API calls the secret a [`Signet`], its 32-byte self-certifying identifier a
-//! [`SignetId`] (which names which signet you mean and verifies its imprints), and the 5,888-byte
+//! [`SignetId`] (which names which signet you mean and verifies its imprints), and the 7,392-byte
 //! proof an [`Imprint`]. Pass message bytes or a stream directly: BLINCS hashes the input in a
 //! single salted keyed-BLAKE3 pass under a fresh per-imprint salt.
 //!
@@ -80,18 +80,18 @@ fn msg_digest_input(randomizer: &[u8; N], root: &[u8; N], short: &[u8; SHORT_LEN
     buf
 }
 
-/// A 5,888-byte BLINCS imprint (proof produced by pressing a [`Signet`] onto a message).
+/// A 7,392-byte BLINCS imprint (proof produced by pressing a [`Signet`] onto a message).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Imprint([u8; IMPRINT_LEN]);
 
 impl Imprint {
-    /// Wrap a raw 5,888-byte imprint array.
+    /// Wrap a raw 7,392-byte imprint array.
     #[must_use]
     pub fn from_bytes(bytes: &[u8; IMPRINT_LEN]) -> Self {
         Self(*bytes)
     }
 
-    /// Borrow the raw 5,888 imprint bytes.
+    /// Borrow the raw 7,392 imprint bytes.
     pub fn as_bytes(&self) -> &[u8; IMPRINT_LEN] {
         &self.0
     }
@@ -208,7 +208,7 @@ impl SignetId {
     }
 }
 
-/// A BLINCS signet (bearer authority derived from a 32-byte seed, holding the 4 KiB top hypertree in memory).
+/// A BLINCS signet (bearer authority derived from a 32-byte seed, holding the 1 KiB top hypertree in memory).
 pub struct Signet {
     seed: [u8; SEED_LEN],
     secret_key: SecretKey,
@@ -237,7 +237,7 @@ impl Signet {
         Ok(Self::from_seed(&seed))
     }
 
-    /// Derive a signet from a 32-byte `seed`, building the 4 KiB top hypertree on the calling thread.
+    /// Derive a signet from a 32-byte `seed`, building the 1 KiB top hypertree on the calling thread.
     #[must_use]
     pub fn from_seed(seed: &[u8; SEED_LEN]) -> Self {
         ensure_init();
@@ -278,7 +278,7 @@ impl Signet {
         let (sec, pubk) = (self.secret_key, self.id.public_key);
         let mut ws = SignWorkspace::new();
 
-        // Build all 13 FORS trees and compute the FORS root.
+        // Build all 20 FORS trees and compute the FORS root.
         let mut at = 2 * N;
         let mut fors_roots = [[0u8; N]; FORS_TREES];
         for t in 0..FORS_TREES {
@@ -293,7 +293,7 @@ impl Signet {
         }
         let mut node = fors_root(&pubk.hasher(false), leaf_addr, &fors_roots);
 
-        // Build the 4 lower Merkle heaps and imprint all 5 uniform hypertree layers.
+        // Build the 6 lower Merkle heaps and imprint all 7 uniform hypertree layers.
         for layer in Layer::LOWER {
             let (tree, leaf) = coords[layer.index()];
             let heap = build_tree_heap(&sec, &pubk, layer, tree, &mut ws);

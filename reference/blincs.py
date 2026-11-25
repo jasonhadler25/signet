@@ -10,9 +10,9 @@ import sys
 import blake3
 
 N = 16
-LAYERS, TREE_HEIGHT = 5, 7
+LAYERS, TREE_HEIGHT = 7, 5
 W, CHAIN_STEPS, MSG_CHAINS, CSUM_CHAINS, CHAINS = 16, 15, 32, 3, 35
-FORS_HEIGHT, FORS_TREES = 11, 13
+FORS_HEIGHT, FORS_TREES = 8, 20
 HYPER_BITS = LAYERS * TREE_HEIGHT
 FORS_LEN = FORS_TREES * (1 + FORS_HEIGHT) * N
 LAYER_LEN = (CHAINS + TREE_HEIGHT) * N
@@ -87,9 +87,8 @@ def digits(node):
 
 
 def parse_digest(digest):
-    """13 eleven-bit FORS leaf indices (digest[:18], low 143 bits) and 35-bit leaf address (digest[20:28])."""
-    fors_bits = int.from_bytes(digest[:18], "little")
-    indices = [(fors_bits >> (FORS_HEIGHT * j)) & 0x7FF for j in range(FORS_TREES)]
+    """20 byte-aligned FORS leaf indices (digest[:20]) and 35-bit leaf address (digest[20:28])."""
+    indices = list(digest[:FORS_TREES])
     leaf_addr = int.from_bytes(digest[20:28], "little") & ((1 << HYPER_BITS) - 1)
     return indices, leaf_addr
 

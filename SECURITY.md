@@ -17,7 +17,7 @@ Full mathematical and operational details are in [`SPEC.md`](SPEC.md) and [`DESI
 - **Supported platforms:** Linux (`x86_64`, `aarch64`) and macOS (`x86_64`, `aarch64`). If your platform is not on this list, this software is not expected to work for that use.
 - **Seed directory placement:** provision a dedicated private directory (`0700` on Unix) once with `Randomness::create`. Do not place unrelated files in that directory (`initialize` rejects unexpected entries, symlinks, or files `> 32` bytes without touching them). Filenames (`blincs-r2-<32 hex>`) derive from a domain-separated `file_id` and reveal zero bits of future salts or signets.
 - **Process forks and VM snapshots:** after `fork()` (without `exec()`) or restoring a live VM snapshot, call `Randomness::initialize` again so cloned processes or images do not share the same `(run_key, count)` draw sequence.
-- **Memory retention:** `Signet` retains its 32-byte seed, derived keys, and inline 4 KiB top tree; signing allocates a transient local `SignWorkspace` freed on return. Neither BLINCS nor `blake3-servil-core` wipes secret key memory on drop. Verification uses only local stack buffers (zero heap allocation). Streaming readers use a fresh local zero-initialized 16 KiB stack buffer, zeroing each slice before `Read::read`.
+- **Memory retention:** `Signet` retains its 32-byte seed, derived keys, and inline 1 KiB top tree; signing allocates a transient local `SignWorkspace` (~110 KiB) freed on return. Neither BLINCS nor `blake3-servil-core` wipes secret key memory on drop. Verification uses only local stack buffers (zero heap allocation). Streaming readers use a fresh local zero-initialized 16 KiB stack buffer, zeroing each slice before `Read::read`.
 - **Pass the original message or stream directly:** call `imprint`/`imprint_reader` and `verify`/`verify_reader` on the full message so the entire input is hashed in BLINCS's single salted BLAKE3 pass at full speed, resting on randomized target-collision resistance rather than unsalted collision resistance.
 
 ## Timing and secret independence
@@ -28,9 +28,9 @@ In BLINCS's Rust code, every branch and memory index during signing and verifica
 
 Where this repository records digests, it records both SHA-256 and BLAKE3:
 
-- `test_vectors/reference-imprint-1.bin` (5,888 bytes):
-  - SHA-256: `965c4bf2ccc1b670f17f26d1ecaeda126f6de57839c8cf964ef2f6ffac749bb0`
-  - BLAKE3:  `9f88101241de2493b0c2e3584e2cef5c8463d64e606040086f2d602e4bed8351`
+- `test_vectors/reference-imprint-1.bin` (7,392 bytes):
+  - SHA-256: `ab9d2c8bf1e375e49ef57c3df2fe0c3700ffd5553d5085bd2f48abaac4e2386d`
+  - BLAKE3:  `b72623d86ea8e954b39604329aeb2694c701f1e2043f6ca62285fbd770af9421`
 - `test_vectors/edge-vectors.json` (4 boundary vectors: empty, 1 B, 1,024 B, 16,385 B with bit-34 `leaf_addr`):
-  - SHA-256: `f5d6ab2ee23c650231e8098fc28e5684b0d1522196e9e6b5929ba6b1128c301e`
-  - BLAKE3:  `57d7af23421b796c128f9c012a41cc22951d6db6e220bcaffea8c319a429aa52`
+  - SHA-256: `bd46fb9730fcaa11be294f6ed7e5d6ad931906cb89957681fe6315af4b1ca4e8`
+  - BLAKE3:  `dc3ba2d0b4094aed404ec293994deded59294c970cf5de0d23eb6c21bdd124bf`

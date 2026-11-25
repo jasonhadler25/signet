@@ -8,7 +8,7 @@ const WOTS_BATCH_SLOTS: usize = TREE_LEAVES * CHAINS;
 const MERKLE_BATCH_SLOTS: usize = FORS_LEAVES / 2;
 
 const _: () = {
-    assert!(WOTS_BATCH_SLOTS == 4480 && WOTS_BATCH_SLOTS >= FORS_LEAVES && MERKLE_BATCH_SLOTS == 1024);
+    assert!(WOTS_BATCH_SLOTS == 1120 && WOTS_BATCH_SLOTS >= FORS_LEAVES && MERKLE_BATCH_SLOTS == 128);
 };
 
 /// Transient heap workspace owned by a single `Signet::from_seed` or `Signet::imprint` call.
@@ -101,7 +101,7 @@ pub(crate) fn advance_chains(public: &TreeHasher, pos: Pos, values: &mut [[u8; N
     }
 }
 
-/// Build all `TREE_LEAVES` (128) WOTS+ verifying-key leaves for `(layer, tree)` and its 1-indexed
+/// Build all `TREE_LEAVES` (32) WOTS+ verifying-key leaves for `(layer, tree)` and its 1-indexed
 /// binary Merkle heap (`2 * TREE_LEAVES` nodes; index `1` is the root).
 pub(crate) fn build_tree_heap(secret: &SecretKey, public: &PublicKey, layer: Layer, tree: u64, ws: &mut SignWorkspace) -> [[u8; N]; 2 * TREE_LEAVES] {
     assert!(tree < layer.trees());

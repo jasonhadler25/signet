@@ -79,7 +79,7 @@ export const derive = (ctx: string, m: Uint8Array): Uint8Array =>
   b3(toWords(b3(IV, DK_CTX, enc.encode(ctx)), 0, 32, 8), DK_MAT, m);
 
 // ---------------- BLINCS ----------------
-const N = 16, LAYERS = 5, TREE_HEIGHT = 7, CHAINS = 35, FORS_TREES = 13, FORS_HEIGHT = 11, SIG_LEN = 5888;
+const N = 16, LAYERS = 7, TREE_HEIGHT = 5, CHAINS = 35, FORS_TREES = 20, FORS_HEIGHT = 8, SIG_LEN = 7392;
 const P = "BLINCS 2026-11-25 ";
 const CTX_PUBLIC_HASH = P + "public hash", CTX_CONTENT = P + "content", CTX_MIX = P + "randomness: mix",
   CTX_FILE_ID = P + "randomness: file id", CTX_NEXT_SEED = P + "randomness: next seed",
@@ -121,14 +121,13 @@ export function verify(vk: Uint8Array, message: Uint8Array, sig: Uint8Array): bo
   const kMsg = keyed(kContent, e);
   const short = cat(e, keyed(kMsg, message));
   const D = keyed(kPub, cat(tweak(MESSAGE, 0, 0, 0, 0, 0), R, root, short));
-  let fb = 0n; for (let i = 17; i >= 0; i--) fb = (fb << 8n) | BigInt(D[i]);
   let la = 0n; for (let i = 27; i >= 20; i--) la = (la << 8n) | BigInt(D[i]);
   const leafAddr = Number(la & ((1n << 35n) - 1n));
 
-  // FORS (13 trees x 2,048 leaves)
+  // FORS (20 trees x 256 leaves; one byte per tree)
   const roots: Uint8Array[] = [];
   for (let t = 0; t < FORS_TREES; t++) {
-    const idx = Number((fb >> BigInt(FORS_HEIGHT * t)) & 0x7ffn);
+    const idx = D[t];
     const off = 32 + t * (1 + FORS_HEIGHT) * N;
     let v = shortHash(kPub, tweak(FEW_LEAF, 0, leafAddr, t, 0, idx), sig.subarray(off, off + N));
     for (let h = 0; h < FORS_HEIGHT; h++) {
@@ -140,7 +139,7 @@ export function verify(vk: Uint8Array, message: Uint8Array, sig: Uint8Array): bo
   }
   let node = shortHash(kPub, tweak(FEW_ROOT, 0, leafAddr, 0, 0, 0), cat(...roots));
 
-  // Hypertree (5 uniform height-7 layers)
+  // Hypertree (7 uniform height-5 layers)
   let addr = leafAddr, off = 32 + FORS_TREES * (1 + FORS_HEIGHT) * N;
   for (let layer = 0; layer < LAYERS; layer++) {
     const leaf = addr % (1 << TREE_HEIGHT), tree = Math.floor(addr / (1 << TREE_HEIGHT));

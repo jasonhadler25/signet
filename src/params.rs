@@ -5,8 +5,8 @@ pub const SEED_LEN: usize = 32;
 pub const SIGNET_ID_LEN: usize = 32;
 
 pub(crate) const N: usize = 16;
-pub(crate) const LAYERS: usize = 5;
-pub(crate) const TREE_HEIGHT: usize = 7;
+pub(crate) const LAYERS: usize = 7;
+pub(crate) const TREE_HEIGHT: usize = 5;
 pub(crate) const TREE_LEAVES: usize = 1 << TREE_HEIGHT;
 
 pub(crate) const W: usize = 16;
@@ -15,9 +15,9 @@ pub(crate) const MSG_CHAINS: usize = 2 * N;
 pub(crate) const CSUM_CHAINS: usize = 3;
 pub(crate) const CHAINS: usize = MSG_CHAINS + CSUM_CHAINS;
 
-pub(crate) const FORS_HEIGHT: usize = 11;
+pub(crate) const FORS_HEIGHT: usize = 8;
 pub(crate) const FORS_LEAVES: usize = 1 << FORS_HEIGHT;
-pub(crate) const FORS_TREES: usize = 13;
+pub(crate) const FORS_TREES: usize = 20;
 pub(crate) const HYPER_BITS: usize = LAYERS * TREE_HEIGHT;
 
 pub(crate) const SHORT_LEN: usize = N + 32;
@@ -27,8 +27,8 @@ pub const IMPRINT_LEN: usize = 2 * N + FORS_LEN + LAYERS * LAYER_LEN;
 
 const _: () = {
     assert!(W == (CHAIN_STEPS as usize) + 1 && CHAINS == 35 && MSG_CHAINS * 4 == N * 8);
-    assert!(FORS_TREES * FORS_HEIGHT == 143 && HYPER_BITS == 35 && HYPER_BITS < 48);
-    assert!(IMPRINT_LEN == 5888 && 2 * N + FORS_LEN + 5 * LAYER_LEN == IMPRINT_LEN);
+    assert!(FORS_TREES * FORS_HEIGHT == 160 && HYPER_BITS == 35 && HYPER_BITS < 48);
+    assert!(IMPRINT_LEN == 7392 && 2 * N + FORS_LEN + 7 * LAYER_LEN == IMPRINT_LEN);
 };
 
 // Key-derivation contexts (SPEC.md, "Key-derivation contexts").
@@ -128,7 +128,7 @@ pub(crate) enum TweakKind {
     Message = 9,
 }
 
-/// Uniform hypertree layer (`0..5`), each of height `TREE_HEIGHT = 7` (`128` leaves).
+/// Uniform hypertree layer (`0..7`), each of height `TREE_HEIGHT = 5` (`32` leaves).
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Layer {
@@ -137,12 +137,14 @@ pub(crate) enum Layer {
     L2 = 2,
     L3 = 3,
     L4 = 4,
+    L5 = 5,
+    L6 = 6,
 }
 
 impl Layer {
-    pub(crate) const ALL: [Self; LAYERS] = [Self::L0, Self::L1, Self::L2, Self::L3, Self::L4];
-    pub(crate) const LOWER: [Self; LAYERS - 1] = [Self::L0, Self::L1, Self::L2, Self::L3];
-    pub(crate) const TOP: Self = Self::L4;
+    pub(crate) const ALL: [Self; LAYERS] = [Self::L0, Self::L1, Self::L2, Self::L3, Self::L4, Self::L5, Self::L6];
+    pub(crate) const LOWER: [Self; LAYERS - 1] = [Self::L0, Self::L1, Self::L2, Self::L3, Self::L4, Self::L5];
+    pub(crate) const TOP: Self = Self::L6;
 
     pub(crate) const fn index(self) -> usize {
         self as usize
@@ -152,7 +154,7 @@ impl Layer {
         self as u8
     }
 
-    /// Number of trees at this layer (`2^28`, `2^21`, `2^14`, `2^7`, `1` for layers 0..=4).
+    /// Number of trees at this layer (`2^30`, `2^25`, `2^20`, `2^15`, `2^10`, `2^5`, `1` for layers 0..=6).
     pub(crate) const fn trees(self) -> u64 {
         1u64 << (HYPER_BITS - (self.index() + 1) * TREE_HEIGHT)
     }
@@ -175,7 +177,7 @@ impl LeafAddr {
         self.0
     }
 
-    /// Decompose this 35-bit address into `(tree, leaf)` for each of the 5 uniform hypertree layers.
+    /// Decompose this 35-bit address into `(tree, leaf)` for each of the 7 uniform hypertree layers.
     pub(crate) fn split_layers(self) -> [(u64, u16); LAYERS] {
         let mut out = [(0u64, 0u16); LAYERS];
         let mut addr = self.0;

@@ -16,10 +16,10 @@ Design approach (inspired by Conor Deegan of Project 11):
      `blake3-servil-core = "=0.11.0"`, Apple M6) via Leximin L_inf above the feasible frontier.
 
 Usage:
-    python3 tools/optimize.py                         # default constrained-device-first search
-    python3 tools/optimize.py --max-ledger-sign 5.0   # tighter hardware-wallet UX target (seconds)
+    python3 tools/optimize.py                         # default ST33 p99 <= 5.0s constrained-device search
+    python3 tools/optimize.py --nibble-only           # restrict to w=16 nibble WOTS+
     python3 tools/optimize.py --max-bytes 5950        # enforce 8 KiB Base64 HTTP-header ceiling
-    python3 tools/optimize.py --check                 # verify current SPEC.md (12+3x7) security & M6 fit
+    python3 tools/optimize.py --check                 # verify adopted SPEC.md (7x5, FORS(8,20)) security & M6 fit
 """
 
 import argparse
@@ -191,27 +191,28 @@ def fmt_row(c):
 
 
 def run_check():
-    # Verify current SPEC.md implementation (uniform 5x7, w=16, FORS(11,13)) size, FORS cover curve, and 1T M6 calibration.
-    c = eval_candidate(7, 5, 7, 4, 11, 13)
-    if c["bytes"] != 5888:
+    # Verify adopted SPEC.md implementation (uniform 7x5, w=16, byte-aligned FORS(8,20)) size, FORS cover curve, and 1T M6 calibration.
+    # Zero grinding => algorithmic signing time is constant (mean == p99 == p99.9 == max).
+    c = eval_candidate(5, 7, 5, 4, 8, 20)
+    if c["bytes"] != 7392:
         raise RuntimeError(f"unexpected bytes {c['bytes']}")
-    f32 = fors_security_bits(1 << 32, 35, 11, 13)
-    f33 = fors_security_bits(1 << 33, 35, 11, 13)
-    f34 = fors_security_bits(1 << 34, 35, 11, 13)
-    f35 = fors_security_bits(1 << 35, 35, 11, 13)
-    f36 = fors_security_bits(1 << 36, 35, 11, 13)
-    if not (abs(f32 - 132.5006) < 1e-3 and abs(f33 - 128.4523) < 1e-3 and abs(f34 - 123.7671) < 1e-3 and abs(f35 - 118.3066) < 1e-3 and abs(f36 - 111.9204) < 1e-3):
+    f32 = fors_security_bits(1 << 32, 35, 8, 20)
+    f33 = fors_security_bits(1 << 33, 35, 8, 20)
+    f34 = fors_security_bits(1 << 34, 35, 8, 20)
+    f35 = fors_security_bits(1 << 35, 35, 8, 20)
+    f36 = fors_security_bits(1 << 36, 35, 8, 20)
+    if not (abs(f32 - 134.4633) < 1e-3 and abs(f33 - 128.8484) < 1e-3 and abs(f34 - 122.3896) < 1e-3 and abs(f35 - 114.9014) < 1e-3 and abs(f36 - 106.1754) < 1e-3):
         raise RuntimeError(f"unexpected FORS curve {f32}/{f33}/{f34}/{f35}/{f36}")
-    if not (abs(c["m6_kg_ms"] - 0.65) < 0.2 and abs(c["m6_sign_ms"] - 3.47) < 0.4 and abs(c["m6_ver_us"] - 26.3) < 3.0):
-        raise RuntimeError(f"unexpected M6 1T calibration: kg={c['m6_kg_ms']} sign={c['m6_sign_ms']} ver={c['m6_ver_us']}")
-    feasible, pareto = search_feasible(1 << 32, 128.0, 3.0, 12.0, 5950)
+    if not (c["ledger_sign_s"] <= 5.0 and abs(c["m6_kg_ms"] - 0.17) < 0.1 and abs(c["m6_sign_ms"] - 1.31) < 0.25 and abs(c["m6_ver_us"] - 34.9) < 4.0):
+        raise RuntimeError(f"unexpected ST33/M6 1T calibration: st33={c['ledger_sign_s']} kg={c['m6_kg_ms']} sign={c['m6_sign_ms']} ver={c['m6_ver_us']}")
+    feasible, pareto = search_feasible(1 << 32, 128.0, 2.0, 5.0, 7856)
     if not (feasible and pareto):
         raise RuntimeError("constrained search returned no feasible candidates")
     print(
-        f"CHECK PASSED: adopted SPEC 5x7 ({c['bytes']} B, {c['top_kib']:.0f} KiB top tree, ST33 kg={c['ledger_kg_s']:.1f}s unc={c['ledger_sign_s']:.1f}s) | "
+        f"CHECK PASSED: adopted SPEC 7x5 FORS(8,20) ({c['bytes']} B, {c['top_kib']:.0f} KiB top tree, ST33 kg={c['ledger_kg_s']:.2f}s p99={c['ledger_sign_s']:.2f}s) | "
         f"FORS={f32:.1f}/{f33:.1f}/{f34:.1f}/{f35:.1f}/{f36:.1f}b (2^32..2^36) | "
-        f"M6-1T kg={c['m6_kg_ms']:.2f}ms (meas 0.65), sign={c['m6_sign_ms']:.2f}ms (meas 3.47), ver={c['m6_ver_us']:.1f}us (meas 26.3) | "
-        f"constrained search (<=3s kg, <=12s sign on ST33, <=5950 B): {len(feasible)} feasible / {len(pareto)} Pareto."
+        f"M6-1T kg={c['m6_kg_ms']:.2f}ms (meas 0.17), sign={c['m6_sign_ms']:.2f}ms (meas 1.31), ver={c['m6_ver_us']:.1f}us (meas 34.9) | "
+        f"ST33 p99 <= 5.0s search (<= 7856 B): {len(feasible)} feasible / {len(pareto)} Pareto."
     )
 
 
@@ -219,8 +220,8 @@ def main():
     ap = argparse.ArgumentParser(description="Constrained-device-first BLINCS parameter search (inspired by Conor Deegan, Project 11).")
     ap.add_argument("--signatures", default="2^32")
     ap.add_argument("--security", type=float, default=128.0)
-    ap.add_argument("--max-ledger-keygen", type=float, default=3.0, help="Max Ledger ST33 keygen time (seconds)")
-    ap.add_argument("--max-ledger-sign", type=float, default=12.0, help="Max Ledger ST33 uncached sign time (seconds)")
+    ap.add_argument("--max-ledger-keygen", type=float, default=2.0, help="Max Ledger ST33 keygen time (seconds)")
+    ap.add_argument("--max-ledger-sign", type=float, default=5.0, help="Max Ledger ST33 uncached p99 sign time (seconds; constant for zero-grinding)")
     ap.add_argument("--max-bytes", type=int, default=7856, help="Max signature bytes (default 7,856 = SLH-DSA-128s; use 5,950 for 8 KiB HTTP headers)")
     ap.add_argument("--nibble-only", action="store_true", help="Restrict to w=16 nibble WOTS+")
     ap.add_argument("--top", type=int, default=10, help="Number of Pareto rows to display")

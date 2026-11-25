@@ -73,13 +73,13 @@ def check_static(params_src, spec_text, shipped_sources):
     if used_kinds != ALL_KINDS:
         errors.append(f"unused TweakKind variants in shipped src/: {sorted(ALL_KINDS - used_kinds)}")
 
-    # 4. Exact finite-domain bit-width bounds over full 2^35 uniform 5x7 parameter space.
+    # 4. Exact finite-domain bit-width bounds over full 2^35 uniform 7x5 parameter space.
     hyper_bits = 35
-    layer_heights = [7, 7, 7, 7, 7]
+    layer_heights = [5, 5, 5, 5, 5, 5, 5]
     if sum(layer_heights) != hyper_bits:
         errors.append("layer heights do not sum to 35")
     chains, chain_steps = 35, 15
-    fors_trees, fors_height = 13, 11
+    fors_trees, fors_height = 20, 8
     fors_leaves = 1 << fors_height
 
     cum = 0
@@ -134,7 +134,7 @@ def check_dynamic_reference():
     k_sec_expected = orig_derive(blincs.CTX_SECRET_VALUES, seed)
     pk_seed = orig_derive(blincs.CTX_PUBLIC_SEED, seed)[:16]
     k_pub_expected = orig_derive(blincs.CTX_PUBLIC_HASH, pk_seed)
-    id_bytes = bytes.fromhex("db09192c50a65494941887b9c57895ab1d8c239fbfb22e021f3b8dcc8d5b3da2")
+    id_bytes = bytes.fromhex("db09192c50a65494941887b9c57895ab817750c6dacc82855e914ae9adca39da")
     imp_bytes = open(os.path.join(ROOT, "test_vectors", "reference-imprint-1.bin"), "rb").read()
 
     bucket = [ver_sec_tweaks, ver_pub_tweaks]

@@ -27,7 +27,7 @@ CONTROLS = [
         "parse_digest_extracts_all_fors_indices_and_35bit_leaf_addr",
     ),
     (
-        "FORS root binds all 13 tree roots (fors_verify)",
+        "FORS root binds all 20 tree roots (fors_verify)",
         "src/few_time.rs",
         "        public.hash_many(&b48[..], &mut out[..]);",
         "        public.hash_many(&b48[..FORS_TREES - 1], &mut out[..FORS_TREES - 1]);",

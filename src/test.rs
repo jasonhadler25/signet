@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
-const REF_VK_HEX: &str = "db09192c50a65494941887b9c57895ab1d8c239fbfb22e021f3b8dcc8d5b3da2";
+const REF_VK_HEX: &str = "db09192c50a65494941887b9c57895ab817750c6dacc82855e914ae9adca39da";
 
 fn from_hex(s: &str) -> Vec<u8> {
     assert_eq!(s.len() % 2, 0);
@@ -177,35 +177,14 @@ fn wots_digits_and_checksum_boundaries() {
 #[test]
 fn parse_digest_extracts_all_fors_indices_and_35bit_leaf_addr() {
     let mut d = [0u8; 32];
-    let expected_idx: [u16; FORS_TREES] = core::array::from_fn(|t| u16::try_from((t * 157 + 29) & 0x7ff).unwrap());
-    let mut acc = 0u128;
-    // Pack first 11 indices (121 bits) into bytes 0..16, remaining 2 indices into bits 121..143.
-    for (t, &idx) in expected_idx.iter().enumerate() {
-        let bit = FORS_HEIGHT * t;
-        if bit < 112 {
-            acc |= u128::from(idx) << bit;
-        }
-    }
-    d[..16].copy_from_slice(&acc.to_le_bytes());
-    let mut hi_acc = 0u64;
-    for (t, &idx) in expected_idx.iter().enumerate() {
-        let bit = FORS_HEIGHT * t;
-        if bit >= 112 {
-            hi_acc |= u64::from(idx) << (bit - 112);
-        }
-    }
-    let hi_le = hi_acc.to_le_bytes();
-    for k in 0..4 {
-        d[14 + k] |= hi_le[k];
-    }
-    // Set unused bit 143 and bytes 18..20 to 0xff to prove they do not affect extraction.
-    d[17] |= 0x80;
-    d[18] = 0xff;
-    d[19] = 0xff;
+    let expected_idx: [u8; FORS_TREES] = core::array::from_fn(|t| u8::try_from((t * 13 + 29) & 0xff).unwrap());
+    d[..FORS_TREES].copy_from_slice(&expected_idx);
 
     let expected_addr = (1u64 << (HYPER_BITS - 1)) | 0x0123_4567;
     let raw_addr = expected_addr | (0x1fff_ffff_u64 << HYPER_BITS);
     d[20..28].copy_from_slice(&raw_addr.to_le_bytes());
+    // Set unused bytes 28..32 to 0xff to prove they do not affect extraction.
+    d[28..32].copy_from_slice(&[0xff; 4]);
 
     let (indices, addr) = parse_digest(&d);
     assert_eq!(indices, expected_idx);
@@ -619,7 +598,7 @@ fn debug_redacts_secrets() {
 
     let sig = sk.imprint_with_draw(&[1u8; 32], b"dbg");
     let sd = format!("{sig:?}");
-    assert!(sd.contains("5888 bytes") && sd.contains(&to_hex(&sig.as_bytes()[..N])));
+    assert!(sd.contains("7392 bytes") && sd.contains(&to_hex(&sig.as_bytes()[..N])));
 }
 
 #[test]
@@ -756,11 +735,19 @@ fn checked_constructors_reject_out_of_range_values() {
     assert_eq!(&max_t[2..8], &[0xff; 6]);
     assert!(catch_unwind(|| tweak(TweakKind::Node, 0, 1u64 << 48, 0, 0, 0)).is_err());
 
-    // Exact per-layer hypertree bounds: L0 < 2^28, L1 < 2^21, L2 < 2^14, L3 < 2^7, L4 == 0 (all 128 leaves).
-    for (layer, max_trees) in [(Layer::L0, 1u64 << 28), (Layer::L1, 1u64 << 21), (Layer::L2, 1u64 << 14), (Layer::L3, 1u64 << 7), (Layer::L4, 1)] {
-        let _ = Pos::new(layer, max_trees - 1, 127);
+    // Exact per-layer hypertree bounds: L0 < 2^30 .. L5 < 2^5, L6 == 0 (all 32 leaves).
+    for (layer, max_trees) in [
+        (Layer::L0, 1u64 << 30),
+        (Layer::L1, 1u64 << 25),
+        (Layer::L2, 1u64 << 20),
+        (Layer::L3, 1u64 << 15),
+        (Layer::L4, 1u64 << 10),
+        (Layer::L5, 1u64 << 5),
+        (Layer::L6, 1),
+    ] {
+        let _ = Pos::new(layer, max_trees - 1, 31);
         assert!(catch_unwind(|| Pos::new(layer, max_trees, 0)).is_err());
-        assert!(catch_unwind(|| Pos::new(layer, 0, 128)).is_err());
+        assert!(catch_unwind(|| Pos::new(layer, 0, 32)).is_err());
     }
 
     assert_eq!(checked_add_stream_len(u64::MAX - 10, 10).unwrap(), u64::MAX);
