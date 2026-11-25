@@ -3,8 +3,11 @@
 //! **Pre-1.0 experimental software (unsupported):** formats, context strings, and APIs may change
 //! incompatibly before 1.0, and no independent human cryptographic audit has been performed.
 //!
-//! Designed for post-quantum use with a 128-bit classical security target (see `SPEC.md` for bounds).
-//! Runs strictly on the calling thread (`blake3-servil-core`; no background worker threads).
+//! Designed for post-quantum use with a 128-bit classical security target at up to 2³² imprints
+//! per signet (do not imprint more than 2³² things with one signet; see `SPEC.md` for bounds).
+//! Runs strictly on the calling thread (`blake3-servil-core`; no background worker threads) with
+//! zero counter grinding (`7×5` uniform hypertree, byte-aligned `FORS(8, 20)`, 1 KiB top tree).
+//! Supported platforms: Linux (`x86_64`, `aarch64`) and macOS (`x86_64`, `aarch64`).
 //! Because a cryptographic key is a transferable bearer authority rather than a person's handwritten
 //! signature, this API calls the secret a [`Signet`], its 32-byte self-certifying identifier a
 //! [`SignetId`] (which names which signet you mean and verifies its imprints), and the 7,392-byte
@@ -176,14 +179,19 @@ impl SignetId {
         self.bytes[N..].try_into().unwrap()
     }
 
-    /// Verify that `imprint` was made by this signet over an in-memory `message` slice.
+    /// Verify that `imprint` was made by this signet over an in-memory `message` slice (zero heap allocation).
+    ///
+    /// Verify against an expected [`SignetId`] obtained from a pinned or authenticated channel.
     #[must_use = "imprint verification result must be checked"]
     pub fn verify(&self, message: &[u8], imprint: &Imprint) -> bool {
         let short = content_from_slice(&self.content_key, imprint.salt(), message);
         self.verify_short(&short, imprint)
     }
 
-    /// Verify that `imprint` was made by this signet over a streaming `reader` in one salted pass.
+    /// Verify that `imprint` was made by this signet over a streaming `reader` in one salted pass
+    /// (zero heap allocation; uses a local zero-initialized 16 KiB stack buffer).
+    ///
+    /// Verify against an expected [`SignetId`] obtained from a pinned or authenticated channel.
     #[must_use = "imprint verification result must be checked"]
     pub fn verify_reader(&self, reader: impl Read, imprint: &Imprint) -> io::Result<bool> {
         let short = content_from_reader(&self.content_key, imprint.salt(), reader)?;
@@ -237,7 +245,10 @@ impl Signet {
         Ok(Self::from_seed(&seed))
     }
 
-    /// Derive a signet from a 32-byte `seed`, building the 1 KiB top hypertree on the calling thread.
+    /// Derive a signet from a persisted 32-byte `seed`, building the 1 KiB top hypertree on the
+    /// calling thread.
+    ///
+    /// Performs no entropy check on `seed`. For creating new signets, use [`Signet::generate`].
     #[must_use]
     pub fn from_seed(seed: &[u8; SEED_LEN]) -> Self {
         ensure_init();
@@ -326,13 +337,20 @@ impl Signet {
     }
 
     /// Imprint an in-memory `message`, drawing fresh per-imprint randomness from `randomness`.
+    ///
+    /// Self-verifies the finished imprint before returning. Do not imprint more than 2³² things
+    /// with one signet.
     #[must_use]
     pub fn imprint(&self, randomness: &Randomness, message: &[u8]) -> Imprint {
         let draw = randomness.draw();
         self.imprint_with_draw(&draw, message)
     }
 
-    /// Imprint a streaming `reader` in one salted pass, drawing fresh per-imprint randomness from `randomness`.
+    /// Imprint a streaming `reader` in one salted pass, drawing fresh per-imprint randomness from
+    /// `randomness`.
+    ///
+    /// Self-verifies the finished imprint before returning. Do not imprint more than 2³² things
+    /// with one signet.
     pub fn imprint_reader(&self, randomness: &Randomness, reader: impl Read) -> io::Result<Imprint> {
         let draw = randomness.draw();
         self.imprint_reader_with_draw(&draw, reader)

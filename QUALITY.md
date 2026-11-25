@@ -24,7 +24,7 @@ BLINCS computes signatures matching [`SPEC.md`](SPEC.md) with zero `unsafe` Rust
 BLINCS is designed so that no secret material steers a branch or memory index in its Rust code:
 
 1. **Signing branches and indices depend only on public values.** The FORS tree indices (`fors_indices`), hypertree address (`leaf_addr`), chosen FORS leaf (`chosen_leaf`), Merkle sibling directions, and WOTS+ chain step counts (`digits(node)`) are all derived from `D`, `salt`, `randomizer`, and tree roots that are published in the signature itself.
-2. **Secret material is only copied or hashed.** `seed`, `SecretKey`, `salt_key`, `randomizer_key`, `run_key`, `draw`, and unrevealed FORS/WOTS+ secrets are never branched on, sorted by, or used as array indices; they are passed directly into `blake3-servil-core`.
+2. **Secret material is only copied or hashed.** `seed`, `SecretKey`, `salt_key`, `randomizer_key`, `run_key`, `keygen_key`, `draw`, and unrevealed FORS/WOTS+ secrets are never branched on, sorted by, or used as array indices; they are passed directly into `blake3-servil-core`.
 3. **Underlying hash kernels and hardware limits.** `blake3-servil-core` symbolically proves its assembly kernels branch- and address-independent of keys and inputs, while leaving CPU data-independent timing modes (Arm `DIT`, Intel `DOITM`) to the calling thread or OS. Power/frequency side channels (such as Hertzbleed) and data-dependent prefetchers without `DIT` (such as GoFetch on Apple M1–M3) sit outside software proofs; callers requiring hardware timing guarantees should enable `DIT`/`DOITM` at the thread or platform level.
 
 ## Bugs these steps found
@@ -35,8 +35,9 @@ Concrete defects found during development and cross-family reviews, and the chec
 2. **Imprinting self-check did not independently bind `imprint[..16]` to `short[..16]` (Round 2 review).** `verify_short` hashed `short` without comparing `imprint.salt()` against `short[..16]`. Fixed in `SignetId::verify_short`; guarded by planted-fault control #5 in `tools/controls.py`.
 3. **Unchecked `u64::MAX` stream length (Round 2 review).** Fixed via `checked_add_stream_len`; guarded by `test::checked_constructors_reject_out_of_range_values`.
 4. **Reference validation skipped under `python3 -O` (Round 2 review).** `reference/blincs.py` used `assert` for input length checks, which `-O` strips. Replaced with explicit `ValueError`/`TypeError` checks; guarded by the `python3 -O` check in `tools/land.py`.
-5. **Missing `#[must_use]` on `verify`/`verify_reader` and loose `Pos::new` tree bound (Round 3 review).** Fixed with `#[must_use]` annotations and exact per-layer `tree < layer.trees()` (`tree == 0` at layer 3); guarded by `test::checked_constructors_reject_out_of_range_values`.
-6. **Hypertree Merkle left/right rule and `FEW_ROOT` wording in `SPEC.md` (Blind TypeScript test & Round 3 review).** Clarified explicitly in `SPEC.md` so cold readers never have to infer hypertree sibling order or `FEW_ROOT` tweak fields.
+5. **Missing `#[must_use]` on `verify`/`verify_reader` and loose `Pos::new` tree bound (Round 3 review).** Fixed with `#[must_use]` annotations and exact per-layer `tree < layer.trees()` (`tree == 0` at the top layer); guarded by `test::checked_constructors_reject_out_of_range_values`.
+6. **Hypertree Merkle left/right rule and `FEW_ROOT` wording in `SPEC.md` (TypeScript verification & Round 3 review).** Clarified explicitly in `SPEC.md` so cold readers never have to infer hypertree sibling order or `FEW_ROOT` tweak fields.
+7. **Concurrent POSIX `readdir` rotation race in lock-free `Randomness::initialize` (landing stress test).** When overlapping startups unlinked every listed seed between `read_dir` and `open` (or shifted entries past the `readdir` cursor), `initialize` could falsely report an empty directory. Fixed in `read_seed_entries` by re-scanning up to 16 times; guarded by an 8-thread × 10-round (80 overlapping rotations) stress test in `src/test.rs`.
 
 ## Reproduction commands
 

@@ -23,7 +23,7 @@ tests/
 reference/
   blake3.py             From-spec pure-Python BLAKE3 (35 official test vectors)
   blincs.py             Independent pure-Python reference implementation
-  blincs.ts             Educational blind spec-only TypeScript verifier (for reading, not production execution)
+  blincs.ts             Educational spec-only TypeScript verifier (for reading, not production execution)
 test_vectors/           Checked-in primary & edge-case reference signatures (SHA-256 + BLAKE3 recorded)
 tools/
   require_nextest.rs    Sentinel test failing plain `cargo test`
@@ -41,7 +41,7 @@ audits/                 Unedited cross-family review reports
 
 - **Simplicity:** prefer one clear mechanism with the fewest runtime cases and fewest new concepts. Every piece earns its place.
 - **Design by Contract:** document preconditions and fail stop on broken invariants; avoid defensive fallback modes that hide bugs.
-- **Crash-only:** avoid shutdown hooks and per-call allocate-and-drop cycles for reusable buffers.
+- **Crash-only:** zero `Drop` implementations and no shutdown hooks; verification uses only stack buffers (zero heap allocation).
 - **Zero `unsafe`:** the library crate enforces `#![forbid(unsafe_code)]`.
 - **Terminology:** call the 32-byte secret bearer object a **signet** (`Signet`), its 32-byte self-certifying identifier a **signet ID** (`SignetId`) — never "public key" — and the 7,392-byte proof an **imprint** (`Imprint`).
 - **Two hashes:** whenever recording or checking a file digest, record both SHA-256 and BLAKE3.

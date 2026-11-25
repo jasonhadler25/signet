@@ -94,7 +94,7 @@ fn main() {
     let sk = Signet::from_seed(&seed);
     let vk = SignetId::from_bytes(sk.id().as_bytes());
 
-    // Warm up the CPU / SME2 unit and thread-local workspaces.
+    // Warm up the CPU / SME2 unit.
     for _ in 0..8 {
         let s = sk.imprint(&rng, b"warmup");
         assert!(vk.verify(b"warmup", &s));

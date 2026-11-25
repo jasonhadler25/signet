@@ -1,7 +1,9 @@
 use blake3_servil_core::throughput::TreeHasher;
 use blake3_servil_core::{Mode, convenience, initialize};
 
+/// Byte length of a [`crate::Signet`] secret seed (`32` bytes).
 pub const SEED_LEN: usize = 32;
+/// Byte length of a [`crate::SignetId`] wire encoding (`32` bytes: `public_seed || top_root`).
 pub const SIGNET_ID_LEN: usize = 32;
 
 pub(crate) const N: usize = 16;
@@ -23,6 +25,7 @@ pub(crate) const HYPER_BITS: usize = LAYERS * TREE_HEIGHT;
 pub(crate) const SHORT_LEN: usize = N + 32;
 pub(crate) const FORS_LEN: usize = FORS_TREES * (1 + FORS_HEIGHT) * N;
 pub(crate) const LAYER_LEN: usize = (CHAINS + TREE_HEIGHT) * N;
+/// Byte length of a BLINCS [`crate::Imprint`] (`7,392` bytes).
 pub const IMPRINT_LEN: usize = 2 * N + FORS_LEN + LAYERS * LAYER_LEN;
 
 const _: () = {

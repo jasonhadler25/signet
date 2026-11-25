@@ -200,6 +200,10 @@ impl Randomness {
     /// Read all seed files in `dir`, mix them with OS randomness (`getrandom`) and the monotonic
     /// clock, create a fresh seed file atomically (without `fsync`), remove the old files, and
     /// return the in-memory generator.
+    ///
+    /// Rejects non-directories, empty directories, symlinks, unexpected filenames, and seed files
+    /// larger than 32 bytes without modifying or deleting unrelated files. Re-scans if concurrent
+    /// startups rotate the directory during listing, and re-hashes the pool on filename collision.
     pub fn initialize(dir: impl AsRef<Path>) -> io::Result<Self> {
         ensure_init();
         let dir = dir.as_ref();
