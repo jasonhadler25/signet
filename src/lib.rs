@@ -4,6 +4,7 @@
 //! incompatibly before 1.0, and no independent human cryptographic audit has been performed.
 //!
 //! Designed for post-quantum use with a 128-bit classical security target (see `SPEC.md` for bounds).
+//! Runs strictly on the calling thread (`blake3-servil-core`; no background worker threads).
 //! Because a cryptographic key is a transferable bearer authority rather than a person's handwritten
 //! signature, this API calls the secret a [`Signet`], its 32-byte public identifier a [`SignetId`]
 //! (which names which signet you mean and verifies its imprints), and the 5,616-byte proof an
@@ -29,7 +30,6 @@ mod content;
 mod few_time;
 mod one_time;
 mod params;
-mod pool;
 mod randomness;
 
 #[cfg(test)]
@@ -39,26 +39,19 @@ pub use params::{IMPRINT_LEN, SEED_LEN, SIGNET_ID_LEN};
 pub use randomness::Randomness;
 
 use content::{content_from_reader, content_from_slice};
-use few_time::{ForsTreeOut, build_fors_tree, fors_root, fors_verify, parse_digest};
-use one_time::{Pos, build_merkle_heap, build_wots_leaves_chunk, verify_layer, write_layer_signature};
+use few_time::{build_fors_tree, fors_root, fors_verify, parse_digest};
+use one_time::{Pos, SignWorkspace, WOTS_CHUNK_LEAVES, build_merkle_heap, build_wots_leaves_chunk, verify_layer, write_layer_signature};
 use params::{
-    CTX_CONTENT, CTX_CONTENT_SALT, CTX_PUBLIC_SEED, CTX_RANDOMIZER, FORS_LEN, FORS_TREES, LAYERS, LOWER_LEAVES, Layer, N, PublicKey, SHORT_LEN, SecretKey,
-    TOP_LEAVES, TweakKind, derive_key, ensure_init, first_n, keyed, tweak,
+    CTX_CONTENT, CTX_CONTENT_SALT, CTX_PUBLIC_SEED, CTX_RANDOMIZER, FORS_LEN, FORS_TREES, LOWER_LEAVES, Layer, N, PublicKey, SHORT_LEN, SecretKey, TOP_LEAVES,
+    TweakKind, derive_key, ensure_init, first_n, keyed, tweak,
 };
-use pool::{WOTS_CHUNK_LEAVES, parallel_collect, with_caller_scratch, with_verify_workspace};
 use std::array::TryFromSliceError;
 use std::fmt;
 use std::hint::black_box;
 use std::io::{self, Read};
 
-const TOP_CHUNKS: usize = TOP_LEAVES / WOTS_CHUNK_LEAVES;
-const SIGN_WOTS_CHUNK: usize = 8;
-const LOWER_CHUNKS_PER_LAYER: usize = LOWER_LEAVES / SIGN_WOTS_CHUNK;
-const LOWER_WOTS_TASKS: usize = (LAYERS - 1) * LOWER_CHUNKS_PER_LAYER;
-const SIGN_TOTAL_TASKS: usize = LOWER_WOTS_TASKS + FORS_TREES;
-
 const _: () = {
-    assert!(TOP_LEAVES.is_multiple_of(WOTS_CHUNK_LEAVES) && LOWER_LEAVES.is_multiple_of(SIGN_WOTS_CHUNK));
+    assert!(TOP_LEAVES.is_multiple_of(WOTS_CHUNK_LEAVES) && LOWER_LEAVES == WOTS_CHUNK_LEAVES);
 };
 
 fn ct_eq_n(a: &[u8; N], b: &[u8; N]) -> bool {
@@ -204,14 +197,12 @@ impl SignetId {
         let (fors_indices, leaf_addr) = parse_digest(public.hash(&msg_in).as_bytes());
         let coords = leaf_addr.split_layers();
 
-        with_verify_workspace(|ws| {
-            let mut node = fors_verify(&public, leaf_addr, &fors_indices, imprint.fors(), ws);
-            for layer in Layer::ALL {
-                let (tree, leaf) = coords[layer.index()];
-                node = verify_layer(&public, Pos::new(layer, tree, leaf), &node, imprint.layer(layer), ws);
-            }
-            ct_eq_n(&node, self.root())
-        })
+        let mut node = fors_verify(&public, leaf_addr, &fors_indices, imprint.fors());
+        for layer in Layer::ALL {
+            let (tree, leaf) = coords[layer.index()];
+            node = verify_layer(&public, Pos::new(layer, tree, leaf), &node, imprint.layer(layer));
+        }
+        ct_eq_n(&node, self.root())
     }
 }
 
@@ -232,7 +223,7 @@ impl fmt::Debug for Signet {
 }
 
 impl Signet {
-    /// Derive a signet from a 32-byte `seed`, building the 128 KiB top hypertree across all CPU cores.
+    /// Derive a signet from a 32-byte `seed`, building the 128 KiB top hypertree on the calling thread.
     #[must_use]
     pub fn from_seed(seed: &[u8; SEED_LEN]) -> Self {
         ensure_init();
@@ -242,14 +233,13 @@ impl Signet {
         let public_seed = first_n(&derive_key(CTX_PUBLIC_SEED, seed));
         let public_key = PublicKey::from_seed(&public_seed);
 
-        let chunks = parallel_collect(TOP_CHUNKS, move |id, sme2, ws| {
-            let mut buf = [[0u8; N]; WOTS_CHUNK_LEAVES];
-            let leaf = u16::try_from(id * WOTS_CHUNK_LEAVES).unwrap();
-            build_wots_leaves_chunk(&secret_key, &public_key, Pos::new(Layer::TOP, 0, leaf), sme2, ws, &mut buf);
-            buf
-        });
-        let top_leaves: Vec<[u8; N]> = chunks.into_iter().flatten().collect();
-        let top_tree = with_caller_scratch(|ws| build_merkle_heap(&public_key, Layer::TOP, 0, &top_leaves, ws));
+        let mut ws = SignWorkspace::new();
+        let mut top_leaves = vec![[0u8; N]; TOP_LEAVES];
+        for start in (0..TOP_LEAVES).step_by(WOTS_CHUNK_LEAVES) {
+            let leaf = u16::try_from(start).unwrap();
+            build_wots_leaves_chunk(&secret_key, &public_key, Pos::new(Layer::TOP, 0, leaf), &mut ws, &mut top_leaves[start..start + WOTS_CHUNK_LEAVES]);
+        }
+        let top_tree = build_merkle_heap(&public_key, Layer::TOP, 0, &top_leaves, &mut ws);
 
         let mut id_bytes = [0u8; SIGNET_ID_LEN];
         id_bytes[..N].copy_from_slice(&public_seed);
@@ -268,11 +258,6 @@ impl Signet {
     }
 
     fn finish_imprint(&self, short: &[u8; SHORT_LEN]) -> Imprint {
-        enum WaveOut {
-            Wots([[u8; N]; SIGN_WOTS_CHUNK]),
-            Fors(ForsTreeOut),
-        }
-
         let mut sig = [0u8; IMPRINT_LEN];
         let randomizer = first_n(&keyed(&self.randomizer_key, short));
         sig[..N].copy_from_slice(&short[..N]);
@@ -282,26 +267,13 @@ impl Signet {
         let (fors_indices, leaf_addr) = parse_digest(&self.id.public_key.keyed(&msg_in));
         let coords = leaf_addr.split_layers();
         let (sec, pubk) = (self.secret_key, self.id.public_key);
+        let mut ws = SignWorkspace::new();
 
-        // One parallel wave builds all 3 lower XMSS leaf sets (384 WOTS+ leaves) and all 16 FORS trees.
-        let results = parallel_collect(SIGN_TOTAL_TASKS, move |id, sme2, ws| {
-            if id < LOWER_WOTS_TASKS {
-                let layer = Layer::LOWER[id / LOWER_CHUNKS_PER_LAYER];
-                let leaf = u16::try_from((id % LOWER_CHUNKS_PER_LAYER) * SIGN_WOTS_CHUNK).unwrap();
-                let mut buf = [[0u8; N]; SIGN_WOTS_CHUNK];
-                build_wots_leaves_chunk(&sec, &pubk, Pos::new(layer, coords[layer.index()].0, leaf), sme2, ws, &mut buf);
-                WaveOut::Wots(buf)
-            } else {
-                let t = id - LOWER_WOTS_TASKS;
-                WaveOut::Fors(build_fors_tree(&sec, &pubk, leaf_addr, u16::try_from(t).unwrap(), fors_indices[t], sme2, ws))
-            }
-        });
-
-        // Pack FORS imprint and compute FORS root.
+        // Build all 16 FORS trees and compute the FORS root.
         let mut at = 2 * N;
         let mut fors_roots = [[0u8; N]; FORS_TREES];
-        for (t, item) in results[LOWER_WOTS_TASKS..].iter().enumerate() {
-            let WaveOut::Fors(tree) = item else { unreachable!() };
+        for t in 0..FORS_TREES {
+            let tree = build_fors_tree(&sec, &pubk, leaf_addr, u16::try_from(t).unwrap(), fors_indices[t], &mut ws);
             sig[at..at + N].copy_from_slice(&tree.secret);
             at += N;
             for sib in &tree.auth {
@@ -313,33 +285,19 @@ impl Signet {
         let mut node = fors_root(&pubk.hasher(false), leaf_addr, &fors_roots);
 
         // Build the 3 lower Merkle heaps and imprint all 4 hypertree layers.
-        with_caller_scratch(|ws| {
-            for layer in Layer::LOWER {
-                let l = layer.index();
-                let mut leaves = [[0u8; N]; LOWER_LEAVES];
-                for chunk in 0..LOWER_CHUNKS_PER_LAYER {
-                    let WaveOut::Wots(data) = &results[l * LOWER_CHUNKS_PER_LAYER + chunk] else { unreachable!() };
-                    leaves[chunk * SIGN_WOTS_CHUNK..(chunk + 1) * SIGN_WOTS_CHUNK].copy_from_slice(data);
-                }
-                let (tree, leaf) = coords[l];
-                let off = layer.sig_offset();
-                let heap = build_merkle_heap(&pubk, layer, tree, &leaves, ws);
-                write_layer_signature(&sec, &pubk, Pos::new(layer, tree, leaf), &node, &heap, ws, &mut sig[off..off + layer.sig_len()]);
-                node = heap[1];
-            }
-            let (top_tree_idx, top_leaf) = coords[Layer::TOP.index()];
-            assert_eq!(top_tree_idx, 0);
-            let off = Layer::TOP.sig_offset();
-            write_layer_signature(
-                &sec,
-                &pubk,
-                Pos::new(Layer::TOP, top_tree_idx, top_leaf),
-                &node,
-                &self.top_tree,
-                ws,
-                &mut sig[off..off + Layer::TOP.sig_len()],
-            );
-        });
+        let mut leaves = [[0u8; N]; LOWER_LEAVES];
+        for layer in Layer::LOWER {
+            let (tree, leaf) = coords[layer.index()];
+            build_wots_leaves_chunk(&sec, &pubk, Pos::new(layer, tree, 0), &mut ws, &mut leaves);
+            let heap = build_merkle_heap(&pubk, layer, tree, &leaves, &mut ws);
+            let off = layer.sig_offset();
+            write_layer_signature(&sec, &pubk, Pos::new(layer, tree, leaf), &node, &heap, &mut sig[off..off + layer.sig_len()]);
+            node = heap[1];
+        }
+        let (top_tree_idx, top_leaf) = coords[Layer::TOP.index()];
+        assert_eq!(top_tree_idx, 0);
+        let off = Layer::TOP.sig_offset();
+        write_layer_signature(&sec, &pubk, Pos::new(Layer::TOP, top_tree_idx, top_leaf), &node, &self.top_tree, &mut sig[off..off + Layer::TOP.sig_len()]);
 
         let imprint = Imprint(sig);
         assert!(self.id.verify_short(short, &imprint), "internal error: generated imprint failed self-verification");

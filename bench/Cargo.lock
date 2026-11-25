@@ -3,47 +3,25 @@
 version = 4
 
 [[package]]
-name = "arrayvec"
-version = "0.7.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
-
-[[package]]
-name = "blake3-servil"
-version = "0.10.0+b0b4c80c39ff28c2dbcc2234a6dc17b40911830d"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69a34a6598bfae54dc08a4aed4c3c7d10b8c8f52d8132944ae4350fdeb076081"
-dependencies = [
- "arrayvec",
- "blake3-servil-core",
- "cc",
-]
-
-[[package]]
 name = "blake3-servil-core"
-version = "0.10.0+b0b4c80c39ff28c2dbcc2234a6dc17b40911830d"
+version = "0.11.0+2c43b150bd18c89b6c08a133446c51a3fe6981bc"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89ad4f705b7555f204f1135cdf3b1c1c44c0aa26cd777ba7a535bd462e61c7d3"
+checksum = "bae688de9624cf0ebd41e02d8f32f457a0207dba7999b7a7240afdb69d19946b"
 dependencies = [
- "arrayvec",
  "blake3-servil-version",
- "cc",
- "cfg-if",
- "constant_time_eq",
- "libc",
 ]
 
 [[package]]
 name = "blake3-servil-version"
-version = "0.10.0+b0b4c80c39ff28c2dbcc2234a6dc17b40911830d"
+version = "0.11.0+2c43b150bd18c89b6c08a133446c51a3fe6981bc"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2dd9388ff4d0afe6036b59b2002708163797aa4b8779aeceebfcf4016b59c8b"
+checksum = "ca53212aa401fdabad2b45928b0a0fa8a0cf9bc2842e691acd655fddd97b6642"
 
 [[package]]
 name = "blincs"
 version = "0.1.0"
 dependencies = [
- "blake3-servil",
+ "blake3-servil-core",
 ]
 
 [[package]]
@@ -55,46 +33,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cc"
-version = "1.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02f0e023adb368345ce0ca6cdfc0f24a06554468d0e8503e14a0841de79bfa69"
-dependencies = [
- "find-msvc-tools",
- "shlex",
-]
-
-[[package]]
-name = "cfg-if"
-version = "1.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
-
-[[package]]
 name = "clocks"
 version = "0.1.0"
 source = "git+https://github.com/servil-software-factory/bench-hashes?rev=cade30fdb71682719f5fa3e586ff96146ae9fc25#cade30fdb71682719f5fa3e586ff96146ae9fc25"
-
-[[package]]
-name = "constant_time_eq"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
-
-[[package]]
-name = "find-msvc-tools"
-version = "0.1.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
-
-[[package]]
-name = "libc"
-version = "0.2.191"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
-
-[[package]]
-name = "shlex"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"

@@ -9,7 +9,6 @@ use crate::params::{
 };
 use crate::randomness::{STATE_LEN, mix, read_exact_or_reject, read_monotonic_clock};
 use crate::{Imprint, Randomness, SEED_LEN, SIGNET_ID_LEN, Signet, SignetId};
-use blake3_servil::throughput::Batch;
 use std::fs;
 use std::io::{self, Cursor, ErrorKind, Read};
 use std::panic::catch_unwind;
@@ -209,11 +208,9 @@ fn advance_chains_handles_zero_partial_and_full_lengths() {
     let initial: [[u8; N]; CHAINS] = core::array::from_fn(|i| [u8::try_from(i).unwrap(); N]);
 
     let mut batched = initial;
-    let mut b32 = Batch::new(32, CHAINS);
-    let mut out = [[0u8; 32]; CHAINS];
     let pub_core = public.hasher(false);
     let pos2 = Pos::new(Layer::L2, 17, 9);
-    advance_chains(&pub_core, pos2, &mut batched, &starts, &ends, &mut b32, &mut out);
+    advance_chains(&pub_core, pos2, &mut batched, &starts, &ends);
 
     for c in 0..CHAINS {
         let mut expected = initial[c];
@@ -225,14 +222,14 @@ fn advance_chains_handles_zero_partial_and_full_lengths() {
     }
 
     let mut noop = initial;
-    advance_chains(&pub_core, Pos::new(Layer::L0, 0, 0), &mut noop, &[5u8; CHAINS], &[5u8; CHAINS], &mut b32, &mut out);
+    advance_chains(&pub_core, Pos::new(Layer::L0, 0, 0), &mut noop, &[5u8; CHAINS], &[5u8; CHAINS]);
     assert_eq!(noop, initial);
 
     // Early-finish case: every chain finishes by step 4 (< CHAIN_STEPS).
     let mut short = initial;
     let short_starts = [2u8; CHAINS];
     let short_ends: [u8; CHAINS] = core::array::from_fn(|i| 2 + u8::try_from(i % 5).unwrap());
-    advance_chains(&pub_core, Pos::new(Layer::L1, 3, 2), &mut short, &short_starts, &short_ends, &mut b32, &mut out);
+    advance_chains(&pub_core, Pos::new(Layer::L1, 3, 2), &mut short, &short_starts, &short_ends);
     for c in 0..CHAINS {
         let mut expected = initial[c];
         for step in short_starts[c]..short_ends[c] {
@@ -845,21 +842,4 @@ fn stateful_lifecycle_and_trait_contracts() {
 
     let _ = fs::remove_dir_all(p1.parent().unwrap());
     let _ = fs::remove_dir_all(p2.parent().unwrap());
-}
-
-#[test]
-fn pool_executes_tasks_across_multiple_threads_when_available() {
-    ensure_init();
-    let cpus = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    // First wave lets newly spawned workers finish one-time scratch allocation and park on the condvar.
-    let _ = crate::pool::parallel_collect(1, |_, _, _| ());
-    let ids = crate::pool::parallel_collect(32, |_, _, _| {
-        thread::sleep(std::time::Duration::from_millis(2));
-        thread::current().id()
-    });
-    assert_eq!(ids.len(), 32);
-    if cpus > 1 {
-        let unique: std::collections::HashSet<_> = ids.into_iter().collect();
-        assert!(unique.len() > 1, "expected parallel_collect to use > 1 thread on {cpus}-CPU host");
-    }
 }

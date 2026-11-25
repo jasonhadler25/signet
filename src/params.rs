@@ -1,5 +1,5 @@
-use blake3_servil::throughput::TreeHasher;
-use blake3_servil::{Mode, convenience, initialize_multithreaded};
+use blake3_servil_core::throughput::TreeHasher;
+use blake3_servil_core::{Mode, convenience, initialize};
 
 pub const SEED_LEN: usize = 32;
 pub const SIGNET_ID_LEN: usize = 32;
@@ -48,7 +48,7 @@ pub(crate) const CTX_RUN_KEY: &str = "BLINCS 2026-11-24 randomness: key of this 
 
 #[inline]
 pub(crate) fn ensure_init() {
-    initialize_multithreaded(None);
+    initialize();
 }
 
 #[inline]
@@ -67,13 +67,13 @@ pub(crate) fn first_n(full: &[u8; 32]) -> [u8; N] {
 }
 
 #[inline]
-pub(crate) fn pack_tagged(dst: &mut [u8], t: [u8; 16], val: &[u8]) {
+pub(crate) fn pack_tagged(dst: &mut [u8; 32], t: [u8; 16], val: &[u8]) {
     dst[..16].copy_from_slice(&t);
     dst[16..32].copy_from_slice(val);
 }
 
 #[inline]
-pub(crate) fn pack_pair(dst: &mut [u8], t: [u8; 16], left: &[u8], right: &[u8]) {
+pub(crate) fn pack_pair(dst: &mut [u8; 48], t: [u8; 16], left: &[u8], right: &[u8]) {
     dst[..16].copy_from_slice(&t);
     dst[16..32].copy_from_slice(left);
     dst[32..48].copy_from_slice(right);

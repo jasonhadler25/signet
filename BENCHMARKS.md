@@ -1,138 +1,60 @@
-# Benchmarks: Project 11 SLH-DSA-B reproduction and BLINCS
+# Benchmarks: Project 11 SLH-DSA-B reproduction and BLINCS (single-threaded)
 
 *Thanks to [Project 11](https://research.projecteleven.com/) — specifically **Conor Deegan** and **julienif** on [PQC Suite B (`PQC-Suite-B/signatures`)](https://github.com/PQC-Suite-B/signatures) (building on the **RustCrypto** `slh-dsa` crate) — for publishing the SLH-DSA-B implementation, benchmark harness, and charts reproduced here, and to **Servil Software Factory** for [`blake3-servil-core`](https://github.com/servil-software-factory/BLAKE3) and [`bench-hashes`](https://github.com/servil-software-factory/bench-hashes) (`clocks`).*
 
-All local measurements below ran on an **Apple M6** (12 cores, macOS arm64, Rust 1.100.0).
+All local measurements below ran on an **Apple M6** (macOS arm64, Rust 1.100.0). **BLINCS runs strictly single-threaded** on the calling thread via `blake3-servil-core = "=0.11.0"` (zero worker threads, zero background runtime).
 
-## 1. Project 11 SLH-DSA-B reproduction vs. BLINCS (Criterion methodology)
+## 1. Single-core comparison: Project 11 SLH-DSA-B reproduction vs. BLINCS
 
-Source reproduced: [`PQC-Suite-B/signatures`](https://github.com/PQC-Suite-B/signatures) branch `b3`, commit `b392fe82d2d9770142477a576a758a233888bc0a` (`slh-dsa/benches/sign_verify.rs` and `slh-dsa/benches/sign_large_msg.rs`: Criterion 0.5, `sample_size(10)`, `measurement_time(10s)` for `sign_large` over 64 B, 1 MiB, and 100 MiB, and `verify` over 64 B). BLINCS was measured with the exact same Criterion configuration.
+Source reproduced for SLH-DSA: [`PQC-Suite-B/signatures`](https://github.com/PQC-Suite-B/signatures) branch `b3`, commit `b392fe82d2d9770142477a576a758a233888bc0a` (Criterion 0.5, `sample_size(10)`, `measurement_time(10s)` for `sign_large` over 64 B, 1 MiB, and 100 MiB, and `verify` over 64 B). Because `PQC-Suite-B/signatures` enables `blake3/rayon` for message segments $\ge 256$ KiB, we measured `SLH-DSA-BLAKE3` with `RAYON_NUM_THREADS=1` so every row below compares **1 core vs. 1 core** cleanly. BLINCS (`12 + 3×7`, `5,616 B`, `WOTS+` + `FORS`, no disk cache, `blake3-servil-core = "=0.11.0"`) was measured with `bench/` (`clocks`, 0% E-cores).
 
-> **Threading note:** `PQC-Suite-B/signatures` enables `blake3 = { version = "1.8.2", features = ["rayon"] }` and uses `update_rayon` on message segments $\ge 256$ KiB, so its `SLH-DSA-BLAKE3` 1 MiB and 100 MiB runs use **all CPU cores** for message hashing while its tree hashing is single-threaded. We measured `SLH-DSA-BLAKE3` both as-shipped (default 12 threads) and single-threaded (`RAYON_NUM_THREADS=1`). **BLINCS (`5,616 B`, `12 + 3×7`, `WOTS+` + `FORS`, no disk cache)** enables multithreading by default via `blake3-servil = "=0.10.0"` (single-pass salted content hashing + coarse leaf-parallel tree/FORS wave) while verification of small messages stays single-core.
-
-### Published Apple M3 (PQC-Suite-B charts) vs. Apple M6 reproduction vs. BLINCS
-
-| Scheme | Sig bytes | Budget | Verify 64 B (M3 pub.) | Verify 64 B (M6) | Sign 64 B (M3 pub.) | Sign 64 B (M6) | Sign 1 MiB (M6) | Sign 100 MiB (M6) |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| SLH-DSA-SHAKE-128s | 7,856 B | $2^{64}$ | 665 µs | 509.0 µs | 696.0 ms | 548.4 ms | 550.1 ms | 738.7 ms |
-| SLH-DSA-SHA2-128s | 7,856 B | $2^{64}$ | 115 µs | 74.4 µs | 113.8 ms | 75.5 ms | 76.1 ms | 132.6 ms |
-| SLH-DSA-BLAKE3-128s *(as-shipped, rayon)* | 7,856 B | $2^{64}$ | 159 µs | 126.6 µs | 155.3 ms | 121.7 ms | 122.1 ms | 131.9 ms *(12 cores)* |
-| SLH-DSA-BLAKE3-128s *(1 thread)* | 7,856 B | $2^{64}$ | — | 126.6 µs | — | 121.7 ms | — | 222.8 ms *(1 core)* |
-| SLH-DSA-SHAKE-128f | 17,088 B | $2^{64}$ | 1,943 µs | 1,539.9 µs | 33.6 ms | 26.3 ms | 28.2 ms | 215.5 ms |
-| SLH-DSA-SHA2-128f | 17,088 B | $2^{64}$ | 328 µs | 219.9 µs | 5.54 ms | 3.63 ms | 4.19 ms | 60.6 ms |
-| SLH-DSA-BLAKE3-128f *(as-shipped, rayon)* | 17,088 B | $2^{64}$ | 459 µs | 353.7 µs | 7.42 ms | 5.81 ms | 6.26 ms | 15.8 ms *(12 cores)* |
-| SLH-DSA-BLAKE3-128f *(1 thread)* | 17,088 B | $2^{64}$ | — | 353.7 µs | — | 5.81 ms | — | 89.1 ms *(1 core)* |
-| **BLINCS *(`12 + 3×7`, multithreaded default)*** | **5,616 B** | **$2^{32}$** | — | **25.3 µs** | — | **0.73 ms** | **0.79 ms** | **4.28–4.46 ms** *(12 cores)* |
-| *BLINCS 0.1.0 draft (1 thread, 3,988 B, WOTS+C + PORS+FP)* | *3,988 B* | *$2^{33}$* | — | *31.8 µs* | — | *16.44 ms* | *16.67 ms* | *31.33 ms (1 core)* |
-
-Additional BLINCS (`12 + 3×7`) verification numbers on M6 (`clocks`, single-pass salted, `blake3-servil = "=0.10.0"`):
-
-- `verify 64 B` (1 core): **25.3 µs** (39,500 / s)
-- `verify 1 MiB`: **114.3 µs** (9,171 MB/s)
-- `verify 16 MiB`: **595.9 µs** (28,156 MB/s)
-- `verify 100 MiB`: **3.67 ms** (28,565 MB/s) / `verify_reader 100 MiB` (zero-copy `Pipeline`): **3.79 ms** (27,674 MB/s)
-
-Key takeaways on M6:
-
-- **Size:** BLINCS (`5,616 B`, `7,488 B` Base64) is **29% smaller** than `SLH-DSA-128s` (`7,856 B`), **3.0× smaller** than `SLH-DSA-128f` (`17,088 B`), and clears default Apache (`8,190 B`) and nginx (`8,192 B`) HTTP header limits with 702 B to spare.
-- **Verification (64 B, 1 core):** BLINCS (**25.3 µs**) is **2.9× faster** than hardware-accelerated `SLH-DSA-SHA2-128s` (74.4 µs), **5.0× faster** than `SLH-DSA-BLAKE3-128s` (126.6 µs), **14.0× faster** than `SLH-DSA-BLAKE3-128f` (353.7 µs), and **20.1× faster** than `SLH-DSA-SHAKE-128s` (509.0 µs).
-- **Signing (64 B):** BLINCS (**0.73 ms** warm, **6.16 ms** cold 1-shot with no disk cache) is **167× faster** than `SLH-DSA-BLAKE3-128s` (121.7 ms), **8.0× faster** than `SLH-DSA-BLAKE3-128f` (5.81 ms), and **5.0× faster** than `SLH-DSA-SHA2-128f` (3.63 ms) — with **zero counter grinding** and zero tail-latency spikes.
-- **Signing (100 MiB):** BLINCS (**4.28 ms** slice, **4.46 ms** via zero-copy `Pipeline` streaming) is **31× faster** than 12-core `SLH-DSA-BLAKE3-128s` (131.9 ms) and **3.7× faster** than 12-core `SLH-DSA-BLAKE3-128f` (15.8 ms).
-
-## 2. Wall time and core cycles (`bench/`, `clocks` crate)
-
-Measured on a quiet machine (`bench/` with `blake3-servil = "=0.10.0"`, `12 + 3×7` `5,616 B`, 0% E-cores on every run):
-
-| Operation | Wall time | Main-thread cycles | Instructions | IPC | Clock | Throughput |
+| Scheme (Apple M6, **1 core**) | Sig bytes | Per-key budget | Verify 64 B | Sign 64 B (warm) | Sign 1 MiB | Sign 100 MiB |
 |---|---:|---:|---:|---:|---:|---:|
-| `SigningKey::from_seed` (128 KiB top tree, no disk cache) | **5.43 ms** | 19.25M | 41.59M | 2.16 | 4,312 MHz | **184 / s** |
-| `sign` 64 B | **729.7 µs** | 2.57M | 6.05M | 2.36 | 3,828 MHz | **1,370 / s** |
-| `sign_reader` 64 B | **730.1 µs** | 2.57M | 6.05M | 2.36 | 3,829 MHz | **1,370 / s** |
-| `verify` 64 B (1 core) | **25.3 µs** | 116.7k | 651.8k | 5.58 | 4,611 MHz | **39,500 / s** |
-| `verify_reader` 64 B (1 core) | **25.7 µs** | 118.2k | 656.1k | 5.55 | 4,604 MHz | **38,900 / s** |
-| `verify` 256 KiB | 61.6 µs | 274.3k | 1.06M | 3.88 | 4,454 MHz | 4,255 MB/s |
-| `verify_reader` 256 KiB | 63.4 µs | 273.6k | 1.44M | 5.25 | 4,313 MHz | 4,132 MB/s |
-| `sign` 1 MiB | 789.6 µs | 2.82M | 6.93M | 2.45 | 3,862 MHz | 1,328 MB/s |
-| `verify` 1 MiB | 114.3 µs | 500.1k | 2.61M | 5.21 | 4,395 MHz | 9,171 MB/s |
-| `verify_reader` 1 MiB | 130.6 µs | 532.5k | 3.00M | 5.64 | 4,242 MHz | 8,026 MB/s |
-| `sign` 16 MiB | **1.29 ms** | 5.05M | 19.92M | 3.94 | 4,098 MHz | **12,987 MB/s** |
-| `verify` 16 MiB | **595.9 µs** | 2.58M | 14.44M | 5.59 | 4,342 MHz | **28,156 MB/s** |
-| `sign` 100 MiB | **4.28 ms** | 18.03M | 88.43M | 4.90 | 4,249 MHz | **24,475 MB/s** |
-| `sign_reader` 100 MiB (`Pipeline`) | **4.46 ms** | 17.97M | 96.05M | 5.34 | 4,078 MHz | **23,521 MB/s** |
-| `verify` 100 MiB | **3.67 ms** | 15.18M | 80.70M | 5.32 | 4,134 MHz | **28,565 MB/s** |
-| `verify_reader` 100 MiB (`Pipeline`) | **3.79 ms** | 15.34M | 89.91M | 5.86 | 4,048 MHz | **27,674 MB/s** |
-| `Randomness::initialize` | 22.8 µs | 103.3k | 444.8k | 4.31 | 4,535 MHz | — |
+| SLH-DSA-SHAKE-128s | 7,856 B | $2^{64}$ | 509.0 µs | 548.4 ms | 550.1 ms | 738.7 ms |
+| SLH-DSA-SHA2-128s | 7,856 B | $2^{64}$ | 74.4 µs | 75.5 ms | 76.1 ms | 132.6 ms |
+| SLH-DSA-BLAKE3-128s *(1 thread)* | 7,856 B | $2^{64}$ | 126.6 µs | 121.7 ms | 122.1 ms | 222.8 ms |
+| SLH-DSA-SHAKE-128f | 17,088 B | $2^{64}$ | 1,539.9 µs | 26.3 ms | 28.2 ms | 215.5 ms |
+| SLH-DSA-SHA2-128f | 17,088 B | $2^{64}$ | 219.9 µs | 3.63 ms | 4.19 ms | 60.6 ms |
+| SLH-DSA-BLAKE3-128f *(1 thread)* | 17,088 B | $2^{64}$ | 353.7 µs | 5.81 ms | 6.26 ms | 89.1 ms |
+| **BLINCS (`12 + 3×7`, `blake3-servil-core 0.11.0`)** | **5,616 B** | **$2^{32}$** | **21.3 µs** | **2.54 ms** | **2.68 ms** | **17.61 ms** |
 
-## 3. Optimized `blake3-servil` `0.10.0` benchmarks (single-threaded & multithreaded)
+Key takeaways on 1 Apple M6 core:
 
-We audited and benchmarked every relevant API in `blake3-servil-core = "=0.10.0"` and `blake3-servil = "=0.10.0"` (`Batch`, `TreeHasher::on_this_core()`, `hash_many`, `hash_many_multithreaded`, `hash_multithreaded`, and `Pipeline`) on a quiet Apple M6 using `clocks`.
+- **Size:** BLINCS (`5,616 B`, `7,488 B` Base64) is **29% smaller** than `SLH-DSA-128s` (`7,856 B`) and **3.0× smaller** than `SLH-DSA-128f` (`17,088 B`).
+- **Verification (64 B, 1 core):** BLINCS (**21.3 µs**, `46,900 / s`) is **3.5× faster** than hardware-accelerated `SLH-DSA-SHA2-128s` (`74.4 µs`), **5.9× faster** than `SLH-DSA-BLAKE3-128s` (`126.6 µs`), **16.6× faster** than `SLH-DSA-BLAKE3-128f` (`353.7 µs`), and **23.9× faster** than `SLH-DSA-SHAKE-128s` (`509.0 µs`).
+- **Signing (64 B, 1 core):** BLINCS (**2.54 ms** warm, **23.07 ms** cold 1-shot with no disk cache) is **48× faster** than `SLH-DSA-BLAKE3-128s` (`121.7 ms`), **30× faster** than `SLH-DSA-SHA2-128s` (`75.5 ms`), **2.3× faster** than `SLH-DSA-BLAKE3-128f` (`5.81 ms`) while 3× smaller, and **1.43× faster** than `SLH-DSA-SHA2-128f` (`3.63 ms`) — with zero counter grinding.
+- **Signing (100 MiB, 1 core):** BLINCS (**17.61 ms** slice / **27.00 ms** zero-allocation 16 KiB streaming reader) is **12.7× faster** than 1-core `SLH-DSA-BLAKE3-128s` (`222.8 ms`) and **5.1× faster** than 1-core `SLH-DSA-BLAKE3-128f` (`89.1 ms`), because BLINCS hashes the message in a single salted BLAKE3 pass (~6.0 GB/s signing, ~6.9 GB/s verifying on 1 core).
 
-### 3.1. Raw `hash_many` (32-byte messages: WOTS+C chain steps & PORS+FP leaves)
+## 2. Wall time, core cycles, and IPC (`bench/`, `clocks` crate)
 
-| Count | 1T SME2 (`hash_many`) | 1T NEON (`on_this_core`) | `hash_many_multithreaded` (`b3-MT`) | `b3-MT` vs. 1T |
-|---:|---:|---:|---:|---:|
-| 32 – 4,096 | 8.69 ns/hash | 14.78 ns/hash | 8.69 ns/hash | 1.00× *(< 512 KiB)* |
-| 8,192 (512 KiB) | 8.69 ns/hash | 14.78 ns/hash | 5.57 ns/hash | 1.56× |
-| 16,384 (1 MiB) | 8.69 ns/hash | 14.77 ns/hash | 5.21 ns/hash | 1.67× |
-| 32,768 (2 MiB) | 8.69 ns/hash | 14.79 ns/hash | 3.77 ns/hash | 2.30× |
-| 65,536 (4 MiB) | 8.69 ns/hash | 14.79 ns/hash | 3.22 ns/hash | 2.70× |
+Measured on a quiet Apple M6 (`bench/`, `blake3-servil-core = "=0.11.0"`, single-threaded, `0% E-cores` on every row):
 
-### 3.2. Full XMSS tree builds (single tree, merged lower layers, and `h_top = 15` keygen)
+| Operation (1 core) | Wall time | Core cycles | Instructions | IPC | Clock | Throughput |
+|---|---:|---:|---:|---:|---:|---:|
+| `Signet::from_seed` (128 KiB top tree, no disk cache) | **20.53 ms** | 84.48M | 115.85M | 1.37 | 4,116 MHz | **49 / s** |
+| `Signet::imprint` 64 B | **2.54 ms** | 10.44M | 14.97M | 1.43 | 4,109 MHz | **394 / s** |
+| `Signet::imprint_reader` 64 B | **2.54 ms** | 10.44M | 14.98M | 1.43 | 4,108 MHz | **394 / s** |
+| `SignetId::verify` 64 B | **21.3 µs** | 98.5k | 691.4k | **7.02** | 4,629 MHz | **46,900 / s** |
+| `SignetId::verify_reader` 64 B | **21.5 µs** | 99.0k | 692.8k | **7.00** | 4,615 MHz | **46,500 / s** |
+| `SignetId::verify` 1 KiB | 23.2 µs | 107.3k | 757.1k | 7.06 | 4,617 MHz | — |
+| `SignetId::verify` 64 KiB | 35.5 µs | 144.8k | 764.9k | 5.28 | 4,078 MHz | 1,845 MB/s |
+| `SignetId::verify` 256 KiB | 58.8 µs | 256.6k | 1.11M | 4.33 | 4,369 MHz | 4,462 MB/s |
+| `SignetId::verify_reader` 256 KiB | 86.6 µs | 363.2k | 1.10M | 3.04 | 4,198 MHz | 3,029 MB/s |
+| `Signet::imprint` 1 MiB | 2.68 ms | 11.04M | 17.27M | 1.56 | 4,120 MHz | 391 MB/s |
+| `SignetId::verify` 1 MiB | 159.3 µs | 706.7k | 3.03M | 4.29 | 4,437 MHz | 6,580 MB/s |
+| `SignetId::verify_reader` 1 MiB | 283.3 µs | 1.16M | 2.34M | 2.03 | 4,080 MHz | 3,701 MB/s |
+| `Signet::imprint` 16 MiB | **4.79 ms** | 20.27M | 52.17M | 2.57 | 4,230 MHz | **3,500 MB/s** |
+| `SignetId::verify` 16 MiB | **2.27 ms** | 9.90M | 37.97M | 3.83 | 4,371 MHz | **7,401 MB/s** |
+| `Signet::imprint` 100 MiB | **17.61 ms** | 76.44M | 247.61M | 3.24 | 4,342 MHz | **5,953 MB/s** |
+| `Signet::imprint_reader` 100 MiB (16 KiB stack buf) | 27.00 ms | 109.27M | 174.93M | 1.60 | 4,049 MHz | 3,884 MB/s |
+| `SignetId::verify` 100 MiB | **15.16 ms** | 66.40M | 233.34M | 3.51 | 4,382 MHz | **6,917 MB/s** |
+| `SignetId::verify_reader` 100 MiB (16 KiB stack buf) | 24.45 ms | 98.92M | 160.66M | 1.62 | 4,047 MHz | 4,288 MB/s |
+| `Randomness::initialize` | 23.0 µs | 104.5k | 450.6k | 4.31 | 4,540 MHz | — |
 
-In BLINCS signing, all $d - 1$ lower XMSS trees depend only on `(sk_seed, pk_seed, tree_idx)` and can be built together in **one merged batch** (`3× h=6`, `3× h=7`, `3× h=9`). We compare:
+## 3. Reproducing
 
-- **`1T-SME`:** single-threaded `blake3-servil-core` `Batch` on SME2.
-- **`b3-MT`:** `blake3-servil`'s built-in `hash_many_multithreaded` (zero custom threads; 512 KiB split threshold; barrier per chain step).
-- **`12T-HYB`:** persistent coarse leaf split across all 12 M6 cores — 1 thread on SME2 + 11 threads using `TreeHasher::on_this_core()` NEON, running all $w$ chain steps + copy-back + `ONE_TIME_KEY` locally in L1/L2 with **one** barrier at the end (no SME2 contention).
+```sh
+cd bench && cargo run --release
+```
 
-| XMSS workload | `1T-SME` | `1T-NEON` | `b3-MT` (zero custom threads) | `8T-HYB` | `12T-HYB` |
-|---|---:|---:|---:|---:|---:|
-| `1× h=6` (`w=16, v=32`) | 418 µs | 539 µs | 421 µs (0.99×) | 153 µs (2.73×) | **142 µs (2.95×)** |
-| `3× h=6` (`w=16, v=32`, merged) | 1.18 ms | 1.62 ms | 1.19 ms (1.00×) | 355 µs (3.33×) | **309 µs (3.82×)** |
-| `1× h=7` (`w=16, v=31`) | 784 µs | 1.04 ms | 786 µs (1.00×) | 251 µs (3.12×) | **215 µs (3.65×)** |
-| `3× h=7` (`w=16, v=31`, merged) | 2.20 ms | 3.12 ms | 1.57 ms (1.40×) | 666 µs (3.31×) | **530 µs (4.16×)** |
-| `4× h=7` (`w=16, v=31`, merged) | 2.90 ms | 4.17 ms | 1.89 ms (1.54×) | 879 µs (3.30×) | **689 µs (4.21×)** |
-| `3× h=9` (`w=32, v=24`, BLINCS `0.1.0`) | 12.73 ms | 19.30 ms | 7.66 ms (1.66×) | 4.04 ms (3.15×) | **2.98 ms (4.27×)** |
-| **`h_top = 15` keygen** (`32,768` leaves, `w=16, v=32`) | 177.05 ms | — | 72.33 ms (2.45×) | 59.61 ms (2.97×) | **42.56 ms (4.16×)** |
-
-### 3.3. PORS+FP tree builds (`b = 12..16`) and counter grinding
-
-| Workload | `1T-SME` | `b3-MT` | `8T-HYB` | `12T-HYB` |
-|---|---:|---:|---:|---:|
-| PORS+FP `b = 12` (4,096 leaves) | 158 µs | 166 µs (1.00×) | 94 µs (1.68×) | **86 µs (1.83×)** |
-| PORS+FP `b = 13` (8,192 leaves) | 299 µs | 279 µs (1.12×) | 134 µs (2.23×) | **115 µs (2.61×)** |
-| PORS+FP `b = 14` (16,384 leaves) | 565 µs | 427 µs (1.35×) | 201 µs (2.81×) | **174 µs (3.26×)** |
-| PORS+FP `b = 15` (32,768 leaves) | 1.08 ms | 688 µs (1.59×) | 335 µs (3.22×) | **295 µs (3.65×)** |
-| PORS+FP `b = 16` (65,536 leaves) | 2.10 ms | 1.08 ms (1.98×) | 669 µs (3.14×) | **531 µs (3.95×)** |
-| Grinding `52 B × 8,192` *(incl. counter write)* | 11.38 ns/try | 5.59 ns/try (1.55×) | 8.33 ns/try (1.37×) | 8.33 ns/try (1.37×) |
-| Grinding `52 B × 16,384` | 11.09 ns/try | 5.22 ns/try (1.67×) | 6.18 ns/try (1.79×) | **5.20 ns/try (2.13×)** |
-| Grinding `52 B × 32,768` | 10.75 ns/try | — | 4.79 ns/try (2.25×) | **3.85 ns/try (2.79×)** |
-
-### 3.4. Large-message content hashing (`100 MiB`): why BLINCS switched to single-pass salted BLAKE3
-
-We compared the earlier chained two-pass 256 KiB design against larger chunks, unchained parallel two-pass chunks, and single-pass salted BLAKE3 (`Keyed(Keyed(K_content, e), M)`) on a quiet Apple M6:
-
-| Content-hashing design (100 MiB, Apple M6) | Single thread | Multithreaded (`blake3-servil 0.10.0`) | Speedup vs. 2-pass 256 KiB 1T |
-|---|---:|---:|---:|
-| Chained 2-pass 256 KiB *(earlier draft)* | 31.56 ms (3,322 MB/s) | 31.55 ms (`hash_multithreaded`, 1.00×) / 26.28 ms (`Pipeline::lent`, 1.20×) | 1.00× – 1.20× |
-| Chained 2-pass 1 MiB | 28.33 ms (3,701 MB/s) | 11.86 ms (`hash_multithreaded`, 8,843 MB/s) | 2.66× |
-| Unchained parallel 2-pass 256 KiB *(12-core 1 SME2 + 11 NEON)* | ~31.6 ms | 6.32 ms (16,592 MB/s) | 4.99× |
-| **Single-pass salted BLAKE3 *(adopted)*** | **15.06 ms (6,963 MB/s)** | **3.42 ms (`hash_multithreaded`, 30,629 MB/s) / 3.45 ms (`Pipeline::room()`, 30,409 MB/s)** | **9.22×** |
-
-### 3.5. Highest-impact `blake3-servil` API optimizations for BLINCS
-
-In BLINCS, **`32 B` messages** (`16 B tweak || 16 B node`) account for **80–88% of all signing compressions** (WOTS+C chains and PORS+FP leaves), `48 B` Merkle internal nodes for ~5–10%, and `16 B` messages (tweak-only leaf seeds) for only ~4–7%. Based on the measurements and `blake3-servil 0.10.0` source audit, we filed four upstream feature requests on `servil-software-factory/BLAKE3`:
-
-1. **Fused in-place hash-chain primitive ([#510](https://github.com/servil-software-factory/BLAKE3/issues/510)):** stepping `Packed<32>` WOTS+C chains `s` times in registers with incrementing tweak counter, zero intermediate RAM writes, and zero per-step thread barriers (~3.8–4.3× on M6, +20–28% even on 1 core).
-2. **Fast `Packed<32>` batch hashing in low-latency & `Pipeline::batch` modes + optional 16-byte truncated output ([#509](https://github.com/servil-software-factory/BLAKE3/issues/509), building on [#501](https://github.com/servil-software-factory/BLAKE3/issues/501) / [#502](https://github.com/servil-software-factory/BLAKE3/issues/502) / [#503](https://github.com/servil-software-factory/BLAKE3/issues/503)):** zero-copy `Packed<32>` kernels with implicit zero padding in registers and `[u8; 16]` output cut hot-loop L1/L2 bandwidth in half.
-3. **Register-only counter-grinding batch ([#511](https://github.com/servil-software-factory/BLAKE3/issues/511)):** hashing one fixed $\le 64\text{ B}$ template with an incrementing `u32` counter in registers eliminates writing 2,048–32,768 duplicated slots to RAM.
-4. **General `Pipeline` ergonomics ([#512](https://github.com/servil-software-factory/BLAKE3/issues/512)):** per-message `Mode` (`message_with_mode`), safe zero-copy owned buffers for pre-existing slices, and calling-thread participation at low queue depth (note that zero-copy single-pass streaming directly into `Pipeline::room()` already reaches **30.4 GB/s** safely in `0.10.0`).
-
-## 4. Calibrated timing fit summary (used by `tools/optimize.py`)
-
-`tools/optimize.py --check` verifies the fitted M6 models directly against the measurements in Section 3:
-
-- **1T-SME (merged lower trees):** XMSS `10.25 + 2.2 * 6144 / (chains + 6144)` ns/comp (`h_top = 15` predicts `175.5 ms` vs. `177.1 ms` measured); PORS `10.2 + 4.4 * 6144 / (leaves + 6144)` ns/comp; grinding `11.4` ns/try.
-- **`b3-MT` (`hash_many_multithreaded`):** stays single-threaded below 8,192 slots (`512 KiB`), scaling smoothly up to `2.45×` on `h_top = 15` and `1.98×` on `b = 16` PORS.
-- **`12T-HYB` (1 SME2 + 11 NEON `on_this_core()`):** XMSS `2.38 + 3.6 * 1500 / (chains + 1500)` ns/comp + `15 µs` (`h_top = 15` predicts `40.8 ms` vs. `42.6 ms` measured); PORS `2.45 * (3 * leaves - 1) + 56,000` ns (within 1.7% across `b = 12..16`); grinding `4.8` ns/try above 10,000 tries.
-- **Verification (1 core, `on_this_core()`):** `18.5` ns/batched + `45.0` ns/scalar (`33.1 µs` predicted vs. `33.3 µs` measured for BLINCS `0.1.0`).
+x86-64 and non-Apple ARM measurements have not yet been published here.

@@ -73,17 +73,17 @@ def check_static(params_src, spec_text, shipped_sources):
                 # Inspect the local statement window (next 12 lines) to check which hasher/batch consumes it.
                 window = "\n".join(lines[max(0, lineno - 3) : min(len(lines), lineno + 12)])
                 if kind in SECRET_KINDS:
-                    if "sec_h.hash_many" not in window:
-                        errors.append(f"{rel}:{lineno}: secret tweak {kind} not paired with sec_h.hash_many")
-                    if "pub_h.hash_many" in window or "public.hash" in window:
+                    if "sec_h.hash_many" not in window and "sec_h.hash_counter_range" not in window:
+                        errors.append(f"{rel}:{lineno}: secret tweak {kind} not paired with sec_h.hash_many/hash_counter_range")
+                    if "pub_h.hash_many" in window or "pub_h.hash_counter_range" in window or "public.hash" in window:
                         # Narrower check: the batch immediately following the loop must be sec_h, not pub_h.
                         after = "\n".join(lines[lineno - 1 : min(len(lines), lineno + 6)])
-                        if "pub_h.hash_many" in after or "public.hash" in after:
+                        if "pub_h.hash_many" in after or "pub_h.hash_counter_range" in after or "public.hash" in after:
                             errors.append(f"{rel}:{lineno}: secret tweak {kind} appears adjacent to public hasher")
                 elif kind in PUBLIC_KINDS:
                     after = "\n".join(lines[lineno - 1 : min(len(lines), lineno + 8)])
-                    if "sec_h.hash_many" in after:
-                        errors.append(f"{rel}:{lineno}: public tweak {kind} appears adjacent to sec_h.hash_many")
+                    if "sec_h.hash_many" in after or "sec_h.hash_counter_range" in after:
+                        errors.append(f"{rel}:{lineno}: public tweak {kind} appears adjacent to sec_h")
                 else:
                     errors.append(f"{rel}:{lineno}: unknown TweakKind::{kind}")
 
@@ -132,8 +132,8 @@ def self_test(params_src, spec_text, shipped_sources):
     # Planted fault 3: secret tweak paired with public hasher.
     bad_role = dict(shipped_sources)
     bad_role["src/few_time.rs"] = bad_role["src/few_time.rs"].replace(
-        "sec_h.hash_many(&ws.b16.part(0..FORS_LEAVES)",
-        "pub_h.hash_many(&ws.b16.part(0..FORS_LEAVES)",
+        "sec_h.hash_counter_range(&secret_template, 3, 0, &mut ws.out[..FORS_LEAVES])",
+        "pub_h.hash_counter_range(&secret_template, 3, 0, &mut ws.out[..FORS_LEAVES])",
         1,
     )
     assert check_static(params_src, spec_text, bad_role), "self-test failed: secret/public role mixup escaped"

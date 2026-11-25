@@ -3,9 +3,5 @@
 # Classified by property: [functional-equiv], [dispatch/resource], or [durability].
 # Every entry must name a real surviving mutant; stale entries fail tools/mutants/check.py.
 
-src/content.rs	replace >= with < in content_from_slice	[dispatch/resource] Selects between single-core TreeHasher::hash and multi-core update_multithreaded; identical BLAKE3 keyed hash bytes.
-src/content.rs	replace > with >= in content_from_reader	[functional-equiv] Pipeline::commit with 0 bytes written is a documented no-op in blake3-servil 0.10.0.
-src/pool.rs	replace += with -= in Pool::run	[functional-equiv] In release mode, workers only compare guard.generation == seen for inequality; wrapping decrement steps through the same 2^64 distinct wave tokens.
 src/randomness.rs	replace read_monotonic_clock::<impl Hasher for Collect>::finish -> u64 with 1	[functional-equiv] Hasher::finish is never called; Instant::now().hash only invokes Hasher::write.
 src/randomness.rs	replace match guard !p.as_os_str().is_empty() with false in Randomness::create	[durability] Syncs "." instead of path.parent() when both are readable; affects directory-sync target only.
-src/pool.rs	replace / with *	[dispatch/resource] Allocates ws.b48 with 2048 slots instead of 512; build_merkle_heap chunks by ws.b48.len(), so results are identical.

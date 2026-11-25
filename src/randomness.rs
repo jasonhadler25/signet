@@ -61,9 +61,9 @@ pub(crate) fn read_exact_or_reject(reader: &mut impl Read) -> io::Result<[u8; ST
 ///
 /// Keep the state file in a private local directory owned by the signer on a Unix filesystem that
 /// supports advisory file locks (`flock`). Provision the file once with [`Randomness::create`] before
-/// starting signers. Do not use BLINCS in a `fork()` child without `exec()` (a multithreaded child does
-/// not inherit background worker threads). After restoring a live VM snapshot, call
-/// [`Randomness::initialize`] again so cloned images do not share the same `(run_key, count)` sequence.
+/// starting signers. After `fork()` (without `exec()`) or restoring a live VM snapshot, call
+/// [`Randomness::initialize`] again so cloned processes or images do not share the same
+/// `(run_key, count)` sequence.
 pub struct Randomness {
     run_key: [u8; 32],
     count: AtomicU64,

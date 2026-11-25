@@ -7,16 +7,15 @@ BLINCS is a stateless hash-based signature scheme on BLAKE3 implemented in Rust 
 ```text
 SPEC.md                 Normative byte-level specification
 DESIGN.md               Rationale for every design decision (including minimax)
-BENCHMARKS.md           SLH-DSA-B reproduction, BLINCS comparison, clocks & MT
+BENCHMARKS.md           SLH-DSA-B 1-core reproduction, BLINCS comparison, and clocks wall/cycle tables
 QUALITY.md              Verification layers, reproduction commands, and known gaps
 SECURITY.md             Threat model, operational boundaries, and reporting
 src/
   lib.rs                Public API (Signet, SignetId, Imprint)
   params.rs             Constants, contexts, 16-byte tweaks, key helpers
-  content.rs            Single-pass salted BLAKE3 content hashing (multi-core slices & zero-copy Pipeline streams)
+  content.rs            Single-pass salted BLAKE3 content hashing (single-threaded slices & 16 KiB stack streams)
   few_time.rs           FORS few-time signatures (16 trees x 1,024 leaves, zero grinding)
-  one_time.rs           WOTS+ nibble one-time signatures (w = 16, 35 chains, zero grinding) and Merkle trees
-  pool.rs               Crash-only parallel task runner and per-thread scratch workspaces (zero Drop impls)
+  one_time.rs           WOTS+ nibble one-time signatures (w = 16, 35 chains, zero grinding), Merkle trees, SignWorkspace
   randomness.rs         48-byte state file (create, initialize) and in-memory draws
   test.rs               Unit tests, reference vector checks, negative tests
 tests/
