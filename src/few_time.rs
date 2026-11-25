@@ -1,5 +1,7 @@
 use crate::one_time::SignWorkspace;
-use crate::params::{FORS_HEIGHT, FORS_LEAVES, FORS_LEN, FORS_TREES, LeafAddr, N, PublicKey, SecretKey, TweakKind, first_n, pack_pair, pack_tagged, tweak};
+use crate::params::{
+    FORS_HEIGHT, FORS_LEAVES, FORS_LEN, FORS_TOTAL_LEAVES, FORS_TREES, LeafAddr, N, PublicKey, SecretKey, TweakKind, first_n, pack_pair, pack_tagged, tweak,
+};
 use blake3_servil_core::throughput::TreeHasher;
 
 /// Extract the 20 byte-aligned FORS leaf indices (`digest[0..20]`, one byte per tree) and 35-bit
@@ -11,55 +13,68 @@ pub(crate) fn parse_digest(digest: &[u8; 32]) -> ([u8; FORS_TREES], LeafAddr) {
     (indices, leaf_addr)
 }
 
-/// Output of building one FORS tree during signing: secret value, authentication path, and tree root.
-#[derive(Clone, Copy)]
-pub(crate) struct ForsTreeOut {
-    pub secret: [u8; N],
-    pub auth: [[u8; N]; FORS_HEIGHT],
-    pub root: [u8; N],
-}
-
-/// Build one FORS tree `tree_idx` (0..20, 256 leaves) for `leaf_addr` and extract `chosen_leaf`'s path.
-pub(crate) fn build_fors_tree(
+/// Build all 20 FORS trees (256 leaves each) in lockstep, batching leaves and Merkle levels across
+/// all 20 trees so SIMD/SME2 stays saturated, writing secrets and authentication paths into `out_sig`
+/// and returning the 16-byte FORS root.
+pub(crate) fn build_all_fors(
     secret: &SecretKey,
     public: &PublicKey,
     leaf_addr: LeafAddr,
-    tree_idx: u16,
-    chosen_leaf: u8,
+    indices: &[u8; FORS_TREES],
     ws: &mut SignWorkspace,
-) -> ForsTreeOut {
-    assert!(usize::from(tree_idx) < FORS_TREES);
+    out_sig: &mut [u8; FORS_LEN],
+) -> [u8; N] {
     let tree = leaf_addr.as_u64();
+    let stride = (1 + FORS_HEIGHT) * N;
     let (sec_h, pub_h) = (secret.hasher(true), public.hasher(true));
 
-    let secret_template = tweak(TweakKind::FewSecret, 0, tree, tree_idx, 0, 0);
-    sec_h.hash_counter_range(&secret_template, 3, 0, &mut ws.out[..FORS_LEAVES]);
-    let chosen_secret = first_n(&ws.out[usize::from(chosen_leaf)]);
+    for (t, &chosen) in indices.iter().enumerate() {
+        let base = t * FORS_LEAVES;
+        let tree_u16 = u16::try_from(t).unwrap();
+        let secret_template = tweak(TweakKind::FewSecret, 0, tree, tree_u16, 0, 0);
+        sec_h.hash_counter_range(&secret_template, 3, 0, &mut ws.out[base..base + FORS_LEAVES]);
+        out_sig[t * stride..t * stride + N].copy_from_slice(&ws.out[base + usize::from(chosen)][..N]);
 
-    for i in 0..FORS_LEAVES {
-        pack_tagged(&mut ws.b32[i], tweak(TweakKind::FewLeaf, 0, tree, tree_idx, 0, u32::try_from(i).unwrap()), &ws.out[i][..N]);
+        for i in 0..FORS_LEAVES {
+            pack_tagged(&mut ws.b32[base + i], tweak(TweakKind::FewLeaf, 0, tree, tree_u16, 0, u32::try_from(i).unwrap()), &ws.out[base + i][..N]);
+        }
     }
-    pub_h.hash_many(&ws.b32[..FORS_LEAVES], &mut ws.out[..FORS_LEAVES]);
 
-    let mut nodes: [[u8; N]; FORS_LEAVES] = core::array::from_fn(|i| first_n(&ws.out[i]));
-    let mut auth = [[0u8; N]; FORS_HEIGHT];
-    let (mut cur_idx, mut count) = (usize::from(chosen_leaf), FORS_LEAVES);
+    pub_h.hash_many(&ws.b32[..FORS_TOTAL_LEAVES], &mut ws.out[..FORS_TOTAL_LEAVES]);
+    for i in 0..FORS_TOTAL_LEAVES {
+        ws.fors_nodes[i] = first_n(&ws.out[i]);
+    }
 
+    let mut cur_idx: [usize; FORS_TREES] = core::array::from_fn(|t| usize::from(indices[t]));
+    let mut width = FORS_LEAVES;
     for level in 1..=FORS_HEIGHT {
         let level_u16 = u16::try_from(level).unwrap();
-        auth[level - 1] = nodes[cur_idx ^ 1];
-        let parents = count / 2;
-        for (p, slot) in ws.b48[..parents].iter_mut().enumerate() {
-            pack_pair(slot, tweak(TweakKind::FewNode, 0, tree, tree_idx, level_u16, u32::try_from(p).unwrap()), &nodes[2 * p], &nodes[2 * p + 1]);
+        let parents = width / 2;
+        let total_parents = FORS_TREES * parents;
+        for t in 0..FORS_TREES {
+            let tree_u16 = u16::try_from(t).unwrap();
+            let base = t * width;
+            out_sig[t * stride + level * N..t * stride + (level + 1) * N].copy_from_slice(&ws.fors_nodes[base + (cur_idx[t] ^ 1)]);
+            let p_base = t * parents;
+            for p in 0..parents {
+                pack_pair(
+                    &mut ws.b48[p_base + p],
+                    tweak(TweakKind::FewNode, 0, tree, tree_u16, level_u16, u32::try_from(p).unwrap()),
+                    &ws.fors_nodes[base + 2 * p],
+                    &ws.fors_nodes[base + 2 * p + 1],
+                );
+            }
+            cur_idx[t] >>= 1;
         }
-        pub_h.hash_many(&ws.b48[..parents], &mut ws.out[..parents]);
-        for p in 0..parents {
-            nodes[p] = first_n(&ws.out[p]);
+        pub_h.hash_many(&ws.b48[..total_parents], &mut ws.out[..total_parents]);
+        for i in 0..total_parents {
+            ws.fors_nodes[i] = first_n(&ws.out[i]);
         }
-        (cur_idx, count) = (cur_idx >> 1, parents);
+        width = parents;
     }
 
-    ForsTreeOut { secret: chosen_secret, auth, root: nodes[0] }
+    let roots: &[[u8; N]; FORS_TREES] = ws.fors_nodes[..FORS_TREES].try_into().unwrap();
+    fors_root(&public.hasher(false), leaf_addr, roots)
 }
 
 /// Compress the 20 FORS tree roots into the 16-byte FORS root signed by hypertree layer 0.

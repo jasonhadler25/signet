@@ -1,14 +1,14 @@
 use crate::params::{
-    CHAIN_STEPS, CHAINS, FORS_LEAVES, LAYER_LEN, Layer, MSG_CHAINS, N, PublicKey, SecretKey, TREE_HEIGHT, TREE_LEAVES, TweakKind, first_n, pack_pair,
+    CHAIN_STEPS, CHAINS, FORS_TOTAL_LEAVES, LAYER_LEN, Layer, MSG_CHAINS, N, PublicKey, SecretKey, TREE_HEIGHT, TREE_LEAVES, TweakKind, first_n, pack_pair,
     pack_tagged, tweak,
 };
 use blake3_servil_core::throughput::{Batch, Prepared, TreeHasher};
 
 const WOTS_BATCH_SLOTS: usize = TREE_LEAVES * CHAINS;
-const MERKLE_BATCH_SLOTS: usize = FORS_LEAVES / 2;
+const MERKLE_BATCH_SLOTS: usize = FORS_TOTAL_LEAVES / 2;
 
 const _: () = {
-    assert!(WOTS_BATCH_SLOTS == 1120 && WOTS_BATCH_SLOTS >= FORS_LEAVES && MERKLE_BATCH_SLOTS == 128);
+    assert!(WOTS_BATCH_SLOTS == 1120 && FORS_TOTAL_LEAVES == 5120 && FORS_TOTAL_LEAVES >= WOTS_BATCH_SLOTS && MERKLE_BATCH_SLOTS == 2560);
 };
 
 /// Transient heap workspace owned by a single `Signet::from_seed` or `Signet::imprint` call.
@@ -18,16 +18,21 @@ pub(crate) struct SignWorkspace {
     pub b48: Vec<[u8; 48]>,
     pub b_pk: Batch<'static>,
     pub out: Vec<[u8; 32]>,
+    pub fors_nodes: Vec<[u8; N]>,
 }
 
 impl SignWorkspace {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(for_imprint: bool) -> Self {
+        let batch_32 = if for_imprint { FORS_TOTAL_LEAVES } else { WOTS_BATCH_SLOTS };
+        let batch_48 = if for_imprint { MERKLE_BATCH_SLOTS } else { TREE_LEAVES / 2 };
+        let fors_len = if for_imprint { FORS_TOTAL_LEAVES } else { 0 };
         Self {
             b16: vec![[0u8; 16]; WOTS_BATCH_SLOTS],
-            b32: vec![[0u8; 32]; WOTS_BATCH_SLOTS],
-            b48: vec![[0u8; 48]; MERKLE_BATCH_SLOTS],
+            b32: vec![[0u8; 32]; batch_32],
+            b48: vec![[0u8; 48]; batch_48],
             b_pk: Batch::new(16 + N * CHAINS, TREE_LEAVES),
-            out: vec![[0u8; 32]; WOTS_BATCH_SLOTS],
+            out: vec![[0u8; 32]; batch_32],
+            fors_nodes: vec![[0u8; N]; fors_len],
         }
     }
 }

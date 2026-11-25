@@ -1,17 +1,18 @@
 include!("../tools/require_nextest.rs");
 
-use crate::content::{checked_add_stream_len, content_from_reader};
+use crate::content::{checked_add_stream_len, content_from_reader, content_from_slice, derive_msg_key};
 use crate::few_time::parse_digest;
 use crate::one_time::{Pos, advance_chains, digits};
 use crate::params::{
-    CHAIN_STEPS, CHAINS, CTX_CONTENT, FORS_HEIGHT, FORS_TREES, HYPER_BITS, IMPRINT_LEN, LAYER_LEN, Layer, MSG_CHAINS, N, PublicKey, TREE_HEIGHT, TweakKind,
-    derive_key, ensure_init, tweak,
+    CHAIN_STEPS, CHAINS, CTX_CONTENT, FORS_HEIGHT, FORS_TREES, HYPER_BITS, IMPRINT_LEN, LAYER_LEN, Layer, MAX_CONTEXT_LEN, MSG_CHAINS, N, PublicKey,
+    SUITE_NAME, TREE_HEIGHT, TweakKind, derive_key, ensure_init, tweak,
 };
 use crate::randomness::{
     SEED_FILE_MAX_LEN, expand_pool, is_seed_filename, mix_pool, read_bounded_seed, read_monotonic_clock, read_os_randomness, read_seed_if_present,
     remove_if_present, seed_filename, write_next_seed,
 };
-use crate::{Imprint, Randomness, SEED_LEN, SIGNET_ID_LEN, Signet, SignetId};
+use crate::{Context, ContextTooLong, Imprint, InvalidImprint, Randomness, SEED_LEN, SIGNET_ID_LEN, Signet, SignetId, VerifyError, compute_message_digest};
+use std::error::Error;
 use std::fs;
 use std::io::{self, Cursor, ErrorKind, Read};
 use std::panic::catch_unwind;
@@ -19,7 +20,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
-const REF_VK_HEX: &str = "db09192c50a65494941887b9c57895ab817750c6dacc82855e914ae9adca39da";
+const REF_VK_HEX: &str = "b58abfb655db7c92808f12c3a8ffd2d04841cf61994321648cf193638876c492";
+const REF_CTX: Context<'static> = Context::new(b"BLINCS-128-7x5 reference vector v1");
+const TEST_CTX: Context<'static> = Context::new(b"signet unit test v1");
 
 fn from_hex(s: &str) -> Vec<u8> {
     assert_eq!(s.len() % 2, 0);
@@ -36,7 +39,7 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 fn temp_state_dir(tag: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!("blincs-test-{}-{tag}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("signet-test-{}-{tag}", std::process::id()));
     let _ = fs::remove_dir_all(&base);
     fs::create_dir_all(&base).unwrap();
     base.join("state.d")
@@ -107,7 +110,8 @@ impl Read for FailAfterReader {
 }
 
 #[test]
-fn reference_vector_matches_python_byte_for_byte() {
+fn reference_vector_and_intermediate_kats_match_python_byte_for_byte() {
+    assert_eq!(SUITE_NAME, "BLINCS-128-7x5");
     let seed: [u8; SEED_LEN] = core::array::from_fn(|i| u8::try_from(i).unwrap());
     let draw = [7u8; 32];
     let msg = b"hello, BLINCS";
@@ -120,19 +124,38 @@ fn reference_vector_matches_python_byte_for_byte() {
     assert_eq!(expected.len(), IMPRINT_LEN);
     let ref_sig = Imprint::try_from(expected.as_slice()).unwrap();
 
-    let rust_sig = sk.imprint_with_draw(&draw, msg);
+    // Intermediate Known Answer Tests (KATs) matching reference/blincs.py.
+    let e: [u8; N] = ref_sig.as_bytes()[..N].try_into().unwrap();
+    let r: [u8; N] = ref_sig.as_bytes()[N..2 * N].try_into().unwrap();
+    assert_eq!(to_hex(&e), "c59c076073bef65dd74facc7453fdcdc");
+    assert_eq!(to_hex(&r), "8538feb0b1803987e8a2344e0991d9b2");
+    let ck = derive_key(CTX_CONTENT, sk.id().as_bytes());
+    let k_msg = derive_msg_key(&ck, &e, REF_CTX);
+    assert_eq!(to_hex(&k_msg), "1c28a56af15ce2bb6792393b0b477388d924a2236ca3aedb061fb93d5e52bd8e");
+    let short = content_from_slice(&ck, &e, REF_CTX, msg);
+    assert_eq!(to_hex(&short[N..]), "ad7606a939db70dcc963a91e0fa003d59fc4462e163c16dd2138c4cd0cc66fab");
+    let pk = PublicKey::from_seed(sk.id().as_bytes()[..N].try_into().unwrap());
+    let root: [u8; N] = sk.id().as_bytes()[N..].try_into().unwrap();
+    let d = compute_message_digest(&pk, &r, &root, &short, REF_CTX);
+    assert_eq!(to_hex(&d), "6e13239c0efaa15bda213d2b03ca8b8d726cc1f9e6e0c6c686fdac69f6af9c68");
+    let (fors_idx, leaf_addr) = parse_digest(&d);
+    assert_eq!(fors_idx.as_slice(), &d[..FORS_TREES]);
+    assert_eq!(leaf_addr.as_u64(), 0x6c6c6e0e6);
+
+    let rust_sig = sk.imprint_with_draw(&draw, REF_CTX, msg);
     assert_eq!(rust_sig.as_bytes().as_slice(), expected.as_slice());
 
-    let reader_sig = sk.imprint_reader_with_draw(&draw, Cursor::new(msg)).unwrap();
+    let reader_sig = sk.imprint_reader_with_draw(&draw, REF_CTX, Cursor::new(msg)).unwrap();
     assert_eq!(reader_sig, rust_sig);
 
     let vk = SignetId::try_from(sk.id().as_bytes().as_slice()).unwrap();
     assert_eq!(vk, SignetId::from_bytes(sk.id().as_bytes()));
     assert!(SignetId::try_from(&vk.as_bytes()[..SIGNET_ID_LEN - 1]).is_err());
     assert!(SignetId::try_from([vk.as_bytes().as_slice(), &[0u8]].concat().as_slice()).is_err());
-    assert!(vk.verify(msg, &ref_sig));
-    assert!(vk.verify_reader(Cursor::new(msg), &ref_sig).unwrap());
-    assert!(!vk.verify(b"hello, BLINCS!", &ref_sig));
+    vk.verify(REF_CTX, msg, &ref_sig).unwrap();
+    vk.verify_reader(REF_CTX, Cursor::new(msg), &ref_sig).unwrap();
+    assert_eq!(vk.verify(REF_CTX, b"hello, BLINCS!", &ref_sig), Err(InvalidImprint));
+    assert_eq!(vk.verify(Context::EMPTY, msg, &ref_sig), Err(InvalidImprint));
 }
 
 #[test]
@@ -141,7 +164,67 @@ fn verify_alone_initializes_blake3_in_fresh_process() {
     let sig_bytes = fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/test_vectors/reference-imprint-1.bin")).unwrap();
     let vk = SignetId::from_bytes(&vk_bytes);
     let sig = Imprint::try_from(sig_bytes.as_slice()).unwrap();
-    assert!(vk.verify(b"hello, BLINCS", &sig));
+    vk.verify(REF_CTX, b"hello, BLINCS", &sig).unwrap();
+}
+
+#[test]
+fn context_validation_framing_and_error_contracts() {
+    assert_eq!(Context::EMPTY.as_bytes(), b"");
+    let max_bytes = [0x5au8; MAX_CONTEXT_LEN];
+    let max_ctx = Context::try_new(&max_bytes).unwrap();
+    assert_eq!(max_ctx.as_bytes().len(), MAX_CONTEXT_LEN);
+    assert_eq!(Context::try_from(max_bytes.as_slice()).unwrap(), max_ctx);
+
+    let over_bytes = [0x5au8; MAX_CONTEXT_LEN + 1];
+    let err = Context::try_new(&over_bytes).unwrap_err();
+    assert_eq!(err, ContextTooLong { len: 256 });
+    assert!(err.to_string().contains("256"));
+    assert_eq!(Context::try_from(over_bytes.as_slice()).unwrap_err(), err);
+    assert!(catch_unwind(|| Context::new(&over_bytes)).is_err());
+
+    // Distinct contexts and length-framing boundaries cannot cross-verify, and derive_msg_key itself binds ctx.
+    let sk = Signet::from_seed(&[0x31u8; SEED_LEN]);
+    let vk = sk.id();
+    let ck = derive_key(CTX_CONTENT, vk.as_bytes());
+    assert_ne!(derive_msg_key(&ck, &[0u8; N], Context::EMPTY), derive_msg_key(&ck, &[0u8; N], Context::new(b"a")));
+    assert_ne!(derive_msg_key(&ck, &[0u8; N], Context::new(b"a")), derive_msg_key(&ck, &[0u8; N], Context::new(b"b")));
+    let sig_ab_c = sk.imprint_with_draw(&[1u8; 32], Context::new(b"ab"), b"c");
+    vk.verify(Context::new(b"ab"), b"c", &sig_ab_c).unwrap();
+    assert_eq!(vk.verify(Context::new(b"a"), b"bc", &sig_ab_c), Err(InvalidImprint));
+    assert_eq!(vk.verify(Context::new(b"abc"), b"", &sig_ab_c), Err(InvalidImprint));
+    assert_eq!(vk.verify(Context::EMPTY, b"abc", &sig_ab_c), Err(InvalidImprint));
+
+    // Error Display / Error::source / From conversions on InvalidImprint and VerifyError.
+    assert!(InvalidImprint.to_string().contains("invalid"));
+    let ve_inv: VerifyError = InvalidImprint.into();
+    assert!(matches!(ve_inv, VerifyError::Invalid));
+    assert!(ve_inv.source().is_none());
+    assert!(ve_inv.to_string().contains("invalid"));
+
+    let ve_io: VerifyError = io::Error::new(ErrorKind::BrokenPipe, "pipe").into();
+    assert!(matches!(ve_io, VerifyError::Io(_)));
+    assert!(ve_io.source().is_some());
+    assert!(ve_io.to_string().contains("pipe"));
+
+    assert!(matches!(vk.verify_reader(Context::new(b"wrong"), Cursor::new(b"c"), &sig_ab_c), Err(VerifyError::Invalid)));
+    assert!(matches!(vk.verify_reader(Context::new(b"ab"), FailingReader::default(), &sig_ab_c), Err(VerifyError::Io(e)) if e.kind() == ErrorKind::BrokenPipe));
+}
+
+#[test]
+fn verify_short_rejects_mismatched_salt_against_short() {
+    let sk = Signet::from_seed(&[0x23u8; SEED_LEN]);
+    let vk = sk.id();
+    let sig = sk.imprint_with_draw(&[0x44u8; 32], TEST_CTX, b"salt-check");
+    let ck = derive_key(CTX_CONTENT, vk.as_bytes());
+    let salt: [u8; N] = sig.as_bytes()[..N].try_into().unwrap();
+    let short = content_from_slice(&ck, &salt, TEST_CTX, b"salt-check");
+    vk.verify_short(TEST_CTX, &short, &sig).unwrap();
+
+    // Corrupt only imprint.salt() (sig[0]) while keeping short intact: D and all trees still match,
+    // so ONLY the explicit ct_eq_n(imprint.salt(), short[..N]) check in verify_short rejects this.
+    let mut bad_raw = *sig.as_bytes();
+    bad_raw[0] ^= 0x01;
+    assert_eq!(vk.verify_short(TEST_CTX, &short, &Imprint::from_bytes(&bad_raw)), Err(InvalidImprint));
 }
 
 #[test]
@@ -183,7 +266,6 @@ fn parse_digest_extracts_all_fors_indices_and_35bit_leaf_addr() {
     let expected_addr = (1u64 << (HYPER_BITS - 1)) | 0x0123_4567;
     let raw_addr = expected_addr | (0x1fff_ffff_u64 << HYPER_BITS);
     d[20..28].copy_from_slice(&raw_addr.to_le_bytes());
-    // Set unused bytes 28..32 to 0xff to prove they do not affect extraction.
     d[28..32].copy_from_slice(&[0xff; 4]);
 
     let (indices, addr) = parse_digest(&d);
@@ -238,13 +320,13 @@ fn every_signature_region_is_checked() {
     let vk = sk.id();
 
     let msg = b"hello, BLINCS";
-    let base = sk.imprint_with_draw(&[7u8; 32], msg);
-    assert!(vk.verify(msg, &base));
+    let base = sk.imprint_with_draw(&[7u8; 32], REF_CTX, msg);
+    vk.verify(REF_CTX, msg, &base).unwrap();
 
     let flip = |offset: usize| -> bool {
         let mut raw = *base.as_bytes();
         raw[offset] ^= 1;
-        vk.verify(msg, &Imprint::from_bytes(&raw))
+        vk.verify(REF_CTX, msg, &Imprint::from_bytes(&raw)).is_ok()
     };
 
     for &off in &[0, 15, 16, 31] {
@@ -271,21 +353,47 @@ fn every_signature_region_is_checked() {
 
     let mut bad_vk = *vk.as_bytes();
     bad_vk[0] ^= 1;
-    assert!(!SignetId::from_bytes(&bad_vk).verify(msg, &base));
+    assert_eq!(SignetId::from_bytes(&bad_vk).verify(REF_CTX, msg, &base), Err(InvalidImprint));
     let mut bad_root = *vk.as_bytes();
     bad_root[31] ^= 1;
-    assert!(!SignetId::from_bytes(&bad_root).verify(msg, &base));
+    assert_eq!(SignetId::from_bytes(&bad_root).verify(REF_CTX, msg, &base), Err(InvalidImprint));
 
     // A valid imprint from a different signet must be rejected.
     let other_sk = Signet::from_seed(&[0x99u8; SEED_LEN]);
-    let other_sig = other_sk.imprint_with_draw(&[7u8; 32], msg);
-    assert!(other_sk.id().verify(msg, &other_sig));
-    assert!(!vk.verify(msg, &other_sig));
+    let other_sig = other_sk.imprint_with_draw(&[7u8; 32], REF_CTX, msg);
+    other_sk.id().verify(REF_CTX, msg, &other_sig).unwrap();
+    assert_eq!(vk.verify(REF_CTX, msg, &other_sig), Err(InvalidImprint));
 
     assert!(Imprint::try_from(&base.as_bytes()[..IMPRINT_LEN - 1]).is_err());
     let mut too_long = base.as_bytes().to_vec();
     too_long.push(0);
     assert!(Imprint::try_from(too_long.as_slice()).is_err());
+}
+
+#[test]
+fn arbitrary_imprints_never_panic_and_are_rejected() {
+    let vk_bytes: [u8; SIGNET_ID_LEN] = from_hex(REF_VK_HEX).try_into().unwrap();
+    let vk = SignetId::from_bytes(&vk_bytes);
+    let mut raw = [0u8; IMPRINT_LEN];
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    for round in 0..1000u32 {
+        // Fill with deterministic SplitMix64 pseudorandom bytes (plus boundary all-0 and all-ff patterns).
+        if round == 0 {
+            raw.fill(0x00);
+        } else if round == 1 {
+            raw.fill(0xff);
+        } else {
+            for chunk in raw.as_chunks_mut::<8>().0 {
+                state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                chunk.copy_from_slice(&(z ^ (z >> 31)).to_le_bytes());
+            }
+        }
+        let imp = Imprint::from_bytes(&raw);
+        assert_eq!(vk.verify(REF_CTX, b"fuzz-target", &imp), Err(InvalidImprint));
+    }
 }
 
 #[test]
@@ -297,34 +405,34 @@ fn streaming_boundaries_and_fragmented_readers_match_slices() {
 
     for &len in &[0usize, 1, 63, 64, 65, 1024, 16_383, 16_384, 16_385, 65_535, 65_536, 65_537, 256 * 1024, 512 * 1024, 1024 * 1024 + 19] {
         let msg: Vec<u8> = (0..len).map(|i| u8::try_from((i.wrapping_mul(37) ^ (i >> 8)) & 0xff).unwrap()).collect();
-        let sig = sk.imprint_with_draw(&draw, &msg);
-        assert!(vk.verify(&msg, &sig), "slice verify failed for len {len}");
+        let sig = sk.imprint_with_draw(&draw, TEST_CTX, &msg);
+        vk.verify(TEST_CTX, &msg, &sig).unwrap();
 
         let frag_sign = FragmentedReader::new(&msg, 7717, 5);
-        let sig_reader = sk.imprint_reader_with_draw(&draw, frag_sign).unwrap();
+        let sig_reader = sk.imprint_reader_with_draw(&draw, TEST_CTX, frag_sign).unwrap();
         assert_eq!(sig_reader, sig, "reader signature differed for len {len}");
 
         let frag_ver = FragmentedReader::new(&msg, 11113, 3);
-        assert!(vk.verify_reader(frag_ver, &sig).unwrap(), "reader verify failed for len {len}");
+        vk.verify_reader(TEST_CTX, frag_ver, &sig).unwrap();
 
         let mut longer = msg.clone();
         longer.push(0);
-        assert!(!vk.verify(&longer, &sig), "accepted trailing zero byte for len {len}");
+        assert_eq!(vk.verify(TEST_CTX, &longer, &sig), Err(InvalidImprint));
         if !msg.is_empty() {
             let mut flipped = msg.clone();
             flipped[len - 1] ^= 1;
-            assert!(!vk.verify(&flipped, &sig), "accepted last-byte flip for len {len}");
+            assert_eq!(vk.verify(TEST_CTX, &flipped, &sig), Err(InvalidImprint));
         }
     }
 
     let ck = derive_key(CTX_CONTENT, vk.as_bytes());
-    let err = content_from_reader(&ck, &[0u8; N], FailingReader::default()).unwrap_err();
+    let err = content_from_reader(&ck, &[0u8; N], TEST_CTX, FailingReader::default()).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::BrokenPipe);
-    assert_eq!(sk.imprint_reader_with_draw(&draw, FailingReader::default()).unwrap_err().kind(), ErrorKind::BrokenPipe);
-    let sig = sk.imprint_with_draw(&draw, b"x");
-    assert_eq!(vk.verify_reader(FailingReader::default(), &sig).unwrap_err().kind(), ErrorKind::BrokenPipe);
+    assert_eq!(sk.imprint_reader_with_draw(&draw, TEST_CTX, FailingReader::default()).unwrap_err().kind(), ErrorKind::BrokenPipe);
+    let sig = sk.imprint_with_draw(&draw, TEST_CTX, b"x");
+    assert!(matches!(vk.verify_reader(TEST_CTX, FailingReader::default(), &sig), Err(VerifyError::Io(e)) if e.kind() == ErrorKind::BrokenPipe));
 
-    let err_mid = content_from_reader(&ck, &[0u8; N], FailAfterReader { remaining: 90_000, failed: false }).unwrap_err();
+    let err_mid = content_from_reader(&ck, &[0u8; N], TEST_CTX, FailAfterReader { remaining: 90_000, failed: false }).unwrap_err();
     assert_eq!(err_mid.kind(), ErrorKind::BrokenPipe);
 }
 
@@ -332,18 +440,18 @@ fn streaming_boundaries_and_fragmented_readers_match_slices() {
 fn concurrent_signing_threads_produce_identical_signatures() {
     let sk = Arc::new(Signet::from_seed(&[0x55u8; SEED_LEN]));
     let vk = sk.id();
-    let expected: Vec<Imprint> = (0u8..8).map(|i| sk.imprint_with_draw(&[i; 32], &[i; 128])).collect();
+    let expected: Vec<Imprint> = (0u8..8).map(|i| sk.imprint_with_draw(&[i; 32], TEST_CTX, &[i; 128])).collect();
 
     let handles: Vec<_> = (0u8..8)
         .map(|i| {
             let sk = Arc::clone(&sk);
-            thread::spawn(move || sk.imprint_with_draw(&[i; 32], &[i; 128]))
+            thread::spawn(move || sk.imprint_with_draw(&[i; 32], TEST_CTX, &[i; 128]))
         })
         .collect();
     for (i, h) in handles.into_iter().enumerate() {
         let sig = h.join().unwrap();
         assert_eq!(sig, expected[i]);
-        assert!(vk.verify(&[u8::try_from(i).unwrap(); 128], &sig));
+        vk.verify(TEST_CTX, &[u8::try_from(i).unwrap(); 128], &sig).unwrap();
     }
 }
 
@@ -357,20 +465,20 @@ fn randomness_mix_matches_python_reference() {
     let pool = mix_pool(&[&s1, &s2], &system, clock);
     let (file_id, next_seed, run_key, keygen_key) = expand_pool(&pool);
 
-    assert_eq!(to_hex(&file_id), "25867ca5a64bc1144508c40dcf8811b3");
-    assert_eq!(to_hex(&next_seed), "faa9e83e7a6c973128ae3731f620be90cc9d5e041b851ceb66dd333f949a4e33");
-    assert_eq!(to_hex(&run_key), "e83d7320fb5db53ebb9b5ea8f04895e7936c56a11bc71681d201b2902426ebf8");
-    assert_eq!(to_hex(&keygen_key), "5ed0b294833d747b589829846d84c0ab0b15478d04b047a42a292c9891c8a4ab");
+    assert_eq!(to_hex(&file_id), "a927779e28c7d4d6e9b90fce92b7d968");
+    assert_eq!(to_hex(&next_seed), "fe3349e18bfbb00aa7c01e353a77116c60a815f9c4c2d2c0975b378013860ceb");
+    assert_eq!(to_hex(&run_key), "c8957425119b74d75e27985c4a1dbc9854fa0ad485361642b13fb927e17770c2");
+    assert_eq!(to_hex(&keygen_key), "a10872041d434e01fd6c8761bfc3f25e84a697c255c1dbd26959cec5c5ad1cc6");
 
     // Distinct seeds/framing produce distinct pools.
     assert_ne!(mix_pool(&[&s1], &system, clock), pool);
     assert_ne!(mix_pool(&[&[0x01u8], &[0x02, 0x03]], &system, clock), mix_pool(&[&[0x01u8, 0x02], &[0x03]], &system, clock));
 
     let r = Randomness::from_keys_at(run_key, keygen_key, 0);
-    assert_eq!(to_hex(&r.draw()), "4cf8c5e80dcee5740ccc5def4297a61106e66c759679878dfb79b6b00574b9fc");
-    assert_eq!(to_hex(&r.draw()), "39e6c944a4e723109e6d5405bd98d714268cdc267ea1bd349868e0216c8c8185");
+    assert_eq!(to_hex(&r.draw()), "2654e875d07988376ff03a027fc5168c708341b72c01a97e29f143bc9429caea");
+    assert_eq!(to_hex(&r.draw()), "c64abdd2cdeae926fc81a698156cf71371339af227026256f9a90d389eaef652");
     let rk = Randomness::from_keys_at(run_key, keygen_key, 0);
-    assert_eq!(to_hex(&rk.draw_for_keygen()), "d1e76af88105198cefd2348e1fd3f969cebf1abe76a10ac7d27c6d380ae501e6");
+    assert_eq!(to_hex(&rk.draw_for_keygen()), "2bae1e739a4b6fd15f275edf493a4c96cc18e3924749d0c1a06780f9a4084f12");
 }
 
 #[test]
@@ -388,9 +496,9 @@ fn randomness_seed_directory_lifecycle_concurrency_and_self_healing() {
     assert!(!dir.exists());
 
     // Filename validator boundary checks.
-    assert!(is_seed_filename("blincs-r2-0123456789abcdef0123456789abcdef"));
-    assert!(!is_seed_filename("blincs-r2-0123456789ABCDEF0123456789abcdef"));
-    assert!(!is_seed_filename("blincs-r2-0123456789abcdef0123456789abcde"));
+    assert!(is_seed_filename("signet-r2-0123456789abcdef0123456789abcdef"));
+    assert!(!is_seed_filename("signet-r2-0123456789ABCDEF0123456789abcdef"));
+    assert!(!is_seed_filename("signet-r2-0123456789abcdef0123456789abcde"));
     assert!(!is_seed_filename("other-r2-0123456789abcdef0123456789abcdef"));
 
     Randomness::create(&dir).unwrap();
@@ -414,11 +522,12 @@ fn randomness_seed_directory_lifecycle_concurrency_and_self_healing() {
     assert_eq!(init_files[0].1.len(), 32);
     assert_ne!(init_files[0].1.as_slice(), &[0u8; 32]);
 
+    // Umask-tolerant permission check: group/other bits must be zero (owner-only).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
-        assert_eq!(fs::metadata(dir.join(&init_files[0].0)).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o077, 0);
+        assert_eq!(fs::metadata(dir.join(&init_files[0].0)).unwrap().permissions().mode() & 0o077, 0);
     }
 
     // Separate create() produces distinct seed and filename.
@@ -443,7 +552,7 @@ fn randomness_seed_directory_lifecycle_concurrency_and_self_healing() {
     assert_ne!(rng1.draw(), rng2.draw());
 
     // Self-healing: leave a simulated 0-byte crash file alongside the valid 32-byte seed file.
-    let crash_name = "blincs-r2-00000000000000000000000000000000";
+    let crash_name = "signet-r2-00000000000000000000000000000000";
     fs::write(dir.join(crash_name), b"").unwrap();
     assert_eq!(list_files(&dir).len(), 2);
     let _rng3 = Randomness::initialize(&dir).unwrap();
@@ -475,7 +584,7 @@ fn randomness_seed_directory_lifecycle_concurrency_and_self_healing() {
     assert_ne!(os_a, [1u8; 32]);
 
     // read_seed_if_present & remove_if_present ignore NotFound (concurrent deletion) but propagate other I/O errors (ENOTDIR).
-    let missing = dir.join("blincs-r2-00000000000000000000000000000000");
+    let missing = dir.join("signet-r2-00000000000000000000000000000000");
     assert_eq!(read_seed_if_present(&missing).unwrap(), None);
     remove_if_present(&missing).unwrap();
     let existing_file = dir.join(&list_files(&dir)[0].0);
@@ -507,7 +616,7 @@ fn randomness_seed_directory_lifecycle_concurrency_and_self_healing() {
 
 #[test]
 fn hostile_directory_and_unexpected_files_are_rejected_without_deletion() {
-    let base = std::env::temp_dir().join(format!("blincs-hostile-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("signet-hostile-{}", std::process::id()));
     let _ = fs::remove_dir_all(&base);
     fs::create_dir_all(&base).unwrap();
 
@@ -532,7 +641,7 @@ fn hostile_directory_and_unexpected_files_are_rejected_without_deletion() {
     // Directory containing an oversized (>32 B) seed-named file is rejected without touching it.
     let over_dir = base.join("over.d");
     Randomness::create(&over_dir).unwrap();
-    let big_seed = over_dir.join("blincs-r2-ffffffffffffffffffffffffffffffff");
+    let big_seed = over_dir.join("signet-r2-ffffffffffffffffffffffffffffffff");
     fs::write(&big_seed, [0x77u8; 33]).unwrap();
     assert_eq!(Randomness::initialize(&over_dir).unwrap_err().kind(), ErrorKind::InvalidData);
     assert!(big_seed.exists());
@@ -549,7 +658,7 @@ fn hostile_directory_and_unexpected_files_are_rejected_without_deletion() {
 
         let sym_inside = base.join("sym-inside.d");
         Randomness::create(&sym_inside).unwrap();
-        symlink(&reg, sym_inside.join("blincs-r2-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")).unwrap();
+        symlink(&reg, sym_inside.join("signet-r2-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")).unwrap();
         assert_eq!(Randomness::initialize(&sym_inside).unwrap_err().kind(), ErrorKind::InvalidData);
     }
 
@@ -560,9 +669,12 @@ fn hostile_directory_and_unexpected_files_are_rejected_without_deletion() {
 fn monotonic_clock_advances_and_is_nontrivial() {
     ensure_init();
     let c1 = read_monotonic_clock();
-    assert!(c1.len() >= 8);
-    let p1 = mix_pool(&[&[0x10u8; 32]], &[0x20u8; 32], b"clock-a");
-    let p2 = mix_pool(&[&[0x10u8; 32]], &[0x20u8; 32], b"clock-b");
+    thread::sleep(std::time::Duration::from_millis(2));
+    let c2 = read_monotonic_clock();
+    assert!(c1.len() >= 8 && c2.len() >= 8);
+    assert_ne!(c1, c2);
+    let p1 = mix_pool(&[&[0x10u8; 32]], &[0x20u8; 32], &c1);
+    let p2 = mix_pool(&[&[0x10u8; 32]], &[0x20u8; 32], &c2);
     assert_ne!(p1, p2);
 }
 
@@ -578,9 +690,9 @@ fn signet_generate_produces_distinct_valid_signets() {
     assert_ne!(s1.id(), s2.id());
     assert_eq!(Signet::from_seed(s1.seed()).id(), s1.id());
 
-    let imp1 = s1.imprint(&rng, b"release-1");
-    assert!(s1.id().verify(b"release-1", &imp1));
-    assert!(!s2.id().verify(b"release-1", &imp1));
+    let imp1 = s1.imprint(&rng, TEST_CTX, b"release-1");
+    s1.id().verify(TEST_CTX, b"release-1", &imp1).unwrap();
+    assert_eq!(s2.id().verify(TEST_CTX, b"release-1", &imp1), Err(InvalidImprint));
 
     let _ = fs::remove_dir_all(dir.parent().unwrap());
 }
@@ -596,9 +708,9 @@ fn debug_redacts_secrets() {
     let rng = Randomness::from_keys_at([0xcdu8; 32], [0xefu8; 32], 0);
     assert_eq!(format!("{rng:?}"), "Randomness { .. }");
 
-    let sig = sk.imprint_with_draw(&[1u8; 32], b"dbg");
+    let sig = sk.imprint_with_draw(&[1u8; 32], TEST_CTX, b"dbg");
     let sd = format!("{sig:?}");
-    assert!(sd.contains("7392 bytes") && sd.contains(&to_hex(&sig.as_bytes()[..N])));
+    assert!(sd.contains(SUITE_NAME) && sd.contains("7392 bytes") && sd.contains(&to_hex(&sig.as_bytes()[..N])));
 }
 
 #[test]
@@ -613,7 +725,7 @@ fn create_alone_initializes_blake3_in_fresh_process() {
 fn initialize_alone_initializes_blake3_in_fresh_process() {
     let dir = temp_state_dir("init-only");
     fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("blincs-r2-0123456789abcdef0123456789abcdef"), [0x42u8; 32]).unwrap();
+    fs::write(dir.join("signet-r2-0123456789abcdef0123456789abcdef"), [0x42u8; 32]).unwrap();
     let rng = Randomness::initialize(&dir).unwrap();
     let _ = rng.draw();
     let _ = fs::remove_dir_all(dir.parent().unwrap());
@@ -663,23 +775,23 @@ fn reader_never_sees_previous_callers_bytes() {
     let vk = sk.id();
     let secret_msg = vec![0xAAu8; 256 * 1024];
 
-    let sig = sk.imprint_reader_with_draw(&[1u8; 32], Cursor::new(&secret_msg)).unwrap();
+    let sig = sk.imprint_reader_with_draw(&[1u8; 32], TEST_CTX, Cursor::new(&secret_msg)).unwrap();
 
     let mut snoop_small = SnoopingReader { data: b"second", pos: 0, saw_nonzero: false };
-    let sig2 = sk.imprint_reader_with_draw(&[2u8; 32], &mut snoop_small).unwrap();
+    let sig2 = sk.imprint_reader_with_draw(&[2u8; 32], TEST_CTX, &mut snoop_small).unwrap();
     assert!(!snoop_small.saw_nonzero, "small sign_reader observed previous caller's bytes");
-    assert!(vk.verify(b"second", &sig2));
+    vk.verify(TEST_CTX, b"second", &sig2).unwrap();
 
     let big_data = vec![0x55u8; 200 * 1024];
     let mut snoop_big_sign = SnoopingReader { data: &big_data, pos: 0, saw_nonzero: false };
-    let sig_big = sk.imprint_reader_with_draw(&[3u8; 32], &mut snoop_big_sign).unwrap();
+    let sig_big = sk.imprint_reader_with_draw(&[3u8; 32], TEST_CTX, &mut snoop_big_sign).unwrap();
     assert!(!snoop_big_sign.saw_nonzero, "stream sign_reader observed nonzero buffer bytes");
-    assert!(vk.verify(&big_data, &sig_big));
+    vk.verify(TEST_CTX, &big_data, &sig_big).unwrap();
 
-    assert!(vk.verify_reader(Cursor::new(&secret_msg), &sig).unwrap());
-    assert!(vk.verify_reader(DirtyThenFail::default(), &sig).is_err());
+    vk.verify_reader(TEST_CTX, Cursor::new(&secret_msg), &sig).unwrap();
+    assert!(matches!(vk.verify_reader(TEST_CTX, DirtyThenFail::default(), &sig), Err(VerifyError::Io(_))));
     let mut snoop_ver = SnoopingReader { data: &big_data, pos: 0, saw_nonzero: false };
-    assert!(vk.verify_reader(&mut snoop_ver, &sig_big).unwrap());
+    vk.verify_reader(TEST_CTX, &mut snoop_ver, &sig_big).unwrap();
     assert!(!snoop_ver.saw_nonzero, "stream verify_reader observed nonzero buffer bytes");
 }
 
@@ -687,7 +799,7 @@ fn reader_never_sees_previous_callers_bytes() {
 fn reentrant_reader_can_sign_and_verify_without_borrowing_panic() {
     let sk = Signet::from_seed(&[0x44u8; SEED_LEN]);
     let vk = sk.id();
-    let inner_sig = sk.imprint_with_draw(&[9u8; 32], b"inner");
+    let inner_sig = sk.imprint_with_draw(&[9u8; 32], TEST_CTX, b"inner");
 
     struct ReentrantReader<'a> {
         sk: &'a Signet,
@@ -708,25 +820,27 @@ fn reentrant_reader_can_sign_and_verify_without_borrowing_panic() {
                 return Ok(0);
             }
             self.done = true;
-            let nested = self.sk.imprint_reader_with_draw(&[8u8; 32], Cursor::new(b"nested")).unwrap();
-            assert!(self.vk.verify_reader(Cursor::new(b"nested"), &nested).unwrap());
-            assert!(self.vk.verify(b"inner", self.inner_sig));
+            let nested = self.sk.imprint_reader_with_draw(&[8u8; 32], TEST_CTX, Cursor::new(b"nested")).unwrap();
+            self.vk.verify_reader(TEST_CTX, Cursor::new(b"nested"), &nested).unwrap();
+            self.vk.verify(TEST_CTX, b"inner", self.inner_sig).unwrap();
             let msg = b"outer";
             buf[..msg.len()].copy_from_slice(msg);
             Ok(msg.len())
         }
     }
 
-    let outer = sk.imprint_reader_with_draw(&[7u8; 32], ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, prefix_remaining: 0, done: false }).unwrap();
-    assert!(vk.verify(b"outer", &outer));
-    assert!(vk.verify_reader(ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, prefix_remaining: 0, done: false }, &outer).unwrap());
+    let outer =
+        sk.imprint_reader_with_draw(&[7u8; 32], TEST_CTX, ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, prefix_remaining: 0, done: false }).unwrap();
+    vk.verify(TEST_CTX, b"outer", &outer).unwrap();
+    vk.verify_reader(TEST_CTX, ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, prefix_remaining: 0, done: false }, &outer).unwrap();
 
     let mut expected_big = vec![0x41u8; 32 * 1024];
     expected_big.extend_from_slice(b"outer");
-    let outer_big =
-        sk.imprint_reader_with_draw(&[6u8; 32], ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, prefix_remaining: 32 * 1024, done: false }).unwrap();
-    assert!(vk.verify(&expected_big, &outer_big));
-    assert!(vk.verify_reader(ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, prefix_remaining: 32 * 1024, done: false }, &outer_big).unwrap());
+    let outer_big = sk
+        .imprint_reader_with_draw(&[6u8; 32], TEST_CTX, ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, prefix_remaining: 32 * 1024, done: false })
+        .unwrap();
+    vk.verify(TEST_CTX, &expected_big, &outer_big).unwrap();
+    vk.verify_reader(TEST_CTX, ReentrantReader { sk: &sk, vk, inner_sig: &inner_sig, prefix_remaining: 32 * 1024, done: false }, &outer_big).unwrap();
 }
 
 #[test]
@@ -764,8 +878,8 @@ fn public_sign_with_shared_randomness_works_on_fresh_thread() {
 
     let rng_t = Arc::clone(&rng);
     let sk_t = Arc::clone(&sk);
-    let sig = thread::spawn(move || sk_t.imprint(&rng_t, b"fresh thread message")).join().unwrap();
-    assert!(vk.verify(b"fresh thread message", &sig));
+    let sig = thread::spawn(move || sk_t.imprint(&rng_t, TEST_CTX, b"fresh thread message")).join().unwrap();
+    vk.verify(TEST_CTX, b"fresh thread message", &sig).unwrap();
     let _ = fs::remove_dir_all(dir.parent().unwrap());
 }
 
@@ -790,15 +904,15 @@ fn oversized_read_return_fails_stop() {
     let vk = sk.id();
     let ck = derive_key(CTX_CONTENT, vk.as_bytes());
 
-    assert!(catch_unwind(|| content_from_reader(&ck, &[0u8; N], OversizedReader { prefix: 0 })).is_err());
-    assert!(catch_unwind(|| content_from_reader(&ck, &[0u8; N], OversizedReader { prefix: 32_768 })).is_err());
+    assert!(catch_unwind(|| content_from_reader(&ck, &[0u8; N], TEST_CTX, OversizedReader { prefix: 0 })).is_err());
+    assert!(catch_unwind(|| content_from_reader(&ck, &[0u8; N], TEST_CTX, OversizedReader { prefix: 32_768 })).is_err());
     assert!(catch_unwind(|| read_bounded_seed(&mut OversizedReader { prefix: 0 })).is_err());
 }
 
 #[test]
 fn all_public_operations_fit_within_128kib_stack_budget() {
     let handle = thread::Builder::new()
-        .name("blincs-stack-budget".to_owned())
+        .name("signet-stack-budget".to_owned())
         .stack_size(128 * 1024)
         .spawn(|| {
             let dir = temp_state_dir("stack-128k");
@@ -808,15 +922,15 @@ fn all_public_operations_fit_within_128kib_stack_budget() {
             let vk = SignetId::from_bytes(sk.id().as_bytes());
 
             let small = b"bounded stack budget check";
-            let s_small = sk.imprint(&rng, small);
-            assert!(vk.verify(small, &s_small));
-            let s_small_r = sk.imprint_reader(&rng, Cursor::new(small)).unwrap();
-            assert!(vk.verify_reader(Cursor::new(small), &s_small_r).unwrap());
+            let s_small = sk.imprint(&rng, TEST_CTX, small);
+            vk.verify(TEST_CTX, small, &s_small).unwrap();
+            let s_small_r = sk.imprint_reader(&rng, TEST_CTX, Cursor::new(small)).unwrap();
+            vk.verify_reader(TEST_CTX, Cursor::new(small), &s_small_r).unwrap();
 
             let big = vec![0xA5u8; 100 * 1024];
-            let s_big = sk.imprint_reader(&rng, Cursor::new(&big)).unwrap();
-            assert!(vk.verify_reader(Cursor::new(&big), &s_big).unwrap());
-            assert!(vk.verify(&big, &s_big));
+            let s_big = sk.imprint_reader(&rng, TEST_CTX, Cursor::new(&big)).unwrap();
+            vk.verify_reader(TEST_CTX, Cursor::new(&big), &s_big).unwrap();
+            vk.verify(TEST_CTX, &big, &s_big).unwrap();
 
             let _ = fs::remove_dir_all(dir.parent().unwrap());
         })
@@ -850,20 +964,22 @@ fn edge_vectors_match_python_byte_for_byte() {
     for (block, (expected_name, msg)) in blocks.iter().zip(messages.iter()) {
         let name_end = block.find('"').unwrap();
         assert_eq!(&block[..name_end], *expected_name);
+        let ctx_bytes = from_hex(&extract(block, "ctx_hex"));
+        let ctx = Context::try_new(&ctx_bytes).unwrap();
         let draw: [u8; 32] = from_hex(&extract(block, "draw_hex")).try_into().unwrap();
         let expected_sig = from_hex(&extract(block, "imprint_hex"));
         assert_eq!(expected_sig.len(), IMPRINT_LEN);
 
-        let sig_slice = sk.imprint_with_draw(&draw, msg);
+        let sig_slice = sk.imprint_with_draw(&draw, ctx, msg);
         assert_eq!(sig_slice.as_bytes().as_slice(), expected_sig.as_slice(), "slice mismatch on {expected_name}");
-        let sig_reader = sk.imprint_reader_with_draw(&draw, Cursor::new(msg)).unwrap();
+        let sig_reader = sk.imprint_reader_with_draw(&draw, ctx, Cursor::new(msg)).unwrap();
         assert_eq!(sig_reader, sig_slice, "reader mismatch on {expected_name}");
-        assert!(vk.verify(msg, &sig_slice));
-        assert!(vk.verify_reader(Cursor::new(msg), &sig_slice).unwrap());
+        vk.verify(ctx, msg, &sig_slice).unwrap();
+        vk.verify_reader(ctx, Cursor::new(msg), &sig_slice).unwrap();
 
         let mut bad = *sig_slice.as_bytes();
         bad[IMPRINT_LEN - 1] ^= 1;
-        assert!(!vk.verify(msg, &Imprint::from_bytes(&bad)));
+        assert_eq!(vk.verify(ctx, msg, &Imprint::from_bytes(&bad)), Err(InvalidImprint));
     }
 }
 
@@ -874,6 +990,10 @@ fn stateful_lifecycle_and_trait_contracts() {
     assert_send_sync::<SignetId>();
     assert_send_sync::<Imprint>();
     assert_send_sync::<Randomness>();
+    assert_send_sync::<Context<'static>>();
+    assert_send_sync::<InvalidImprint>();
+    assert_send_sync::<ContextTooLong>();
+    assert_send_sync::<VerifyError>();
 
     let d1 = temp_state_dir("lifecycle-contract-1");
     let d2 = temp_state_dir("lifecycle-contract-2");
@@ -892,19 +1012,19 @@ fn stateful_lifecycle_and_trait_contracts() {
     assert_eq!(vk1, vk1_rt);
     assert_ne!(vk1, vk2);
 
-    let s1a = sk1.imprint(&r1, b"alpha");
-    let s1b = sk1.imprint(&r1, b"alpha");
+    let s1a = sk1.imprint(&r1, TEST_CTX, b"alpha");
+    let s1b = sk1.imprint(&r1, TEST_CTX, b"alpha");
     assert_ne!(s1a, s1b, "distinct draws must yield distinct signatures");
     let s1a_clone = s1a.clone();
     assert_eq!(s1a, s1a_clone);
     assert_eq!(Imprint::try_from(s1a.as_bytes().as_slice()).unwrap(), s1a);
 
-    let s2 = sk2.imprint_reader(&r2, Cursor::new(b"beta")).unwrap();
-    assert!(vk1.verify(b"alpha", &s1a));
-    assert!(vk1_rt.verify_reader(Cursor::new(b"alpha"), &s1b).unwrap());
-    assert!(vk2.verify(b"beta", &s2));
-    assert!(!vk1.verify(b"beta", &s2));
-    assert!(!vk2.verify(b"alpha", &s1a));
+    let s2 = sk2.imprint_reader(&r2, TEST_CTX, Cursor::new(b"beta")).unwrap();
+    vk1.verify(TEST_CTX, b"alpha", &s1a).unwrap();
+    vk1_rt.verify_reader(TEST_CTX, Cursor::new(b"alpha"), &s1b).unwrap();
+    vk2.verify(TEST_CTX, b"beta", &s2).unwrap();
+    assert_eq!(vk1.verify(TEST_CTX, b"beta", &s2), Err(InvalidImprint));
+    assert_eq!(vk2.verify(TEST_CTX, b"alpha", &s1a), Err(InvalidImprint));
 
     let _ = fs::remove_dir_all(d1.parent().unwrap());
     let _ = fs::remove_dir_all(d2.parent().unwrap());

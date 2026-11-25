@@ -1,12 +1,26 @@
 [package]
-name = "blincs"
+name = "signet"
 version = "0.1.0"
 edition = "2024"
-description = "Stateless hash-based signatures based on BLAKE3 and SPHINCS (7,392-byte imprints, single-pass salted content hash)"
+description = "Signet: Rust implementation of BLINCS (BLINCS-128-7x5), stateless hash-based post-quantum signatures on BLAKE3."
 repository = "https://github.com/jasonhadler25/blincs"
 license = "MIT OR Apache-2.0 OR TGPPL-1.0" # OR BOSL-1.0, see LICENSE-BOSL.txt
 readme = "README.md"
-include = ["/src", "/reference/*.py", "/reference/blake3_test_vectors.json", "/test_vectors", "/SPEC.md", "/DESIGN.md", "/BENCHMARKS.md", "/README.md", "/QUALITY.md", "/SECURITY.md", "/LICENSE-*", "/tools/require_nextest.rs"]
+include = [
+    "/src",
+    "/tests",
+    "/reference",
+    "/test_vectors",
+    "/tools",
+    "/SPEC.md",
+    "/DESIGN.md",
+    "/BENCHMARKS.md",
+    "/CONTRIBUTING.md",
+    "/README.md",
+    "/QUALITY.md",
+    "/SECURITY.md",
+    "/LICENSE-*",
+]
 
 [dependencies]
 blake3-servil-core = "=0.11.0"

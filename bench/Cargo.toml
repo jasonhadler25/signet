@@ -1,12 +1,9 @@
 [package]
-name = "blincs-bench"
+name = "signet-bench"
 version = "0.0.0"
 edition = "2024"
 publish = false
 
 [dependencies]
-blincs = { path = ".." }
+signet = { path = ".." }
 clocks = { git = "https://github.com/servil-software-factory/bench-hashes", rev = "cade30fdb71682719f5fa3e586ff96146ae9fc25" }
-
-[profile.release]
-debug = false

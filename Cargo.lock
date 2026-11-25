@@ -18,14 +18,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca53212aa401fdabad2b45928b0a0fa8a0cf9bc2842e691acd655fddd97b6642"
 
 [[package]]
-name = "blincs"
-version = "0.1.0"
-dependencies = [
- "blake3-servil-core",
- "getrandom",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -53,6 +45,14 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "signet"
+version = "0.1.0"
+dependencies = [
+ "blake3-servil-core",
+ "getrandom",
+]
 
 [metadata]
 "hashset blake3-servil-core 0.11.0+2c43b150bd18c89b6c08a133446c51a3fe6981bc (registry+https://github.com/rust-lang/crates.io-index)" = "blake3-xkkkyze74shiwlp4vbqldwbenb2v4cp2j5uxr7kdtrvzjtfiekva.sha256-xltirxuwethq5pkb4awy6mxuk6qca7n2pgm3pjzebl63nhizsrvq"

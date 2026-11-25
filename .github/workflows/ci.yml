@@ -38,22 +38,21 @@ jobs:
           cargo fetch --locked
           python3 tools/cargo_lock_hashsets.py
 
-      - name: Format and lint
+      - name: Format, lint, and rustdoc
         run: |
           cargo fmt -- --check
           cargo clippy --all-targets --locked -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
 
-      - name: Unit, integration, and doc tests
+      - name: Unit, integration, doc tests, and unpacked crate verification
         run: |
           cargo nextest run --locked
           cargo test --doc --locked
+          cargo package --locked
 
-      - name: Python reference, optimizer self-check, safety counts, domain separation, and vector digests (SHA-256 + BLAKE3)
+      - name: Python & TypeScript references, optimizer self-check, safety counts, domain separation, and vector digests (SHA-256 + BLAKE3)
         run: |
-          python3 reference/blake3.py
-          python3 tools/optimize.py --check
-          python3 tools/counts.py
-          python3 tools/domain_sep.py
+          node --version
           python3 tools/land.py --skip-clean-check --skip-rust
 
       - name: Planted-fault controls

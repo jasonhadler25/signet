@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""BLINCS — reference implementation from SPEC.md (educational / vector conformance only).
+"""BLINCS-128-7x5 — educational / vector-conformance reference implementation from SPEC.md.
 
-Self-contained except for reference/blake3.py (BLAKE3 from its spec).
+NOT FOR PRODUCTION USE: pure Python, reads whole messages into RAM, and the CLI accepts test seeds
+on argv (never pass real signing seeds on command lines). Self-contained except reference/blake3.py.
 """
 
 import hmac
 import sys
 
 import blake3
+
+SUITE_NAME = "BLINCS-128-7x5"
+MAX_CONTEXT_LEN = 255
 
 N = 16
 LAYERS, TREE_HEIGHT = 7, 5
@@ -19,18 +23,18 @@ LAYER_LEN = (CHAINS + TREE_HEIGHT) * N
 IMPRINT_LEN = 2 * N + FORS_LEN + LAYERS * LAYER_LEN
 
 # Key-derivation contexts (SPEC.md, "Key-derivation contexts").
-CTX_SECRET_VALUES = "BLINCS 2026-11-25 signet: secret values"
-CTX_CONTENT_SALT = "BLINCS 2026-11-25 signet: content salt"
-CTX_RANDOMIZER = "BLINCS 2026-11-25 signet: randomizer"
-CTX_PUBLIC_SEED = "BLINCS 2026-11-25 signet: public seed"
-CTX_GENERATE_SIGNET = "BLINCS 2026-11-25 signet: generate"
-CTX_PUBLIC_HASH = "BLINCS 2026-11-25 public hash"
-CTX_CONTENT = "BLINCS 2026-11-25 content"
-CTX_MIX = "BLINCS 2026-11-25 randomness: mix"
-CTX_FILE_ID = "BLINCS 2026-11-25 randomness: file id"
-CTX_NEXT_SEED = "BLINCS 2026-11-25 randomness: next seed"
-CTX_RUN_KEY = "BLINCS 2026-11-25 randomness: key of this run"
-CTX_KEYGEN_KEY = "BLINCS 2026-11-25 randomness: keygen key"
+CTX_SECRET_VALUES = "BLINCS-128-7x5 2026-11-25 secret values"
+CTX_CONTENT_SALT = "BLINCS-128-7x5 2026-11-25 content salt"
+CTX_RANDOMIZER = "BLINCS-128-7x5 2026-11-25 randomizer"
+CTX_PUBLIC_SEED = "BLINCS-128-7x5 2026-11-25 public seed"
+CTX_PUBLIC_HASH = "BLINCS-128-7x5 2026-11-25 public hash"
+CTX_CONTENT = "BLINCS-128-7x5 2026-11-25 content"
+CTX_GENERATE_SIGNET = "Signet BLINCS-128-7x5 2026-11-25 generate signet"
+CTX_MIX = "Signet 2026-11-25 randomness: mix"
+CTX_FILE_ID = "Signet 2026-11-25 randomness: file id"
+CTX_NEXT_SEED = "Signet 2026-11-25 randomness: next seed"
+CTX_RUN_KEY = "Signet 2026-11-25 randomness: key of this run"
+CTX_KEYGEN_KEY = "Signet 2026-11-25 randomness: keygen key"
 
 # Tweak kinds (SPEC.md, "Tweaks").
 KIND_CHAIN_SECRET, KIND_CHAIN, KIND_ONE_TIME_KEY, KIND_NODE = 1, 2, 3, 4
@@ -49,6 +53,13 @@ def _check_len(name, value, expected):
     if len(out) != expected:
         raise ValueError(f"{name} must be {expected} bytes, got {len(out)}")
     return out
+
+
+def frame_context(ctx):
+    ctx = _to_bytes("ctx", ctx)
+    if len(ctx) > MAX_CONTEXT_LEN:
+        raise ValueError(f"context length {len(ctx)} exceeds {MAX_CONTEXT_LEN} bytes")
+    return bytes([len(ctx)]) + ctx
 
 
 def tweak(kind, layer=0, tree=0, leaf=0, a=0, b=0):
@@ -116,8 +127,8 @@ def merkle_tree(public, kind, layer, tree, extra_leaf, leaves):
     return levels
 
 
-def content(content_key, salt, message):
-    msg_key = blake3.keyed_hash(content_key, salt)
+def content(content_key, salt, ctx, message):
+    msg_key = blake3.keyed_hash(content_key, salt + frame_context(ctx))
     return salt + blake3.keyed_hash(msg_key, message)
 
 
@@ -159,17 +170,18 @@ class SignetId:
         self.public = blake3.derive_key(CTX_PUBLIC_HASH, self.public_seed)
         self.content_key = blake3.derive_key(CTX_CONTENT, self.bytes)
 
-    def verify(self, message, imprint):
+    def verify(self, ctx, message, imprint):
+        framed_ctx = frame_context(ctx)
         message = _to_bytes("message", message)
         imprint = _to_bytes("imprint", imprint)
         if len(imprint) != IMPRINT_LEN:
             return False
         salt, randomizer, at = imprint[:N], imprint[N : 2 * N], 2 * N
-        short = content(self.content_key, salt, message)
-        digest = blake3.keyed_hash(self.public, tweak(KIND_MESSAGE) + randomizer + self.root + short)
+        short = content(self.content_key, salt, ctx, message)
+        digest = blake3.keyed_hash(self.public, tweak(KIND_MESSAGE) + randomizer + self.root + short + framed_ctx)
         indices, leaf_addr = parse_digest(digest)
 
-        # FORS verification
+        # FORS verification (20 trees x 256 leaves)
         fors_roots = []
         for t in range(FORS_TREES):
             idx = indices[t]
@@ -185,7 +197,7 @@ class SignetId:
             fors_roots.append(cur)
         node = H(self.public, tweak(KIND_FEW_ROOT, 0, leaf_addr), b"".join(fors_roots))
 
-        # Hypertree verification (5 uniform height-7 layers)
+        # Hypertree verification (7 uniform height-5 layers)
         addr = leaf_addr
         for layer in range(LAYERS):
             leaf = addr & ((1 << TREE_HEIGHT) - 1)
@@ -222,19 +234,20 @@ class Signet:
         self.top_levels = merkle_tree(self.public, KIND_NODE, LAYERS - 1, 0, 0, top_leaves)
         self.id = SignetId(public_seed + self.top_levels[-1][0])
 
-    def imprint(self, message, draw_bytes):
+    def imprint(self, ctx, message, draw_bytes):
+        framed_ctx = frame_context(ctx)
         message = _to_bytes("message", message)
         draw_bytes = _check_len("draw", draw_bytes, 32)
         public, sid = self.public, self.id
         salt = blake3.keyed_hash(self.salt_key, draw_bytes)[:N]
-        short = content(sid.content_key, salt, message)
-        randomizer = blake3.keyed_hash(self.randomizer_key, short)[:N]
-        digest = blake3.keyed_hash(public, tweak(KIND_MESSAGE) + randomizer + sid.root + short)
+        short = content(sid.content_key, salt, ctx, message)
+        randomizer = blake3.keyed_hash(self.randomizer_key, short + framed_ctx)[:N]
+        digest = blake3.keyed_hash(public, tweak(KIND_MESSAGE) + randomizer + sid.root + short + framed_ctx)
         indices, leaf_addr = parse_digest(digest)
 
         out = bytearray(salt + randomizer)
 
-        # FORS imprint
+        # FORS imprint (20 trees x 256 leaves)
         fors_roots = []
         for t in range(FORS_TREES):
             secs = [H(self.secret, tweak(KIND_FEW_SECRET, 0, leaf_addr, t, 0, i)) for i in range(1 << FORS_HEIGHT)]
@@ -247,7 +260,7 @@ class Signet:
             fors_roots.append(levels[-1][0])
         node = H(public, tweak(KIND_FEW_ROOT, 0, leaf_addr), b"".join(fors_roots))
 
-        # Hypertree imprint (5 uniform height-7 layers)
+        # Hypertree imprint (7 uniform height-5 layers)
         addr = leaf_addr
         for layer in range(LAYERS):
             leaf = addr & ((1 << TREE_HEIGHT) - 1)
@@ -265,28 +278,30 @@ class Signet:
             node = levels[-1][0]
             addr = tree
         if len(out) != IMPRINT_LEN:
-            raise AssertionError(f"unexpected imprint length {len(out)}")
+            raise RuntimeError(f"unexpected imprint length {len(out)}")
         return bytes(out)
 
 
 def main(argv):
-    if len(argv) == 5 and argv[1] == "verify":
+    if len(argv) == 6 and argv[1] == "verify":
         sid = SignetId(bytes.fromhex(argv[2]))
-        msg = open(argv[3], "rb").read()
-        imp = open(argv[4], "rb").read()
-        ok = sid.verify(msg, imp)
+        ctx = bytes.fromhex(argv[3])
+        msg = open(argv[4], "rb").read()
+        imp = open(argv[5], "rb").read()
+        ok = sid.verify(ctx, msg, imp)
         print("VALID" if ok else "INVALID")
         return 0 if ok else 1
-    if len(argv) == 6 and argv[1] == "imprint":
+    if len(argv) == 7 and argv[1] == "imprint":
         signet = Signet(bytes.fromhex(argv[2]))
         draw_bytes = bytes.fromhex(argv[3])
-        msg = open(argv[4], "rb").read()
-        imp = signet.imprint(msg, draw_bytes)
-        open(argv[5], "wb").write(imp)
+        ctx = bytes.fromhex(argv[4])
+        msg = open(argv[5], "rb").read()
+        imp = signet.imprint(ctx, msg, draw_bytes)
+        open(argv[6], "wb").write(imp)
         print(signet.id.bytes.hex())
         return 0
-    print(f"usage: {argv[0]} verify <signet_id_hex> <msg_path> <imprint_path>", file=sys.stderr)
-    print(f"       {argv[0]} imprint <seed_hex> <draw_hex> <msg_path> <imprint_out_path>", file=sys.stderr)
+    print(f"usage: {argv[0]} verify <signet_id_hex> <ctx_hex> <msg_path> <imprint_path>", file=sys.stderr)
+    print(f"       {argv[0]} imprint <test_seed_hex> <draw_hex> <ctx_hex> <msg_path> <imprint_out_path>", file=sys.stderr)
     return 2
 
 

@@ -1,10 +1,12 @@
-//! BLINCS benchmark using bench-hashes' `clocks` crate: wall time and core cycles together,
-//! with background-load detection (`clocks::load`). All summaries are integer arithmetic
-//! over the run's totals (`sum(wall_ns) / sum(calls)`).
+//! Signet (`BLINCS-128-7x5`) benchmark using bench-hashes' `clocks` crate: wall time and core
+//! cycles together, with background-load detection (`clocks::load`). All summaries are integer
+//! arithmetic over the run's totals (`sum(wall_ns) / sum(calls)`).
 
-use blincs::{Randomness, SEED_LEN, Signet, SignetId};
+use signet::{Context, Randomness, SEED_LEN, Signet, SignetId};
 use std::hint::black_box;
 use std::io::Cursor;
+
+const BENCH_CTX: Context<'static> = Context::new(b"signet bench v1");
 
 struct Summary {
     calls: u64,
@@ -96,8 +98,8 @@ fn main() {
 
     // Warm up the CPU / SME2 unit.
     for _ in 0..8 {
-        let s = sk.imprint(&rng, b"warmup");
-        assert!(vk.verify(b"warmup", &s));
+        let s = sk.imprint(&rng, BENCH_CTX, b"warmup");
+        vk.verify(BENCH_CTX, b"warmup", &s).unwrap();
     }
 
     let b = clocks::measure(10, 100_000_000, || {
@@ -115,27 +117,27 @@ fn main() {
         ("100 MiB", 100 * 1024 * 1024),
     ] {
         let msg: Vec<u8> = (0..len).map(|i| (i.wrapping_mul(31) & 0xff) as u8).collect();
-        let sig = sk.imprint(&rng, &msg);
-        assert!(vk.verify(&msg, &sig));
+        let sig = sk.imprint(&rng, BENCH_CTX, &msg);
+        vk.verify(BENCH_CTX, &msg, &sig).unwrap();
 
         let sign_batches = clocks::measure(12, 150_000_000, || {
-            black_box(sk.imprint(&rng, black_box(&msg)));
+            black_box(sk.imprint(&rng, BENCH_CTX, black_box(&msg)));
         });
         report(&format!("sign slice {label}"), &sign_batches, if len >= 65536 { len as u64 } else { 0 });
 
         let ver_batches = clocks::measure(12, 100_000_000, || {
-            assert!(black_box(vk.verify(black_box(&msg), black_box(&sig))));
+            assert!(black_box(vk.verify(BENCH_CTX, black_box(&msg), black_box(&sig))).is_ok());
         });
         report(&format!("verify slice {label}"), &ver_batches, if len >= 65536 { len as u64 } else { 0 });
 
         if len == 64 || len == 262144 || len == 1024 * 1024 || len == 100 * 1024 * 1024 {
             let sr = clocks::measure(10, 150_000_000, || {
-                black_box(sk.imprint_reader(&rng, Cursor::new(black_box(&msg))).unwrap());
+                black_box(sk.imprint_reader(&rng, BENCH_CTX, Cursor::new(black_box(&msg))).unwrap());
             });
             report(&format!("sign_reader {label}"), &sr, if len >= 65536 { len as u64 } else { 0 });
 
             let vr = clocks::measure(10, 100_000_000, || {
-                assert!(black_box(vk.verify_reader(Cursor::new(black_box(&msg)), black_box(&sig)).unwrap()));
+                assert!(black_box(vk.verify_reader(BENCH_CTX, Cursor::new(black_box(&msg)), black_box(&sig))).is_ok());
             });
             report(&format!("verify_reader {label}"), &vr, if len >= 65536 { len as u64 } else { 0 });
         }

@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-const FILE_PREFIX: &str = "blincs-r2-";
+const FILE_PREFIX: &str = "signet-r2-";
 const FILE_NAME_LEN: usize = FILE_PREFIX.len() + 2 * N;
 pub(crate) const SEED_FILE_MAX_LEN: usize = 32;
 
@@ -72,7 +72,7 @@ pub(crate) fn read_bounded_seed(reader: &mut impl Read) -> io::Result<Vec<u8>> {
     let mut buf = [0u8; SEED_FILE_MAX_LEN + 1];
     let (filled, _) = crate::content::fill_buf(reader, &mut buf, 0, &mut 0)?;
     if filled > SEED_FILE_MAX_LEN {
-        return Err(io::Error::new(ErrorKind::InvalidData, "BLINCS randomness seed file exceeds 32 bytes"));
+        return Err(io::Error::new(ErrorKind::InvalidData, "Signet randomness seed file exceeds 32 bytes"));
     }
     Ok(buf[..filled].to_vec())
 }
@@ -95,7 +95,7 @@ fn write_new_seed_file(path: &Path, seed: &[u8; 32], sync: bool) -> io::Result<(
 
 /// Per-process signer randomness, backed by a lock-free content-addressed seed directory.
 ///
-/// Each seed file is named `blincs-r2-<32 hex>` from a domain-separated `file_id` (revealing zero
+/// Each seed file is named `signet-r2-<32 hex>` from a domain-separated `file_id` (revealing zero
 /// bits of the file's 32-byte `next_seed`, `run_key`, or future salts/signets) and holds up to 32
 /// raw seed bytes. On [`Randomness::initialize`], all existing seed files in the directory are read
 /// and mixed with OS randomness (`getrandom`) and the monotonic clock, a new file is created
@@ -103,7 +103,7 @@ fn write_new_seed_file(path: &Path, seed: &[u8; 32], sync: bool) -> io::Result<(
 /// `flock`, zero lockfiles, and automatic self-healing across concurrent startups and crashes.
 ///
 /// After `initialize` returns, drawing per-imprint randomness computes a keyed BLAKE3 hash over an
-/// in-memory counter (no disk writes, no clock reads, and no system calls by BLINCS itself).
+/// in-memory counter (no disk writes, no clock reads, and no system calls by Signet itself).
 ///
 /// Provision the directory once with [`Randomness::create`] before starting signers. After `fork()`
 /// (without `exec()`) or restoring a live VM snapshot, call [`Randomness::initialize`] again so
@@ -156,9 +156,9 @@ fn read_seed_entries(dir: &Path) -> io::Result<Vec<(String, Vec<u8>)>> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let name =
-                entry.file_name().into_string().map_err(|_| io::Error::new(ErrorKind::InvalidData, "unexpected entry in BLINCS randomness directory"))?;
+                entry.file_name().into_string().map_err(|_| io::Error::new(ErrorKind::InvalidData, "unexpected entry in Signet randomness directory"))?;
             if !is_seed_filename(&name) || !entry.file_type()?.is_file() {
-                return Err(io::Error::new(ErrorKind::InvalidData, "unexpected entry in BLINCS randomness directory"));
+                return Err(io::Error::new(ErrorKind::InvalidData, "unexpected entry in Signet randomness directory"));
             }
             if let Some(bytes) = read_seed_if_present(&entry.path())? {
                 entries.push((name, bytes));
@@ -168,7 +168,7 @@ fn read_seed_entries(dir: &Path) -> io::Result<Vec<(String, Vec<u8>)>> {
             return Ok(entries);
         }
     }
-    Err(io::Error::new(ErrorKind::InvalidData, "BLINCS randomness directory contains no seed files"))
+    Err(io::Error::new(ErrorKind::InvalidData, "Signet randomness directory contains no seed files"))
 }
 
 impl Randomness {
@@ -209,7 +209,7 @@ impl Randomness {
         let dir = dir.as_ref();
         let meta = fs::symlink_metadata(dir)?;
         if !meta.file_type().is_dir() {
-            return Err(io::Error::new(ErrorKind::InvalidInput, "BLINCS randomness state path is not a directory"));
+            return Err(io::Error::new(ErrorKind::InvalidInput, "Signet randomness state path is not a directory"));
         }
 
         let mut entries = read_seed_entries(dir)?;

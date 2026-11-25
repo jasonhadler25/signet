@@ -1,12 +1,14 @@
-# BLINCS specification (draft)
+# BLINCS specification (`BLINCS-128-7x5`, draft)
 
 *Status: pre-1.0 design under active development (0.1.0, formats and context strings may still change before 1.0). Written by an AI assistant at the direction of this repository's owner; no independent cryptographic review or security audit has been performed. Builds on BLAKE3 (O'Connor, Aumasson, Neves, Wilcox-O'Hearn) and SPHINCS / SPHINCS+ / FIPS 205 SLH-DSA (Bernstein, Hopwood, Hülsing, Kölbl, Lange, Niederhagen, Papachristodoulou, Rijneveld, Schneider, Schwabe, Wilcox-O'Hearn, and the NIST SLH-DSA team). Thanks to [Project 11](https://research.projecteleven.com/) — especially **Conor Deegan**, **Alessandro Baiocchi**, **Matteo Vena**, and **Matteo Vicari** — for direct review feedback, benchmarks, and constrained-device design inspiration (full credits in [`README.md`](README.md#credits-and-thanks)).*
 
-BLINCS is a stateless hash-based signature scheme based on BLAKE3 and SPHINCS, using a **WOTS+** (nibbles, `w = 16`) and byte-aligned **FORS** (`20` trees of `256` leaves — one digest byte per tree) structure on a uniform 7-layer hypertree (`7×5`, total height `35`) with **zero counter grinding** and single-pass salted content hashing (BLINCS-specific nibble/tweak encodings and BLAKE3 instantiation; not FIPS 205 interoperable or validated). An imprint is **7,392 bytes** (`9,856` bytes Base64 — smaller than `SLH-DSA-128s`'s `7,856` bytes), a `SignetId` is **32 bytes**, and a `Signet` derives from a **32-byte seed** (holding a 1 KiB top tree in memory). Because there is zero counter grinding, signing performs a constant number of BLAKE3 compressions (`p99 = mean = max`, ~3.6 s uncached on a 60 MHz Ledger ST33 Secure Element, `1.31 ms` warm / `1.48 ms` cold on 1 Apple M6 core). Its design target is **128-bit classical security** (128-bit root) at up to **$2^{32}$ imprints** per signet (4,294,967,296: ten imprints a second for 13.6 years), with an estimated single-query FORS cover exponent of **134.5 bits** at $q = 2^{32}$, degrading gradually past the budget (`128.8` bits at $2^{33}$, `122.4` bits at $2^{34}$, `114.9` bits at $2^{35}$, `106.2` bits at $2^{36}$).
+**BLINCS** is a stateless hash-based signature algorithm based on BLAKE3 and SPHINCS; **Signet** (this repository) is a Rust implementation of the **`BLINCS-128-7x5`** suite. `BLINCS-128-7x5` uses **WOTS+** (nibbles, `w = 16`) and byte-aligned **FORS** (`20` trees of `256` leaves — one digest byte per tree) on a uniform 7-layer hypertree (`7×5`, total height `35`) with **zero counter grinding**, a **suite-separated key schedule**, a **bounded length-framed application context (`0..=255` bytes)**, and **single-pass salted content hashing** (BLINCS-specific nibble/tweak encodings and BLAKE3 instantiation; not FIPS 205 interoperable or validated).
 
-Messages are hashed in a single salted keyed-BLAKE3 pass under a fresh per-imprint salt `e` derived from the signet and per-imprint randomness before reading the message. Pass the original message bytes or stream directly to BLINCS so the entire input is covered by the salted pass at full BLAKE3 streaming speed without relying on unsalted collision resistance.
+An imprint is **7,392 bytes** (`9,856` bytes Base64 — smaller than `SLH-DSA-128s`'s `7,856` bytes), a `SignetId` is **32 bytes**, and a `Signet` derives from a **32-byte seed** (holding a 1 KiB top tree in memory). Because there is zero counter grinding, signing performs a constant number of BLAKE3 compressions (`p99 = mean = max`, ~3.6 s uncached on a 60 MHz Ledger ST33 Secure Element, `1.25 ms` warm / `1.42 ms` cold on 1 Apple M6 core). Its design target is **128-bit classical security** (128-bit root) at up to **$2^{32}$ imprints** per signet (4,294,967,296: ten imprints a second for 13.6 years), with an estimated single-query FORS cover exponent of **134.5 bits** at $q = 2^{32}$, degrading gradually past the budget (`128.8` bits at $2^{33}$, `122.4` bits at $2^{34}$, `114.9` bits at $2^{35}$, `106.2` bits at $2^{36}$).
 
-All fixed-width integers are unsigned and encoded in little-endian byte order. Ranges written `a..b` are half-open `[a, b)` and `a..=b` are closed `[a, b]`. Concatenation is written `||`, byte slicing `x[a..b]` takes bytes `a` through `b - 1`, and `x[..n]` takes the first `n` bytes. Maximum message length is $2^{64} - 1$ bytes.
+Messages are hashed in a single salted keyed-BLAKE3 pass under a fresh per-imprint salt `e` derived from the signet and per-imprint randomness before reading the message. Pass the original message bytes or stream directly to Signet so the entire input is covered by the salted pass at full BLAKE3 streaming speed without relying on unsalted collision resistance.
+
+All fixed-width integers are unsigned and encoded in little-endian byte order. Ranges written `a..b` are half-open `[a, b)` and `a..=b` are closed `[a, b]`. Concatenation is written `||`, byte slicing `x[a..b]` takes bytes `a` through `b - 1`, and `x[..n]` takes the first `n` bytes. Maximum message length is $2^{64} - 1$ bytes; maximum application context length is `255` bytes.
 
 ## Hash primitive
 
@@ -15,7 +17,9 @@ BLINCS uses two 32-byte modes of BLAKE3:
 - `Keyed(K, M)`: BLAKE3 keyed hash with 32-byte key `K` over byte string `M` (32-byte output).
 - `Derive(ctx, M)`: BLAKE3 key derivation with UTF-8 context string `ctx` over input `M` (32-byte output).
 
-## Parameters
+## Suite identity and parameters
+
+Suite identifier: **`BLINCS-128-7x5`**.
 
 | Symbol | Value | Meaning |
 |---|---:|---|
@@ -28,6 +32,7 @@ BLINCS uses two 32-byte modes of BLAKE3:
 | `CHAINS` | 35 | Total WOTS+ chains per one-time signature (`32 + 3`) |
 | `FORS_HEIGHT` | 8 | Height of each FORS tree ($2^8 = 256$ leaves per tree — one byte per index) |
 | `FORS_TREES` | 20 | Number of independent FORS trees (`k`; `20 * 8 = 160` bits = `D[0..20]`) |
+| `MAX_CONTEXT_LEN` | 255 | Maximum byte length of the framed application context `ctx` |
 
 Derived lengths:
 
@@ -37,22 +42,22 @@ Derived lengths:
 
 ## Key-derivation contexts
 
-Every derived 32-byte key uses a distinct UTF-8 context string:
+Every derived 32-byte key uses a distinct UTF-8 context string. All algorithm key-derivation contexts bind the suite name `BLINCS-128-7x5`, ensuring separate suites never share derived keys:
 
 | Name | Context string |
 |---|---|
-| `SECRET_VALUES` | `"BLINCS 2026-11-25 signet: secret values"` |
-| `CONTENT_SALT` | `"BLINCS 2026-11-25 signet: content salt"` |
-| `RANDOMIZER` | `"BLINCS 2026-11-25 signet: randomizer"` |
-| `PUBLIC_SEED` | `"BLINCS 2026-11-25 signet: public seed"` |
-| `GENERATE_SIGNET` | `"BLINCS 2026-11-25 signet: generate"` |
-| `PUBLIC_HASH` | `"BLINCS 2026-11-25 public hash"` |
-| `CONTENT` | `"BLINCS 2026-11-25 content"` |
-| `MIX` | `"BLINCS 2026-11-25 randomness: mix"` |
-| `FILE_ID` | `"BLINCS 2026-11-25 randomness: file id"` |
-| `NEXT_SEED` | `"BLINCS 2026-11-25 randomness: next seed"` |
-| `RUN_KEY` | `"BLINCS 2026-11-25 randomness: key of this run"` |
-| `KEYGEN_KEY` | `"BLINCS 2026-11-25 randomness: keygen key"` |
+| `SECRET_VALUES` | `"BLINCS-128-7x5 2026-11-25 secret values"` |
+| `CONTENT_SALT` | `"BLINCS-128-7x5 2026-11-25 content salt"` |
+| `RANDOMIZER` | `"BLINCS-128-7x5 2026-11-25 randomizer"` |
+| `PUBLIC_SEED` | `"BLINCS-128-7x5 2026-11-25 public seed"` |
+| `PUBLIC_HASH` | `"BLINCS-128-7x5 2026-11-25 public hash"` |
+| `CONTENT` | `"BLINCS-128-7x5 2026-11-25 content"` |
+| `GENERATE_SIGNET` | `"Signet BLINCS-128-7x5 2026-11-25 generate signet"` |
+| `MIX` | `"Signet 2026-11-25 randomness: mix"` |
+| `FILE_ID` | `"Signet 2026-11-25 randomness: file id"` |
+| `NEXT_SEED` | `"Signet 2026-11-25 randomness: next seed"` |
+| `RUN_KEY` | `"Signet 2026-11-25 randomness: key of this run"` |
+| `KEYGEN_KEY` | `"Signet 2026-11-25 randomness: keygen key"` |
 
 ## Tweaks
 
@@ -80,7 +85,7 @@ Unused fields are zero. The nine kinds are:
 | 6 | `FEW_LEAF` | `K_pub` | 16-byte leaf secret | 16 |
 | 7 | `FEW_NODE` | `K_pub` | `left (16) \|\| right (16)` | 16 |
 | 8 | `FEW_ROOT` | `K_pub` | 16 × 20 FORS tree roots (`320` bytes) | 16 |
-| 9 | `MESSAGE` | `K_pub` | `R (16) \|\| root (16) \|\| short (48)` | 32 |
+| 9 | `MESSAGE` | `K_pub` | `R (16) \|\| root (16) \|\| short (48) \|\| u8(len(ctx)) \|\| ctx` | 32 |
 
 Define `ShortHash(K, T, data) = Keyed(K, T || data)[..16]`.
 
@@ -105,7 +110,13 @@ root      = id[16..32]
 K_content = Derive(CONTENT,     id)
 ```
 
-## Content
+## Framed application context and content hashing
+
+Every imprint binds a caller-chosen application context `ctx` of `0..=255` bytes, framed unambiguously as:
+
+```text
+framed_ctx = u8(len(ctx)) || ctx                  # 1..=256 bytes
+```
 
 When imprinting with a 32-byte per-imprint draw `draw`:
 
@@ -113,23 +124,23 @@ When imprinting with a 32-byte per-imprint draw `draw`:
 e = Keyed(K_salt, draw)[..16]                     # 16-byte per-imprint content salt
 ```
 
-Given the 16-byte content salt `e` and message `M` (any length in `0..2^64`):
+Given the 16-byte content salt `e`, application context `ctx`, and message `M` (any length in `0..2^64`):
 
 ```text
-K_msg = Keyed(K_content, e)                       # 32-byte per-imprint message key (public once e is known)
+K_msg = Keyed(K_content, e || framed_ctx)         # 32-byte per-imprint, per-context message key (public once e, ctx are known)
 h_msg = Keyed(K_msg, M)                           # 32-byte keyed BLAKE3 hash of M (single pass)
 short = e || h_msg                                # 48 bytes
 ```
 
-BLAKE3 commits to message length under its standard hash assumptions, and `K_msg` is derived from both `id` (via `K_content`) and the fresh per-imprint salt `e`.
+BLAKE3 commits to message length under its standard hash assumptions, and `K_msg` is derived from `id` (via `K_content`), the fresh per-imprint salt `e`, and the length-framed `ctx`.
 
 ## Message digest and index extraction
 
 The signer computes the deterministic per-imprint randomizer and 32-byte digest `D`:
 
 ```text
-R = Keyed(K_R, short)[..16]
-D = Keyed(K_pub, tweak(MESSAGE, 0, 0, 0, 0, 0) || R || root || short)
+R = Keyed(K_R, short || framed_ctx)[..16]
+D = Keyed(K_pub, tweak(MESSAGE, 0, 0, 0, 0, 0) || R || root || short || framed_ctx)
 ```
 
 From `D` (32 bytes):
@@ -195,11 +206,11 @@ Wire layout of an `Imprint` (`7,392` bytes):
 6752..7392   Layer 6: 35 x 16 B WOTS+ + 5 x 16 B auth path = 640 B
 ```
 
-## Signer randomness (local policy)
+## Signer randomness (Signet local host policy)
 
-The wire format does not depend on how the signer chooses `draw`; the scheme below is BLINCS's local host policy for keeping `draw` non-repeating across restarts without file locking (`flock`).
+The BLINCS wire format does not depend on how the signer chooses `draw`; the scheme below is Signet's local host policy for keeping `draw` non-repeating across restarts without file locking (`flock`).
 
-State lives in a private directory (created once with `Randomness::create`, `0700` on Unix) containing one or more regular files named `blincs-r2-<32 lowercase hex chars>`, each holding `0..=32` raw bytes:
+State lives in a private directory (created once with `Randomness::create`, `0700` on Unix) containing one or more regular files named `signet-r2-<32 lowercase hex chars>`, each holding `0..=32` raw bytes:
 
 1. **State mixing (`mix_pool` and `expand_pool`):**
    Given sorted seed file contents `s_0, ..., s_{m-1}` (each `len <= 32`), 32 bytes `system` from OS cryptographic randomness (`getrandom(2)` / `getentropy`), and opaque `clock` bytes from the monotonic clock:
@@ -207,12 +218,12 @@ State lives in a private directory (created once with `Randomness::create`, `070
    material   = (u8(len(s_0)) || s_0) || ... || (u8(len(s_{m-1})) || s_{m-1}) || 0xff || system || clock
    pool       = Derive(MIX,        material)
    file_id    = Derive(FILE_ID,    pool)[..16]    # filename only; reveals zero bits of secrets below
-   next_seed  = Derive(NEXT_SEED,  pool)          # 32 bytes written inside blincs-r2-<hex(file_id)>
+   next_seed  = Derive(NEXT_SEED,  pool)          # 32 bytes written inside signet-r2-<hex(file_id)>
    run_key    = Derive(RUN_KEY,    pool)          # in-memory key for per-imprint draws
    keygen_key = Derive(KEYGEN_KEY, pool)          # in-memory key for Signet::generate
    ```
 2. **Lock-free directory update (`Randomness::initialize`):**
-   Read all `blincs-r2-<32hex>` regular files in the directory (rejecting unexpected entries, symlinks, files `> 32` bytes, or an empty directory without modifying anything). Compute `pool`, and create `blincs-r2-<hex(file_id)>` with `O_CREAT | O_EXCL` (`0600`) writing `next_seed` (no `fsync`). If `AlreadyExists` occurs, advance `pool = Derive(MIX, pool)` and retry. After writing the new file, unlink the old filenames that were read (ignoring `NotFound`).
+   Read all `signet-r2-<32hex>` regular files in the directory (rejecting unexpected entries, symlinks, files `> 32` bytes, or an empty directory without modifying anything; re-scanning if concurrent rotation unlinks listed entries before open). Compute `pool`, and create `signet-r2-<hex(file_id)>` with `O_CREAT | O_EXCL` (`0600`) writing `next_seed` (no `fsync`). If `AlreadyExists` occurs, advance `pool = Derive(MIX, pool)` and retry. After writing the new file, unlink the old filenames that were read (ignoring `NotFound`).
 3. **Per-imprint draw and signet generation:**
    Each `draw` or `generate` increments an in-memory 64-bit counter `n` (panicking before overflow):
    - Imprint draw: `draw = Keyed(run_key, u64_le(n))`.
@@ -222,5 +233,5 @@ State lives in a private directory (created once with `Randomness::create`, `070
 ## Security target, model, and limits
 
 - **Design target:** 128-bit classical security at up to $q = 2^{32}$ imprints per signet (single-query FORS leaf-cover exponent under ideal hashes: **134.5 bits** at $2^{32}$, **128.8 bits** at $2^{33}$, **122.4 bits** at $2^{34}$, **114.9 bits** at $2^{35}$, **106.2 bits** at $2^{36}$; verified by `python3 tools/optimize.py --check`). These are single-key ideal-hash cover estimates, not a complete multi-user or quantum proof of BLINCS.
-- **Unenforced budget:** BLINCS does not count imprints across runs or across copies of a seed. Do not imprint more than $2^{32}$ things with one signet.
-- **Memory retention:** `Signet` retains its 32-byte seed, derived keys, and 1 KiB top tree; signing allocates a transient local `SignWorkspace` (~110 KiB) freed on return. Neither BLINCS nor `blake3-servil-core` wipes secret key memory on drop. Verification uses only local stack buffers (zero heap allocation). Streaming readers use a fresh local zero-initialized 16 KiB stack buffer, zeroing each slice before calling `Read::read`.
+- **Unenforced budget:** Signet does not count imprints across runs or across copies of a seed. Do not imprint more than $2^{32}$ things with one signet.
+- **Memory retention:** `Signet` retains its 32-byte seed, derived keys, and 1 KiB top tree; signing allocates a transient local `SignWorkspace` (~555 KiB for cross-tree FORS batching; ~110 KiB for `from_seed`) freed on return. Neither Signet nor `blake3-servil-core` wipes secret key memory on drop. Verification uses only local stack buffers (zero heap allocation). Streaming readers use a fresh local zero-initialized 16 KiB stack buffer, zeroing each slice before calling `Read::read`.

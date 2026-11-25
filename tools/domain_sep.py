@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static and dynamic domain-separation & tweak-uniqueness check for BLINCS."""
+"""Static and dynamic domain-separation & tweak-uniqueness check for Signet (BLINCS-128-7x5)."""
 
 import os
 import re
@@ -12,23 +12,86 @@ SECRET_KINDS = {"ChainSecret", "FewSecret"}
 PUBLIC_KINDS = {"Chain", "OneTimeKey", "Node", "FewLeaf", "FewNode", "FewRoot", "Message"}
 ALL_KINDS = SECRET_KINDS | PUBLIC_KINDS
 
+# Mapping between Rust TweakKind CamelCase variant names and SPEC.md SCREAMING_SNAKE names.
+KIND_TO_SPEC = {
+    "ChainSecret": "CHAIN_SECRET",
+    "Chain": "CHAIN",
+    "OneTimeKey": "ONE_TIME_KEY",
+    "Node": "NODE",
+    "FewSecret": "FEW_SECRET",
+    "FewLeaf": "FEW_LEAF",
+    "FewNode": "FEW_NODE",
+    "FewRoot": "FEW_ROOT",
+    "Message": "MESSAGE",
+}
+
+
+def strip_cfg_test_items(src):
+    """Remove only #[cfg(test)] items without discarding shipped code that follows them."""
+    out = []
+    lines = src.splitlines()
+    i = 0
+    while i < len(lines):
+        if re.match(r"^\s*#\[cfg\(test\)\]\s*$", lines[i]):
+            i += 1
+            if i < len(lines) and ";" in lines[i] and "{" not in lines[i]:
+                i += 1
+                continue
+            depth = 0
+            started = False
+            while i < len(lines):
+                depth += lines[i].count("{") - lines[i].count("}")
+                if lines[i].count("{") > 0:
+                    started = True
+                i += 1
+                if started and depth <= 0:
+                    break
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
+def parse_spec_contexts(spec_text):
+    """Parse exact name -> value table from SPEC.md 'Key-derivation contexts'."""
+    m = re.search(r"## Key-derivation contexts(.*?)(?=\n## |\Z)", spec_text, re.S)
+    if not m:
+        return None
+    rows = re.findall(r'^\|\s*`([A-Z0-9_]+)`\s*\|\s*`"([^"]+)"`\s*\|', m.group(1), re.M)
+    return dict(rows)
+
+
+def parse_spec_tweaks(spec_text):
+    """Parse exact tag -> (SPEC_NAME, key_role) table from SPEC.md 'Tweaks'."""
+    m = re.search(r"## Tweaks(.*?)(?=\n## |\Z)", spec_text, re.S)
+    if not m:
+        return None
+    rows = re.findall(r"^\|\s*(\d+)\s*\|\s*`([A-Z0-9_]+)`\s*\|\s*`(K_sec|K_pub)`\s*\|", m.group(1), re.M)
+    return {int(tag): (name, role) for tag, name, role in rows}
+
 
 def check_static(params_src, spec_text, shipped_sources):
     errors = []
 
-    # 1. Context strings: exactly 12, pairwise distinct, all verbatim in SPEC.md.
-    ctxs = re.findall(r'const\s+(CTX_[A-Z0-9_]+)\s*:\s*&str\s*=\s*"([^"]+)";', params_src)
+    # 1. Exact 1-to-1 CTX_* name -> value equality between src/params.rs and SPEC.md table.
+    ctxs = re.findall(r'const\s+CTX_([A-Z0-9_]+)\s*:\s*&str\s*=\s*"([^"]+)";', params_src)
     if len(ctxs) != 12:
         errors.append(f"expected 12 CTX_* constants in src/params.rs, found {len(ctxs)}")
-    seen_ctx = {}
+    rust_ctx_map = {}
+    seen_vals = {}
     for name, val in ctxs:
-        if val in seen_ctx:
-            errors.append(f"duplicate context string {val!r} for {name} and {seen_ctx[val]}")
-        seen_ctx[val] = name
-        if f'"{val}"' not in spec_text:
-            errors.append(f"context {name} = {val!r} not found verbatim in SPEC.md")
+        if val in seen_vals:
+            errors.append(f"duplicate context string {val!r} for CTX_{name} and CTX_{seen_vals[val]}")
+        seen_vals[val] = name
+        rust_ctx_map[name] = val
 
-    # 2. TweakKind enum: exactly 9 distinct non-zero byte values 1..=9 matching SPEC.md.
+    spec_ctx_map = parse_spec_contexts(spec_text)
+    if spec_ctx_map is None:
+        errors.append("Key-derivation contexts table not found in SPEC.md")
+    elif rust_ctx_map != spec_ctx_map:
+        errors.append(f"src/params.rs CTX_* map != SPEC.md table (rust={sorted(rust_ctx_map.items())}, spec={sorted(spec_ctx_map.items())})")
+
+    # 2. Exact 1-to-1 TweakKind tag -> name and key-role match between src/params.rs and SPEC.md table.
     m = re.search(r"enum\s+TweakKind\s*\{([^}]+)\}", params_src, re.S)
     if not m:
         errors.append("enum TweakKind not found in src/params.rs")
@@ -37,20 +100,27 @@ def check_static(params_src, spec_text, shipped_sources):
     kind_names = {k for k, _ in kinds}
     if kind_names != ALL_KINDS:
         errors.append(f"TweakKind variants {sorted(kind_names)} != expected {sorted(ALL_KINDS)}")
-    seen_tags = {}
+
+    rust_tweak_map = {}
     for name, raw_tag in kinds:
         tag = int(raw_tag)
         if not (1 <= tag <= 9):
             errors.append(f"TweakKind::{name} tag {tag} outside 1..=9")
-        if tag in seen_tags:
-            errors.append(f"duplicate TweakKind tag {tag} for {name} and {seen_tags[tag]}")
-        seen_tags[tag] = name
+        if tag in rust_tweak_map:
+            errors.append(f"duplicate TweakKind tag {tag} for {name} and {rust_tweak_map[tag]}")
+        role = "K_sec" if name in SECRET_KINDS else "K_pub"
+        rust_tweak_map[tag] = (KIND_TO_SPEC.get(name, name), role)
+
+    spec_tweak_map = parse_spec_tweaks(spec_text)
+    if spec_tweak_map is None:
+        errors.append("Tweaks table not found in SPEC.md")
+    elif rust_tweak_map != spec_tweak_map:
+        errors.append(f"src/params.rs TweakKind table != SPEC.md table (rust={rust_tweak_map}, spec={spec_tweak_map})")
 
     # 3. Every tweak(TweakKind::...) call site in shipped src/ matches its key role.
     used_kinds = set()
     for rel, src in shipped_sources.items():
-        code = re.sub(r"#\[cfg\(test\)\]\s*mod\s+test;", "", src)
-        code = code.split("#[cfg(test)]")[0]
+        code = strip_cfg_test_items(src)
         lines = code.splitlines()
         for lineno, line in enumerate(lines, 1):
             for kind in re.findall(r"tweak\(\s*TweakKind::([A-Za-z0-9_]+)", line):
@@ -59,10 +129,9 @@ def check_static(params_src, spec_text, shipped_sources):
                 if kind in SECRET_KINDS:
                     if "sec_h.hash_many" not in window and "sec_h.hash_counter_range" not in window:
                         errors.append(f"{rel}:{lineno}: secret tweak {kind} not paired with sec_h.hash_many/hash_counter_range")
-                    if "pub_h.hash_many" in window or "pub_h.hash_counter_range" in window or "public.hash" in window:
-                        after = "\n".join(lines[lineno - 1 : min(len(lines), lineno + 6)])
-                        if "pub_h.hash_many" in after or "pub_h.hash_counter_range" in after or "public.hash" in after:
-                            errors.append(f"{rel}:{lineno}: secret tweak {kind} appears adjacent to public hasher")
+                    after = "\n".join(lines[lineno - 1 : min(len(lines), lineno + 6)])
+                    if "pub_h.hash_many" in after or "pub_h.hash_counter_range" in after or "public.hash" in after:
+                        errors.append(f"{rel}:{lineno}: secret tweak {kind} appears adjacent to public hasher")
                 elif kind in PUBLIC_KINDS:
                     after = "\n".join(lines[lineno - 1 : min(len(lines), lineno + 8)])
                     if "sec_h.hash_many" in after or "sec_h.hash_counter_range" in after:
@@ -73,32 +142,48 @@ def check_static(params_src, spec_text, shipped_sources):
     if used_kinds != ALL_KINDS:
         errors.append(f"unused TweakKind variants in shipped src/: {sorted(ALL_KINDS - used_kinds)}")
 
-    # 4. Exact finite-domain bit-width bounds over full 2^35 uniform 7x5 parameter space.
-    hyper_bits = 35
-    layer_heights = [5, 5, 5, 5, 5, 5, 5]
-    if sum(layer_heights) != hyper_bits:
-        errors.append("layer heights do not sum to 35")
-    chains, chain_steps = 35, 15
-    fors_trees, fors_height = 20, 8
-    fors_leaves = 1 << fors_height
+    # 4. Verify parameter constants parsed directly from src/params.rs stay within wire tweak bit widths.
+    def const_int(cname):
+        cm = re.search(rf"const\s+{cname}\s*:\s*(?:usize|u8)\s*=\s*(\d+);", params_src)
+        if not cm:
+            errors.append(f"const {cname} not found in src/params.rs")
+            return 0
+        return int(cm.group(1))
 
-    cum = 0
-    for layer, h in enumerate(layer_heights):
-        cum += h
-        max_tree = (1 << (hyper_bits - cum)) - 1
-        max_leaf = (1 << h) - 1
+    layers = const_int("LAYERS")
+    tree_h = const_int("TREE_HEIGHT")
+    hyper_bits = layers * tree_h
+    fors_h = const_int("FORS_HEIGHT")
+    fors_trees = const_int("FORS_TREES")
+    chain_steps = const_int("CHAIN_STEPS")
+    chains = 35
+    if hyper_bits != 35:
+        errors.append(f"unexpected HYPER_BITS {hyper_bits}")
+    for layer in range(layers):
+        max_tree = (1 << (hyper_bits - (layer + 1) * tree_h)) - 1
+        max_leaf = (1 << tree_h) - 1
         if not (0 <= layer < (1 << 8) and 0 <= max_tree < (1 << 48) and 0 <= max_leaf < (1 << 16)):
             errors.append(f"hypertree wire bound exceeded at layer {layer}")
-    if not (chains - 1 < (1 << 16) and chain_steps < (1 << 32) and (1 << hyper_bits) - 1 < (1 << 48) and fors_trees - 1 < (1 << 16) and fors_leaves - 1 < (1 << 32)):
+    if not (
+        chains - 1 < (1 << 16)
+        and chain_steps < (1 << 32)
+        and (1 << hyper_bits) - 1 < (1 << 48)
+        and fors_trees - 1 < (1 << 16)
+        and (1 << fors_h) - 1 < (1 << 32)
+    ):
         errors.append("FORS/WOTS wire bound exceeded")
 
     return errors
 
 
 def self_test(params_src, spec_text, shipped_sources):
-    bad_ctx = params_src.replace("BLINCS 2026-11-25 content", "BLINCS 2026-11-25 public hash", 1)
+    bad_ctx = params_src.replace("BLINCS-128-7x5 2026-11-25 content", "BLINCS-128-7x5 2026-11-25 public hash", 1)
     if not check_static(bad_ctx, spec_text, shipped_sources):
         raise RuntimeError("self-test failed: duplicate CTX escaped")
+
+    bad_spec = spec_text.replace("| `CONTENT` | `\"BLINCS-128-7x5 2026-11-25 content\"` |", "| `CONTENT` | `\"BLINCS-128-7x5 2026-11-25 wrong\"` |", 1)
+    if not check_static(params_src, bad_spec, shipped_sources):
+        raise RuntimeError("self-test failed: SPEC.md name-to-value mismatch escaped")
 
     bad_tag = params_src.replace("Message = 9,", "Message = 8,", 1)
     if not check_static(bad_tag, spec_text, shipped_sources):
@@ -106,8 +191,8 @@ def self_test(params_src, spec_text, shipped_sources):
 
     bad_role = dict(shipped_sources)
     bad_role["src/few_time.rs"] = bad_role["src/few_time.rs"].replace(
-        "sec_h.hash_counter_range(&secret_template, 3, 0, &mut ws.out[..FORS_LEAVES])",
-        "pub_h.hash_counter_range(&secret_template, 3, 0, &mut ws.out[..FORS_LEAVES])",
+        "sec_h.hash_counter_range(&secret_template, 3, 0, &mut ws.out[base..base + FORS_LEAVES])",
+        "pub_h.hash_counter_range(&secret_template, 3, 0, &mut ws.out[base..base + FORS_LEAVES])",
         1,
     )
     if not check_static(params_src, spec_text, bad_role):
@@ -134,8 +219,9 @@ def check_dynamic_reference():
     k_sec_expected = orig_derive(blincs.CTX_SECRET_VALUES, seed)
     pk_seed = orig_derive(blincs.CTX_PUBLIC_SEED, seed)[:16]
     k_pub_expected = orig_derive(blincs.CTX_PUBLIC_HASH, pk_seed)
-    id_bytes = bytes.fromhex("db09192c50a65494941887b9c57895ab817750c6dacc82855e914ae9adca39da")
+    id_bytes = bytes.fromhex("b58abfb655db7c92808f12c3a8ffd2d04841cf61994321648cf193638876c492")
     imp_bytes = open(os.path.join(ROOT, "test_vectors", "reference-imprint-1.bin"), "rb").read()
+    ref_ctx = b"BLINCS-128-7x5 reference vector v1"
 
     bucket = [ver_sec_tweaks, ver_pub_tweaks]
 
@@ -156,7 +242,7 @@ def check_dynamic_reference():
     blake3.keyed_hash = traced_keyed
     try:
         sid = blincs.SignetId(id_bytes)
-        if not sid.verify(b"hello, BLINCS", imp_bytes):
+        if not sid.verify(ref_ctx, b"hello, BLINCS", imp_bytes):
             raise RuntimeError("reference verification failed")
 
         bucket[0], bucket[1] = fors_sec_tweaks, fors_pub_tweaks
@@ -201,7 +287,7 @@ def main():
 
     n_ver, n_fors, n_wots, n_ctx = check_dynamic_reference()
     print(
-        f"domain_sep.py PASSED (self-test 3/3 caught; 12 CTX + 9 TweakKind static & finite-domain injective; "
+        f"domain_sep.py PASSED (self-test 4/4 caught; 12 CTX + 9 TweakKind SPEC-table exact match & finite-domain bounds; "
         f"dynamic trace: {n_ver} unique verify K_pub / 0 K_sec, {n_fors} FORS + {n_wots} WOTS+/Merkle disjoint tweaks, {n_ctx} contexts)."
     )
     return 0

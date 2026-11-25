@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Planted-fault positive controls for BLINCS.
+"""Planted-fault positive controls for Signet (BLINCS-128-7x5).
 
-Each control injects one deliberate bug into src/, runs the targeted test via
-cargo-nextest, restores the file immediately, and checks that the test fails.
+Runs all mutations inside a disposable temporary copy (sharing target/ for speed),
+so the main repository checkout is never modified even if interrupted.
 """
 
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -27,32 +29,39 @@ CONTROLS = [
         "parse_digest_extracts_all_fors_indices_and_35bit_leaf_addr",
     ),
     (
-        "FORS root binds all 20 tree roots (fors_verify)",
+        "FORS root compression binds all 20 tree roots (fors_root)",
         "src/few_time.rs",
-        "        public.hash_many(&b48[..], &mut out[..]);",
-        "        public.hash_many(&b48[..FORS_TREES - 1], &mut out[..FORS_TREES - 1]);",
+        "    for t in 0..FORS_TREES {\n        input[16 + t * N..16 + (t + 1) * N].copy_from_slice(&roots[t]);\n    }",
+        "    for t in 0..FORS_TREES - 1 {\n        input[16 + t * N..16 + (t + 1) * N].copy_from_slice(&roots[t]);\n    }",
         "every_signature_region_is_checked",
     ),
     (
         "Hypertree final top-root equality check (verify_short)",
         "src/lib.rs",
-        "        ct_eq_n(&node, self.root())",
-        "        true",
+        "        if ct_eq_n(&node, self.root()) { Ok(()) } else { Err(InvalidImprint) }",
+        "        let _ = node;\n        Ok(())",
         "every_signature_region_is_checked",
     ),
     (
-        "Signing self-verification binds serialized salt to short (verify_short)",
+        "verify_short rejects mismatched serialized salt against short",
         "src/lib.rs",
-        "        sig[..N].copy_from_slice(&short[..N]);",
-        "        sig[..N].copy_from_slice(&short[..N]);\n        sig[0] ^= 1;",
-        "reference_vector_matches_python_byte_for_byte",
+        "        if !ct_eq_n(imprint.salt(), short[..N].try_into().unwrap()) {\n            return Err(InvalidImprint);\n        }",
+        "        let _ = imprint.salt();",
+        "verify_short_rejects_mismatched_salt_against_short",
     ),
     (
-        "Per-signature salt keyed into content hash (content_from_slice)",
+        "Per-signature salt keyed into content hash (derive_msg_key)",
         "src/content.rs",
-        "    let msg_key = keyed(content_key, salt);\n    let message_hash = *TreeHasher::new(Mode::Keyed(&msg_key)).hash(message).as_bytes();",
-        "    let msg_key = keyed(content_key, &[0u8; N]);\n    let message_hash = *TreeHasher::new(Mode::Keyed(&msg_key)).hash(message).as_bytes();",
-        "reference_vector_matches_python_byte_for_byte",
+        "    buf[..N].copy_from_slice(salt);",
+        "    buf[..N].copy_from_slice(&[0u8; N]);",
+        "reference_vector_and_intermediate_kats_match_python_byte_for_byte",
+    ),
+    (
+        "Application Context framed into content hash (derive_msg_key)",
+        "src/content.rs",
+        "    let ctx_bytes = ctx.as_bytes();\n    let mut buf = [0u8; N + 1 + MAX_CONTEXT_LEN];",
+        "    let ctx_bytes: &[u8] = b\"\";\n    let _ = ctx;\n    let mut buf = [0u8; N + 1 + MAX_CONTEXT_LEN];",
+        "context_validation_framing_and_error_contracts",
     ),
     (
         "Streaming content_from_reader feeds chunks into Hasher",
@@ -127,49 +136,62 @@ CONTROLS = [
 ]
 
 
-def run_nextest(test_filter=None):
+def run_nextest(workdir, target_dir, test_filter=None):
     cmd = ["cargo", "nextest", "run", "--locked", "--no-fail-fast", "--color", "never"]
     if test_filter is not None:
         cmd += ["-E", f"test(/{test_filter}$/)"]
-    return subprocess.run(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+    env = os.environ.copy()
+    env["CARGO_TARGET_DIR"] = target_dir
+    return subprocess.run(cmd, cwd=workdir, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
 
 
 def main():
-    print("Baseline: checking unmutated tests pass...")
-    base = run_nextest()
-    if base.returncode != 0:
-        print(base.stdout, file=sys.stderr)
-        print("FAIL: baseline tests did not pass", file=sys.stderr)
-        return 1
+    tmp_root = tempfile.mkdtemp(prefix="signet-controls-")
+    work = os.path.join(tmp_root, "work")
+    target_dir = os.path.join(tmp_root, "target")
+    try:
+        shutil.copytree(
+            ROOT,
+            work,
+            ignore=shutil.ignore_patterns(".git", "target", "bench", "audits", "__pycache__"),
+        )
+        print("Baseline: checking unmutated tests pass in disposable copy...")
+        base = run_nextest(work, target_dir)
+        if base.returncode != 0:
+            print(base.stdout, file=sys.stderr)
+            print("FAIL: baseline tests did not pass", file=sys.stderr)
+            return 1
 
-    missed = []
-    for i, (name, rel, old, new, flt) in enumerate(CONTROLS, 1):
-        path = os.path.join(ROOT, rel)
-        orig = open(path).read()
-        count = orig.count(old)
-        if count != 1:
-            print(f"ERROR [{i}/{len(CONTROLS)}] {name}: expected 1 match in {rel}, found {count}", file=sys.stderr)
-            return 2
-        try:
-            open(path, "w").write(orig.replace(old, new, 1))
-            res = run_nextest(flt)
-        finally:
-            open(path, "w").write(orig)
+        missed = []
+        for i, (name, rel, old, new, flt) in enumerate(CONTROLS, 1):
+            path = os.path.join(work, rel)
+            orig = open(path).read()
+            count = orig.count(old)
+            if count != 1:
+                print(f"ERROR [{i}/{len(CONTROLS)}] {name}: expected 1 match in {rel}, found {count}", file=sys.stderr)
+                return 2
+            try:
+                open(path, "w").write(orig.replace(old, new, 1))
+                res = run_nextest(work, target_dir, flt)
+            finally:
+                open(path, "w").write(orig)
 
-        if res.returncode == 0:
-            print(f"MISSED [{i}/{len(CONTROLS)}] {name} ({flt} still passed!)")
-            missed.append(name)
-        elif "1 test run: 0 passed, 1 failed" not in res.stdout or flt not in res.stdout:
-            print(f"ERROR [{i}/{len(CONTROLS)}] {name}: nonzero exit without running/failing {flt}:\n{res.stdout}", file=sys.stderr)
-            return 2
-        else:
-            print(f"CAUGHT [{i}/{len(CONTROLS)}] {name}")
+            if res.returncode == 0:
+                print(f"MISSED [{i}/{len(CONTROLS)}] {name} ({flt} still passed!)")
+                missed.append(name)
+            elif "1 test run: 0 passed, 1 failed" not in res.stdout or flt not in res.stdout:
+                print(f"ERROR [{i}/{len(CONTROLS)}] {name}: nonzero exit without running/failing {flt}:\n{res.stdout}", file=sys.stderr)
+                return 2
+            else:
+                print(f"CAUGHT [{i}/{len(CONTROLS)}] {name}")
 
-    if missed:
-        print(f"\nFAIL: {len(missed)} planted fault(s) escaped: {missed}", file=sys.stderr)
-        return 1
-    print(f"\nPASS: all {len(CONTROLS)} planted faults caught by their targeted tests.")
-    return 0
+        if missed:
+            print(f"\nFAIL: {len(missed)} planted fault(s) escaped: {missed}", file=sys.stderr)
+            return 1
+        print(f"\nPASS: all {len(CONTROLS)} planted faults caught by their targeted tests (disposable copy).")
+        return 0
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
 
 
 if __name__ == "__main__":

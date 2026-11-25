@@ -78,12 +78,13 @@ const enc = new TextEncoder();
 export const derive = (ctx: string, m: Uint8Array): Uint8Array =>
   b3(toWords(b3(IV, DK_CTX, enc.encode(ctx)), 0, 32, 8), DK_MAT, m);
 
-// ---------------- BLINCS ----------------
-const N = 16, LAYERS = 7, TREE_HEIGHT = 5, CHAINS = 35, FORS_TREES = 20, FORS_HEIGHT = 8, SIG_LEN = 7392;
-const P = "BLINCS 2026-11-25 ";
-const CTX_PUBLIC_HASH = P + "public hash", CTX_CONTENT = P + "content", CTX_MIX = P + "randomness: mix",
-  CTX_FILE_ID = P + "randomness: file id", CTX_NEXT_SEED = P + "randomness: next seed",
-  CTX_RUN_KEY = P + "randomness: key of this run", CTX_KEYGEN_KEY = P + "randomness: keygen key";
+// ---------------- BLINCS-128-7x5 ----------------
+const N = 16, LAYERS = 7, TREE_HEIGHT = 5, CHAINS = 35, FORS_TREES = 20, FORS_HEIGHT = 8, SIG_LEN = 7392, MAX_CTX = 255;
+const BP = "BLINCS-128-7x5 2026-11-25 ";
+const SP = "Signet 2026-11-25 randomness: ";
+const CTX_PUBLIC_HASH = BP + "public hash", CTX_CONTENT = BP + "content",
+  CTX_MIX = SP + "mix", CTX_FILE_ID = SP + "file id", CTX_NEXT_SEED = SP + "next seed",
+  CTX_RUN_KEY = SP + "key of this run", CTX_KEYGEN_KEY = SP + "keygen key";
 const CHAIN = 2, ONE_TIME_KEY = 3, NODE = 4, FEW_LEAF = 6, FEW_NODE = 7, FEW_ROOT = 8, MESSAGE = 9;
 
 function cat(...xs: Uint8Array[]): Uint8Array {
@@ -112,15 +113,17 @@ function digits(node: Uint8Array): number[] {
   return d;
 }
 
-export function verify(vk: Uint8Array, message: Uint8Array, sig: Uint8Array): boolean {
+export function verify(vk: Uint8Array, ctx: Uint8Array, message: Uint8Array, sig: Uint8Array): boolean {
+  if (ctx.length > MAX_CTX) throw new Error("context exceeds 255 bytes");
   if (vk.length !== 32 || sig.length !== SIG_LEN) return false;
+  const framedCtx = cat(new Uint8Array([ctx.length]), ctx);
   const kPub = derive(CTX_PUBLIC_HASH, vk.slice(0, 16));
   const root = vk.slice(16, 32);
   const kContent = derive(CTX_CONTENT, vk);
   const e = sig.slice(0, 16), R = sig.slice(16, 32);
-  const kMsg = keyed(kContent, e);
+  const kMsg = keyed(kContent, cat(e, framedCtx));
   const short = cat(e, keyed(kMsg, message));
-  const D = keyed(kPub, cat(tweak(MESSAGE, 0, 0, 0, 0, 0), R, root, short));
+  const D = keyed(kPub, cat(tweak(MESSAGE, 0, 0, 0, 0, 0), R, root, short, framedCtx));
   let la = 0n; for (let i = 27; i >= 20; i--) la = (la << 8n) | BigInt(D[i]);
   const leafAddr = Number(la & ((1n << 35n) - 1n));
 
@@ -197,8 +200,8 @@ const isMain = proc && Array.isArray(proc.argv) && proc.argv[1] && import.meta.u
 if (isMain) {
   const a: string[] = proc.argv.slice(2);
   try {
-    if (a[0] === "--verify" && a.length === 4) {
-      const ok = verify(hex(a[1], 32), new Uint8Array(readFileSync(a[3])), new Uint8Array(readFileSync(a[2])));
+    if (a[0] === "--verify" && a.length === 5) {
+      const ok = verify(hex(a[1], 32), hex(a[2]), new Uint8Array(readFileSync(a[4])), new Uint8Array(readFileSync(a[3])));
       console.log(ok ? "true" : "false");
       proc.exit(ok ? 0 : 1);
     } else if (a[0] === "--mix" && a.length === 5) {
@@ -209,7 +212,7 @@ if (isMain) {
     } else if (a[0] === "--draw" && a.length === 3) {
       console.log(toHex(draw(hex(a[1], 32), u64arg(a[2]))));
     } else {
-      console.error("usage: --verify <vk_hex> <sig_path> <msg_path> | --mix <csv_seed_hex> <sys_hex> <clock_utf8> <draw_n|-> | --draw <key_hex> <n>");
+      console.error("usage: --verify <vk_hex> <ctx_hex> <sig_path> <msg_path> | --mix <csv_seed_hex> <sys_hex> <clock_utf8> <draw_n|-> | --draw <key_hex> <n>");
       proc.exit(2);
     }
   } catch (err) {

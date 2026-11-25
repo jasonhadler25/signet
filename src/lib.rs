@@ -1,4 +1,5 @@
-//! BLINCS — stateless hash-based digital signatures based on BLAKE3 and SPHINCS.
+//! Signet — a Rust implementation of the **BLINCS** (`BLINCS-128-7x5`) stateless hash-based
+//! post-quantum signature algorithm, based on BLAKE3 and SPHINCS.
 //!
 //! **Pre-1.0 experimental software (unsupported):** formats, context strings, and APIs may change
 //! incompatibly before 1.0, and no independent human cryptographic audit has been performed.
@@ -11,25 +12,29 @@
 //! Because a cryptographic key is a transferable bearer authority rather than a person's handwritten
 //! signature, this API calls the secret a [`Signet`], its 32-byte self-certifying identifier a
 //! [`SignetId`] (which names which signet you mean and verifies its imprints), and the 7,392-byte
-//! proof an [`Imprint`]. Pass message bytes or a stream directly: BLINCS hashes the input in a
-//! single salted keyed-BLAKE3 pass under a fresh per-imprint salt.
+//! proof an [`Imprint`]. Pass a domain-separating [`Context`] and the original message bytes or
+//! stream directly: BLINCS hashes the input in a single salted keyed-BLAKE3 pass under a fresh
+//! per-imprint salt.
 //!
 //! ```no_run
-//! use blincs::{Randomness, Signet, SignetId};
+//! use signet::{Context, Randomness, Signet, SignetId, VerifyError};
 //!
-//! Randomness::create("/path/to/blincs.state.d")?;
-//! let randomness = Randomness::initialize("/path/to/blincs.state.d")?;
+//! const RELEASE_CTX: Context<'static> = Context::new(b"example.org release manifest v1");
+//!
+//! Randomness::create("/path/to/signet.state.d")?;
+//! let randomness = Randomness::initialize("/path/to/signet.state.d")?;
 //! let publisher = Signet::generate(&randomness)?;
 //! let expected_publisher: SignetId = publisher.id();
 //!
-//! let imprint = publisher.imprint(&randomness, b"hello, BLINCS");
-//! assert!(expected_publisher.verify(b"hello, BLINCS", &imprint));
+//! let imprint = publisher.imprint(&randomness, RELEASE_CTX, b"hello, BLINCS");
+//! expected_publisher.verify(RELEASE_CTX, b"hello, BLINCS", &imprint)?;
 //!
-//! // A valid imprint from a different signet must be rejected.
+//! // A valid imprint from a different signet or a different context must be rejected.
 //! let other = Signet::generate(&randomness)?;
-//! let other_imprint = other.imprint(&randomness, b"hello, BLINCS");
-//! assert!(!expected_publisher.verify(b"hello, BLINCS", &other_imprint));
-//! # Ok::<(), std::io::Error>(())
+//! let other_imprint = other.imprint(&randomness, RELEASE_CTX, b"hello, BLINCS");
+//! assert!(expected_publisher.verify(RELEASE_CTX, b"hello, BLINCS", &other_imprint).is_err());
+//! assert!(expected_publisher.verify(Context::new(b"other-protocol"), b"hello, BLINCS", &imprint).is_err());
+//! # Ok::<(), VerifyError>(())
 //! ```
 
 #![forbid(unsafe_code)]
@@ -43,21 +48,131 @@ mod randomness;
 #[cfg(test)]
 mod test;
 
-pub use params::{IMPRINT_LEN, SEED_LEN, SIGNET_ID_LEN};
+pub use params::{IMPRINT_LEN, MAX_CONTEXT_LEN, SEED_LEN, SIGNET_ID_LEN, SUITE_NAME};
 pub use randomness::Randomness;
 
 use content::{content_from_reader, content_from_slice};
-use few_time::{build_fors_tree, fors_root, fors_verify, parse_digest};
+use few_time::{build_all_fors, fors_verify, parse_digest};
 use one_time::{Pos, SignWorkspace, build_tree_heap, verify_layer, write_layer_signature};
 use params::{
-    CTX_CONTENT, CTX_CONTENT_SALT, CTX_GENERATE_SIGNET, CTX_PUBLIC_SEED, CTX_RANDOMIZER, FORS_LEN, FORS_TREES, LAYER_LEN, Layer, N, PublicKey, SHORT_LEN,
-    SecretKey, TREE_LEAVES, TweakKind, derive_key, ensure_init, first_n, keyed, tweak,
+    CTX_CONTENT, CTX_CONTENT_SALT, CTX_GENERATE_SIGNET, CTX_PUBLIC_SEED, CTX_RANDOMIZER, FORS_LEN, LAYER_LEN, Layer, N, PublicKey, SHORT_LEN, SecretKey,
+    TREE_LEAVES, TweakKind, derive_key, ensure_init, first_n, keyed, tweak,
 };
 use randomness::read_os_randomness;
 use std::array::TryFromSliceError;
+use std::error::Error;
 use std::fmt;
 use std::hint::black_box;
 use std::io::{self, Read};
+
+/// Error returned when a [`Context`] exceeds [`MAX_CONTEXT_LEN`] (`255`) bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextTooLong {
+    /// Actual byte length supplied by the caller.
+    pub len: usize,
+}
+
+impl fmt::Display for ContextTooLong {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "BLINCS application context length {} exceeds maximum {MAX_CONTEXT_LEN} bytes", self.len)
+    }
+}
+
+impl Error for ContextTooLong {}
+
+/// Bounded application domain-separation context (`0..=255` bytes) bound into every imprint.
+///
+/// Using a distinct `Context` per protocol or message purpose prevents cross-protocol replay
+/// under the same [`SignetId`]. Construct static contexts at compile time with [`Context::new`],
+/// or validate runtime byte slices with [`Context::try_new`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Context<'a>(&'a [u8]);
+
+impl<'a> Context<'a> {
+    /// Empty application context (`b""`). Prefer a non-empty protocol-specific label.
+    pub const EMPTY: Self = Self(b"");
+
+    /// Construct a `Context` from a byte slice of at most [`MAX_CONTEXT_LEN`] (`255`) bytes.
+    ///
+    /// Panics if `bytes.len() > MAX_CONTEXT_LEN` (fails at compile time when used in a `const`).
+    #[must_use]
+    pub const fn new(bytes: &'a [u8]) -> Self {
+        assert!(bytes.len() <= MAX_CONTEXT_LEN, "BLINCS application context exceeds 255 bytes");
+        Self(bytes)
+    }
+
+    /// Validate a runtime byte slice as a `Context` (`<= 255` bytes).
+    pub fn try_new(bytes: &'a [u8]) -> Result<Self, ContextTooLong> {
+        if bytes.len() > MAX_CONTEXT_LEN {
+            return Err(ContextTooLong { len: bytes.len() });
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Borrow the raw context bytes.
+    pub const fn as_bytes(&self) -> &'a [u8] {
+        self.0
+    }
+}
+
+impl<'a> TryFrom<&'a [u8]> for Context<'a> {
+    type Error = ContextTooLong;
+
+    fn try_from(bytes: &'a [u8]) -> Result<Self, Self::Error> {
+        Self::try_new(bytes)
+    }
+}
+
+/// Imprint verification failed: the imprint is not valid for this [`SignetId`], [`Context`], and message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidImprint;
+
+impl fmt::Display for InvalidImprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("invalid BLINCS imprint")
+    }
+}
+
+impl Error for InvalidImprint {}
+
+/// Error returned by [`SignetId::verify_reader`], distinguishing stream I/O failure from an invalid imprint.
+#[derive(Debug)]
+pub enum VerifyError {
+    /// Reading the message stream failed.
+    Io(io::Error),
+    /// The imprint is not valid for this [`SignetId`], [`Context`], and stream.
+    Invalid,
+}
+
+impl fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "failed to read message stream: {e}"),
+            Self::Invalid => f.write_str("invalid BLINCS imprint"),
+        }
+    }
+}
+
+impl Error for VerifyError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::Invalid => None,
+        }
+    }
+}
+
+impl From<io::Error> for VerifyError {
+    fn from(err: io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+impl From<InvalidImprint> for VerifyError {
+    fn from(_: InvalidImprint) -> Self {
+        Self::Invalid
+    }
+}
 
 fn ct_eq_n(a: &[u8; N], b: &[u8; N]) -> bool {
     let mut diff = 0u8;
@@ -74,16 +189,32 @@ fn fmt_hex(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
     Ok(())
 }
 
-fn msg_digest_input(randomizer: &[u8; N], root: &[u8; N], short: &[u8; SHORT_LEN]) -> [u8; 16 + N + N + SHORT_LEN] {
-    let mut buf = [0u8; 16 + N + N + SHORT_LEN];
+const RANDOMIZER_INPUT_MAX_LEN: usize = SHORT_LEN + 1 + MAX_CONTEXT_LEN;
+const MSG_DIGEST_INPUT_MAX_LEN: usize = 16 + N + N + SHORT_LEN + 1 + MAX_CONTEXT_LEN;
+const _: () = assert!(RANDOMIZER_INPUT_MAX_LEN == 304 && MSG_DIGEST_INPUT_MAX_LEN == 352);
+
+pub(crate) fn compute_randomizer(randomizer_key: &[u8; 32], short: &[u8; SHORT_LEN], ctx: Context<'_>) -> [u8; N] {
+    let ctx_bytes = ctx.as_bytes();
+    let mut buf = [0u8; RANDOMIZER_INPUT_MAX_LEN];
+    buf[..SHORT_LEN].copy_from_slice(short);
+    buf[SHORT_LEN] = u8::try_from(ctx_bytes.len()).unwrap();
+    buf[SHORT_LEN + 1..SHORT_LEN + 1 + ctx_bytes.len()].copy_from_slice(ctx_bytes);
+    first_n(&keyed(randomizer_key, &buf[..SHORT_LEN + 1 + ctx_bytes.len()]))
+}
+
+pub(crate) fn compute_message_digest(public_key: &PublicKey, randomizer: &[u8; N], root: &[u8; N], short: &[u8; SHORT_LEN], ctx: Context<'_>) -> [u8; 32] {
+    let ctx_bytes = ctx.as_bytes();
+    let mut buf = [0u8; MSG_DIGEST_INPUT_MAX_LEN];
     buf[..16].copy_from_slice(&tweak(TweakKind::Message, 0, 0, 0, 0, 0));
     buf[16..32].copy_from_slice(randomizer);
     buf[32..48].copy_from_slice(root);
-    buf[48..].copy_from_slice(short);
-    buf
+    buf[48..96].copy_from_slice(short);
+    buf[96] = u8::try_from(ctx_bytes.len()).unwrap();
+    buf[97..97 + ctx_bytes.len()].copy_from_slice(ctx_bytes);
+    public_key.keyed(&buf[..97 + ctx_bytes.len()])
 }
 
-/// A 7,392-byte BLINCS imprint (proof produced by pressing a [`Signet`] onto a message).
+/// A 7,392-byte BLINCS-128-7x5 imprint (proof produced by pressing a [`Signet`] onto a context and message).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Imprint([u8; IMPRINT_LEN]);
 
@@ -127,16 +258,16 @@ impl TryFrom<&[u8]> for Imprint {
 
 impl fmt::Debug for Imprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Imprint({IMPRINT_LEN} bytes, salt=")?;
+        write!(f, "Imprint({SUITE_NAME}, {IMPRINT_LEN} bytes, salt=")?;
         fmt_hex(f, self.salt())?;
         f.write_str(")")
     }
 }
 
-/// A publisher's self-certifying 32-byte identifier and its complete BLINCS verifying key (`public_seed || top_root`).
+/// A publisher's self-certifying 32-byte identifier and its complete BLINCS-128-7x5 verifying key (`public_seed || top_root`).
 ///
 /// Receiving a `SignetId` does not authenticate the sender: obtain the expected `SignetId` from a
-/// pinned or authenticated channel and call `expected_publisher.verify(message, &imprint)`.
+/// pinned or authenticated channel and call `expected_publisher.verify(ctx, message, &imprint)?`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SignetId {
     bytes: [u8; SIGNET_ID_LEN],
@@ -179,32 +310,35 @@ impl SignetId {
         self.bytes[N..].try_into().unwrap()
     }
 
-    /// Verify that `imprint` was made by this signet over an in-memory `message` slice (zero heap allocation).
+    /// Verify that `imprint` was made by this signet for `ctx` and an in-memory `message` slice (zero heap allocation).
     ///
-    /// Verify against an expected [`SignetId`] obtained from a pinned or authenticated channel.
+    /// Fails closed: returns `Ok(())` only if the imprint is valid. Verify against an expected
+    /// [`SignetId`] obtained from a pinned or authenticated channel.
     #[must_use = "imprint verification result must be checked"]
-    pub fn verify(&self, message: &[u8], imprint: &Imprint) -> bool {
-        let short = content_from_slice(&self.content_key, imprint.salt(), message);
-        self.verify_short(&short, imprint)
+    pub fn verify(&self, ctx: Context<'_>, message: &[u8], imprint: &Imprint) -> Result<(), InvalidImprint> {
+        let short = content_from_slice(&self.content_key, imprint.salt(), ctx, message);
+        self.verify_short(ctx, &short, imprint)
     }
 
-    /// Verify that `imprint` was made by this signet over a streaming `reader` in one salted pass
+    /// Verify that `imprint` was made by this signet for `ctx` and a streaming `reader` in one salted pass
     /// (zero heap allocation; uses a local zero-initialized 16 KiB stack buffer).
     ///
+    /// Fails closed: returns `Ok(())` only if the stream read succeeds and the imprint is valid.
     /// Verify against an expected [`SignetId`] obtained from a pinned or authenticated channel.
     #[must_use = "imprint verification result must be checked"]
-    pub fn verify_reader(&self, reader: impl Read, imprint: &Imprint) -> io::Result<bool> {
-        let short = content_from_reader(&self.content_key, imprint.salt(), reader)?;
-        Ok(self.verify_short(&short, imprint))
+    pub fn verify_reader(&self, ctx: Context<'_>, reader: impl Read, imprint: &Imprint) -> Result<(), VerifyError> {
+        let short = content_from_reader(&self.content_key, imprint.salt(), ctx, reader)?;
+        self.verify_short(ctx, &short, imprint)?;
+        Ok(())
     }
 
-    fn verify_short(&self, short: &[u8; SHORT_LEN], imprint: &Imprint) -> bool {
+    pub(crate) fn verify_short(&self, ctx: Context<'_>, short: &[u8; SHORT_LEN], imprint: &Imprint) -> Result<(), InvalidImprint> {
         if !ct_eq_n(imprint.salt(), short[..N].try_into().unwrap()) {
-            return false;
+            return Err(InvalidImprint);
         }
-        let msg_in = msg_digest_input(imprint.randomizer(), self.root(), short);
+        let digest = compute_message_digest(&self.public_key, imprint.randomizer(), self.root(), short, ctx);
         let public = self.public_key.hasher(false);
-        let (fors_indices, leaf_addr) = parse_digest(public.hash(&msg_in).as_bytes());
+        let (fors_indices, leaf_addr) = parse_digest(&digest);
         let coords = leaf_addr.split_layers();
 
         let mut node = fors_verify(&public, leaf_addr, &fors_indices, imprint.fors());
@@ -212,11 +346,11 @@ impl SignetId {
             let (tree, leaf) = coords[layer.index()];
             node = verify_layer(&public, Pos::new(layer, tree, leaf), &node, imprint.layer(layer));
         }
-        ct_eq_n(&node, self.root())
+        if ct_eq_n(&node, self.root()) { Ok(()) } else { Err(InvalidImprint) }
     }
 }
 
-/// A BLINCS signet (bearer authority derived from a 32-byte seed, holding the 1 KiB top hypertree in memory).
+/// A BLINCS-128-7x5 signet (bearer authority derived from a 32-byte seed, holding the 1 KiB top hypertree in memory).
 pub struct Signet {
     seed: [u8; SEED_LEN],
     secret_key: SecretKey,
@@ -258,7 +392,7 @@ impl Signet {
         let public_seed = first_n(&derive_key(CTX_PUBLIC_SEED, seed));
         let public_key = PublicKey::from_seed(&public_seed);
 
-        let mut ws = SignWorkspace::new();
+        let mut ws = SignWorkspace::new(false);
         let top_tree = build_tree_heap(&secret_key, &public_key, Layer::TOP, 0, &mut ws);
 
         let mut id_bytes = [0u8; SIGNET_ID_LEN];
@@ -277,32 +411,20 @@ impl Signet {
         self.id
     }
 
-    fn finish_imprint(&self, short: &[u8; SHORT_LEN]) -> Imprint {
+    fn finish_imprint(&self, ctx: Context<'_>, short: &[u8; SHORT_LEN]) -> Imprint {
         let mut sig = [0u8; IMPRINT_LEN];
-        let randomizer = first_n(&keyed(&self.randomizer_key, short));
+        let randomizer = compute_randomizer(&self.randomizer_key, short, ctx);
         sig[..N].copy_from_slice(&short[..N]);
         sig[N..2 * N].copy_from_slice(&randomizer);
 
-        let msg_in = msg_digest_input(&randomizer, self.id.root(), short);
-        let (fors_indices, leaf_addr) = parse_digest(&self.id.public_key.keyed(&msg_in));
+        let digest = compute_message_digest(&self.id.public_key, &randomizer, self.id.root(), short, ctx);
+        let (fors_indices, leaf_addr) = parse_digest(&digest);
         let coords = leaf_addr.split_layers();
         let (sec, pubk) = (self.secret_key, self.id.public_key);
-        let mut ws = SignWorkspace::new();
+        let mut ws = SignWorkspace::new(true);
 
-        // Build all 20 FORS trees and compute the FORS root.
-        let mut at = 2 * N;
-        let mut fors_roots = [[0u8; N]; FORS_TREES];
-        for t in 0..FORS_TREES {
-            let tree = build_fors_tree(&sec, &pubk, leaf_addr, u16::try_from(t).unwrap(), fors_indices[t], &mut ws);
-            sig[at..at + N].copy_from_slice(&tree.secret);
-            at += N;
-            for sib in &tree.auth {
-                sig[at..at + N].copy_from_slice(sib);
-                at += N;
-            }
-            fors_roots[t] = tree.root;
-        }
-        let mut node = fors_root(&pubk.hasher(false), leaf_addr, &fors_roots);
+        let fors_slice: &mut [u8; FORS_LEN] = (&mut sig[2 * N..2 * N + FORS_LEN]).try_into().unwrap();
+        let mut node = build_all_fors(&sec, &pubk, leaf_addr, &fors_indices, &mut ws, fors_slice);
 
         // Build the 6 lower Merkle heaps and imprint all 7 uniform hypertree layers.
         for layer in Layer::LOWER {
@@ -318,41 +440,41 @@ impl Signet {
         write_layer_signature(&sec, &pubk, Pos::new(Layer::TOP, top_tree_idx, top_leaf), &node, &self.top_tree, &mut sig[off..off + LAYER_LEN]);
 
         let imprint = Imprint(sig);
-        assert!(self.id.verify_short(short, &imprint), "internal error: generated imprint failed self-verification");
+        assert!(self.id.verify_short(ctx, short, &imprint).is_ok(), "internal error: generated imprint failed self-verification");
         imprint
     }
 
-    pub(crate) fn imprint_with_draw(&self, draw: &[u8; 32], message: &[u8]) -> Imprint {
+    pub(crate) fn imprint_with_draw(&self, draw: &[u8; 32], ctx: Context<'_>, message: &[u8]) -> Imprint {
         ensure_init();
         let salt = first_n(&keyed(&self.salt_key, draw));
-        let short = content_from_slice(&self.id.content_key, &salt, message);
-        self.finish_imprint(&short)
+        let short = content_from_slice(&self.id.content_key, &salt, ctx, message);
+        self.finish_imprint(ctx, &short)
     }
 
-    pub(crate) fn imprint_reader_with_draw(&self, draw: &[u8; 32], reader: impl Read) -> io::Result<Imprint> {
+    pub(crate) fn imprint_reader_with_draw(&self, draw: &[u8; 32], ctx: Context<'_>, reader: impl Read) -> io::Result<Imprint> {
         ensure_init();
         let salt = first_n(&keyed(&self.salt_key, draw));
-        let short = content_from_reader(&self.id.content_key, &salt, reader)?;
-        Ok(self.finish_imprint(&short))
+        let short = content_from_reader(&self.id.content_key, &salt, ctx, reader)?;
+        Ok(self.finish_imprint(ctx, &short))
     }
 
-    /// Imprint an in-memory `message`, drawing fresh per-imprint randomness from `randomness`.
+    /// Imprint an in-memory `message` under `ctx`, drawing fresh per-imprint randomness from `randomness`.
     ///
-    /// Self-verifies the finished imprint before returning. Do not imprint more than 2³² things
-    /// with one signet.
+    /// Self-verifies the finished imprint against `short` before returning. Do not imprint more
+    /// than 2³² things with one signet.
     #[must_use]
-    pub fn imprint(&self, randomness: &Randomness, message: &[u8]) -> Imprint {
+    pub fn imprint(&self, randomness: &Randomness, ctx: Context<'_>, message: &[u8]) -> Imprint {
         let draw = randomness.draw();
-        self.imprint_with_draw(&draw, message)
+        self.imprint_with_draw(&draw, ctx, message)
     }
 
-    /// Imprint a streaming `reader` in one salted pass, drawing fresh per-imprint randomness from
-    /// `randomness`.
+    /// Imprint a streaming `reader` under `ctx` in one salted pass, drawing fresh per-imprint
+    /// randomness from `randomness`.
     ///
-    /// Self-verifies the finished imprint before returning. Do not imprint more than 2³² things
-    /// with one signet.
-    pub fn imprint_reader(&self, randomness: &Randomness, reader: impl Read) -> io::Result<Imprint> {
+    /// Self-verifies the finished imprint against `short` before returning. Do not imprint more
+    /// than 2³² things with one signet.
+    pub fn imprint_reader(&self, randomness: &Randomness, ctx: Context<'_>, reader: impl Read) -> io::Result<Imprint> {
         let draw = randomness.draw();
-        self.imprint_reader_with_draw(&draw, reader)
+        self.imprint_reader_with_draw(&draw, ctx, reader)
     }
 }

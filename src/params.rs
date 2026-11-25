@@ -1,10 +1,14 @@
 use blake3_servil_core::throughput::TreeHasher;
 use blake3_servil_core::{Mode, convenience, initialize};
 
+/// Permanent suite identifier for this BLINCS parameter set (`7×5`, `FORS(8, 20)`, 2³² budget).
+pub const SUITE_NAME: &str = "BLINCS-128-7x5";
 /// Byte length of a [`crate::Signet`] secret seed (`32` bytes).
 pub const SEED_LEN: usize = 32;
 /// Byte length of a [`crate::SignetId`] wire encoding (`32` bytes: `public_seed || top_root`).
 pub const SIGNET_ID_LEN: usize = 32;
+/// Maximum byte length of a [`crate::Context`] application domain tag (`255` bytes).
+pub const MAX_CONTEXT_LEN: usize = 255;
 
 pub(crate) const N: usize = 16;
 pub(crate) const LAYERS: usize = 7;
@@ -20,12 +24,13 @@ pub(crate) const CHAINS: usize = MSG_CHAINS + CSUM_CHAINS;
 pub(crate) const FORS_HEIGHT: usize = 8;
 pub(crate) const FORS_LEAVES: usize = 1 << FORS_HEIGHT;
 pub(crate) const FORS_TREES: usize = 20;
+pub(crate) const FORS_TOTAL_LEAVES: usize = FORS_TREES * FORS_LEAVES;
 pub(crate) const HYPER_BITS: usize = LAYERS * TREE_HEIGHT;
 
 pub(crate) const SHORT_LEN: usize = N + 32;
 pub(crate) const FORS_LEN: usize = FORS_TREES * (1 + FORS_HEIGHT) * N;
 pub(crate) const LAYER_LEN: usize = (CHAINS + TREE_HEIGHT) * N;
-/// Byte length of a BLINCS [`crate::Imprint`] (`7,392` bytes).
+/// Byte length of a BLINCS-128-7x5 [`crate::Imprint`] (`7,392` bytes).
 pub const IMPRINT_LEN: usize = 2 * N + FORS_LEN + LAYERS * LAYER_LEN;
 
 const _: () = {
@@ -35,18 +40,19 @@ const _: () = {
 };
 
 // Key-derivation contexts (SPEC.md, "Key-derivation contexts").
-pub(crate) const CTX_SECRET_VALUES: &str = "BLINCS 2026-11-25 signet: secret values";
-pub(crate) const CTX_CONTENT_SALT: &str = "BLINCS 2026-11-25 signet: content salt";
-pub(crate) const CTX_RANDOMIZER: &str = "BLINCS 2026-11-25 signet: randomizer";
-pub(crate) const CTX_PUBLIC_SEED: &str = "BLINCS 2026-11-25 signet: public seed";
-pub(crate) const CTX_GENERATE_SIGNET: &str = "BLINCS 2026-11-25 signet: generate";
-pub(crate) const CTX_PUBLIC_HASH: &str = "BLINCS 2026-11-25 public hash";
-pub(crate) const CTX_CONTENT: &str = "BLINCS 2026-11-25 content";
-pub(crate) const CTX_MIX: &str = "BLINCS 2026-11-25 randomness: mix";
-pub(crate) const CTX_FILE_ID: &str = "BLINCS 2026-11-25 randomness: file id";
-pub(crate) const CTX_NEXT_SEED: &str = "BLINCS 2026-11-25 randomness: next seed";
-pub(crate) const CTX_RUN_KEY: &str = "BLINCS 2026-11-25 randomness: key of this run";
-pub(crate) const CTX_KEYGEN_KEY: &str = "BLINCS 2026-11-25 randomness: keygen key";
+// Algorithm contexts bind SUITE_NAME ("BLINCS-128-7x5") so suites never share derived keys.
+pub(crate) const CTX_SECRET_VALUES: &str = "BLINCS-128-7x5 2026-11-25 secret values";
+pub(crate) const CTX_CONTENT_SALT: &str = "BLINCS-128-7x5 2026-11-25 content salt";
+pub(crate) const CTX_RANDOMIZER: &str = "BLINCS-128-7x5 2026-11-25 randomizer";
+pub(crate) const CTX_PUBLIC_SEED: &str = "BLINCS-128-7x5 2026-11-25 public seed";
+pub(crate) const CTX_PUBLIC_HASH: &str = "BLINCS-128-7x5 2026-11-25 public hash";
+pub(crate) const CTX_CONTENT: &str = "BLINCS-128-7x5 2026-11-25 content";
+pub(crate) const CTX_GENERATE_SIGNET: &str = "Signet BLINCS-128-7x5 2026-11-25 generate signet";
+pub(crate) const CTX_MIX: &str = "Signet 2026-11-25 randomness: mix";
+pub(crate) const CTX_FILE_ID: &str = "Signet 2026-11-25 randomness: file id";
+pub(crate) const CTX_NEXT_SEED: &str = "Signet 2026-11-25 randomness: next seed";
+pub(crate) const CTX_RUN_KEY: &str = "Signet 2026-11-25 randomness: key of this run";
+pub(crate) const CTX_KEYGEN_KEY: &str = "Signet 2026-11-25 randomness: keygen key";
 
 #[inline]
 pub(crate) fn ensure_init() {

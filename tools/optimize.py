@@ -203,15 +203,15 @@ def run_check():
     f36 = fors_security_bits(1 << 36, 35, 8, 20)
     if not (abs(f32 - 134.4633) < 1e-3 and abs(f33 - 128.8484) < 1e-3 and abs(f34 - 122.3896) < 1e-3 and abs(f35 - 114.9014) < 1e-3 and abs(f36 - 106.1754) < 1e-3):
         raise RuntimeError(f"unexpected FORS curve {f32}/{f33}/{f34}/{f35}/{f36}")
-    if not (c["ledger_sign_s"] <= 5.0 and abs(c["m6_kg_ms"] - 0.17) < 0.1 and abs(c["m6_sign_ms"] - 1.31) < 0.25 and abs(c["m6_ver_us"] - 34.9) < 4.0):
+    if not (c["ledger_sign_s"] <= 5.0 and abs(c["m6_kg_ms"] - 0.17) < 0.1 and abs(c["m6_sign_ms"] - 1.25) < 0.25 and abs(c["m6_ver_us"] - 34.2) < 4.0):
         raise RuntimeError(f"unexpected ST33/M6 1T calibration: st33={c['ledger_sign_s']} kg={c['m6_kg_ms']} sign={c['m6_sign_ms']} ver={c['m6_ver_us']}")
     feasible, pareto = search_feasible(1 << 32, 128.0, 2.0, 5.0, 7856)
     if not (feasible and pareto):
         raise RuntimeError("constrained search returned no feasible candidates")
     print(
-        f"CHECK PASSED: adopted SPEC 7x5 FORS(8,20) ({c['bytes']} B, {c['top_kib']:.0f} KiB top tree, ST33 kg={c['ledger_kg_s']:.2f}s p99={c['ledger_sign_s']:.2f}s) | "
+        f"CHECK PASSED: adopted SPEC BLINCS-128-7x5 ({c['bytes']} B, {c['top_kib']:.0f} KiB top tree, ST33 kg={c['ledger_kg_s']:.2f}s p99={c['ledger_sign_s']:.2f}s) | "
         f"FORS={f32:.1f}/{f33:.1f}/{f34:.1f}/{f35:.1f}/{f36:.1f}b (2^32..2^36) | "
-        f"M6-1T kg={c['m6_kg_ms']:.2f}ms (meas 0.17), sign={c['m6_sign_ms']:.2f}ms (meas 1.31), ver={c['m6_ver_us']:.1f}us (meas 34.9) | "
+        f"M6-1T kg={c['m6_kg_ms']:.2f}ms (meas 0.17), sign={c['m6_sign_ms']:.2f}ms (meas 1.25), ver={c['m6_ver_us']:.1f}us (meas 34.2) | "
         f"ST33 p99 <= 5.0s search (<= 7856 B): {len(feasible)} feasible / {len(pareto)} Pareto."
     )
 
