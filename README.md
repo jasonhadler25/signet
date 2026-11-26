@@ -83,8 +83,8 @@ use signet::{Randomness, Signet};
 
 fn main() -> io::Result<()> {
     // Private seed directory (0700). Refuses to overwrite an existing path.
-    Randomness::create("signet.state.d")?;
-    let rng = Randomness::initialize("signet.state.d")?;
+    Randomness::create("signet.salt")?;
+    let rng = Randomness::initialize("signet.salt")?;
 
     // Generates a fresh 32-byte seed mixing local persisted randomness + OS getrandom(2).
     // Prefer a secrets manager; never derive a seed from a password.
@@ -106,7 +106,7 @@ use signet::{Context, Imprint, InvalidImprint, Randomness, SEED_LEN, SIGNET_ID_L
 const RELEASE_CTX: Context<'static> = Context::new(b"example.org release manifest v1");
 
 fn main() -> Result<(), VerifyError> {
-    let rng = Randomness::initialize("signet.state.d")?; // once per process
+    let rng = Randomness::initialize("signet.salt")?; // once per process
     let raw_seed = fs::read("signet.seed")?;
     let seed: [u8; SEED_LEN] = raw_seed.try_into().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "seed must be 32 bytes"))?;
     let publisher = Signet::from_seed(&seed); // ~0.17 ms: rebuilds the 1 KiB top tree in memory
@@ -137,8 +137,14 @@ fn main() -> Result<(), VerifyError> {
 **Stream large inputs** directly (fails closed on both I/O errors and invalid imprints). This continues inside the same `main`:
 
 ```rust
-let file_imprint = publisher.imprint_reader(&rng, RELEASE_CTX, fs::File::open("artifact.bin")?)?;
-expected_publisher.verify_reader(RELEASE_CTX, fs::File::open("artifact.bin")?, &file_imprint)?;
+let file_imprint = publisher.imprint_with(&rng, RELEASE_CTX, |sink| {
+    std::io::copy(&mut fs::File::open("artifact.bin")?, sink)?;
+    Ok::<(), std::io::Error>(())
+})?;
+expected_publisher.verify_with(RELEASE_CTX, &file_imprint, |sink| {
+    std::io::copy(&mut fs::File::open("artifact.bin")?, sink)?;
+    Ok::<(), std::io::Error>(())
+})?;
 ```
 
 **Standalone `#![no_std]` verification (`crates/signet-verify`):** verifiers that want zero `std`, zero heap allocator, and zero-copy signature views (`ImprintRef<'_>`) can depend on `signet-verify`, which provides both one-shot `SignetId::verify` and incremental `SignetId::verifier` (`update` / `finalize`) on pure-Rust BLAKE3 and is tested on host and freestanding `wasm32-unknown-unknown` (23 KiB `.wasm`, zero imports).
@@ -146,31 +152,30 @@ expected_publisher.verify_reader(RELEASE_CTX, fs::File::open("artifact.bin")?, &
 **Return types:**
 
 - `verify` returns `Result<(), InvalidImprint>` (fail-closed).
-- `verify_reader` returns `Result<(), VerifyError>` (`VerifyError::Io(io::Error)` or `VerifyError::Invalid`, fail-closed on both).
-- `imprint_reader` returns `io::Result<Imprint>`, because reads can fail.
+- `verify_with` returns `Result<(), VerifyError<E>>` (`VerifyError::Source(E)` or `VerifyError::Invalid`, fail-closed on both; `E` defaults to `std::io::Error`).
+- `imprint_with` returns `Result<Imprint, E>`, aborting without finalizing if the producer returns an error.
 
 ## Operational model
 
-### 1. The lock-free `Randomness` seed directory
+### 1. The lock-free `Randomness` state file
 
-Signet stores startup randomness in a private directory on a local filesystem (created once with `Randomness::create`, mode `0700`) holding one or more exact-32-byte regular files named `signet-r2-<32 hex>` (plus a private `.stage/` staging subdirectory). Its only job is to keep per-imprint **content salts** fresh across restarts and hedge `Signet::generate`, even if boot-time OS randomness is weak or repeats. It holds no key index or one-time-key counter.
+Signet stores startup randomness in a single private 32-byte regular file on a local filesystem (created once with `Randomness::create`, mode `0600`). Its only job is to keep per-imprint **content salts** fresh across restarts and hedge `Signet::generate`, even if boot-time OS randomness is weak or repeats. It holds no key index or one-time-key counter.
 
-**How `Randomness::initialize` works (~72 µs, zero `flock`, zero `fsync`):**
+**How `Randomness::initialize` works (~93 µs, zero `flock`, zero `fsync`):**
 
-- Verifies `dir` is a private (`0700`) non-symlink directory, and reads every `signet-r2-<32 hex>` exact-32-byte regular file sorted by filename (ignoring only `.stage`; rejecting unexpected files, symlinks, wrong-sized files, or empty directories without touching anything; re-scanning if concurrent rotation unlinks listed entries during listing).
-- Mixes all read seeds with 32 bytes from OS `getrandom(2)` / `getentropy` and the monotonic clock.
-- Derives four independent, domain-separated outputs from that pool: `file_id` (pool-derived filename, domain-separated from the secret outputs), `next_seed` (32 bytes written completely to a `0600` temp file in `.stage/` and published atomically via no-replace `hard_link` so no partial file ever appears in `dir`), `run_key` (in-memory imprint draws), and `keygen_key` (in-memory draws for `Signet::generate`).
-- Unlinks the old filenames it read. If concurrent processes leave multiple complete seed files, the next `initialize` folds them all together into one fresh 32-byte file and cleans up the rest automatically.
+- Verifies the path is a private (`0600`) regular non-symlink file and reads its exact 32 bytes (rejecting missing paths, directories, symlinks, group/world-accessible permissions, or wrong lengths without touching anything).
+- Mixes the prior 32-byte state with 32 bytes from OS `getrandom(2)` / `getentropy`, the process ID, and the monotonic clock.
+- Derives three independent, domain-separated outputs from that pool: `next_seed` (32 bytes written to a fresh `0600` sibling temp file and published atomically via POSIX `rename`, preserving forward secrecy on disk with no locks and no torn reads), `run_key` (in-memory imprint draws), and `keygen_key` (in-memory draws for `Signet::generate`).
 - Each subsequent imprint draws from `run_key` in memory, with no syscalls or disk writes.
 
-**Losing, cloning, or resetting the seed directory does not cause XMSS/LMS-style one-time-key reuse.**
+**Losing, cloning, or resetting the state file does not cause XMSS/LMS-style one-time-key reuse.**
 
 - Signing secrets derive only from the signet's 32-byte seed.
 - Signing positions come from the message digest.
 - Each hypertree one-time key always signs the same deterministic root.
 - Randomness is hedged: the salt is keyed by the signet, and the randomizer derives from the signet, the salt, the message hash, and the context.
 
-**If the seed directory, OS randomness, and the clock all repeat together**, salts repeat. Signing secrets stay hidden. Content hashing degrades from salted (randomized target-collision) security to the 128-bit collision resistance of keyed BLAKE3.
+**If the state file, OS randomness, PID, and the clock all repeat together**, salts repeat. Signing secrets stay hidden. Content hashing degrades from salted (randomized target-collision) security to the 128-bit collision resistance of keyed BLAKE3.
 
 **Forks and live VM snapshots:** in multithreaded POSIX processes, call `exec()` before initializing Signet rather than calling `Randomness::initialize` directly after `fork()`. After restoring a live VM snapshot, ensure genuinely fresh unshared OS entropy before initializing so cloned images do not repeat `(run_key, count)`.
 
@@ -196,9 +201,9 @@ Signet does not count imprints across runs or across copies of a seed. When reti
 
 ### 3. Startup, streaming, and authenticated IDs
 
-**Startup and memory.** `Signet::from_seed` derives the 1 KiB top tree inline from the 32-byte seed in **~0.17 ms** on 1 core. Nothing is cached on disk, so the seed is all you store. A cold load-and-sign takes **~1.42 ms**. Signing allocates a transient local workspace (~555 KiB for cross-tree FORS batching) that is freed when signing returns; verification uses only stack buffers (~2.5 KiB, plus a 16 KiB stack buffer for `verify_reader`) with zero heap allocation.
+**Startup and memory.** `Signet::from_seed` derives the 1 KiB top tree inline from the 32-byte seed in **~0.17 ms** on 1 core. Nothing is cached on disk, so the seed is all you store. A cold load-and-sign takes **~1.41 ms**. Signing allocates a transient local workspace (~475 KiB for cross-tree FORS batching) that is freed when signing returns; verification uses only stack buffers (~2.5 KiB for `verify`, plus the `Sink`'s 26 KiB BLAKE3 `Hasher` for `verify_with`) with zero heap allocation.
 
-**Streaming.** `imprint`/`verify` take message bytes, and `imprint_reader`/`verify_reader` take a stream. Either way, Signet hashes every byte in a single salted keyed-BLAKE3 pass on the calling thread. The per-imprint salt is chosen before the message is read. On 1 Apple M6 core, 100 MiB hashes at ~6.4 GB/s signing and ~7.0 GB/s verifying (in-memory slice), or ~4.1–4.3 GB/s via `imprint_reader`/`verify_reader` using a local 16 KiB stack buffer.
+**Streaming.** `imprint`/`verify` take message bytes, and `imprint_with`/`verify_with` push bytes into a `Sink` (implementing both `Sink::update` and `std::io::Write`, so `std::io::copy` works in one line). Either way, Signet hashes every byte in a single salted keyed-BLAKE3 pass on the calling thread, choosing the per-imprint salt before the producer runs. On 1 Apple M6 core, 100 MiB hashes at ~6.4 GB/s signing and ~7.0 GB/s verifying (in-memory slice), or ~3.8–4.0 GB/s via `imprint_with`/`verify_with`.
 
 **Authenticated IDs.** Verifiers need an **authenticated** `SignetId`. Receiving a `SignetId` does not authenticate the sender; a valid imprint proves only that it matches a given 32-byte ID and `Context`. Deliver IDs through a channel that ties them to the signer, such as pinned configuration or signed release metadata.
 

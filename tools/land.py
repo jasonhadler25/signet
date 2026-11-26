@@ -115,7 +115,7 @@ def check_vectors_and_references():
                 "import sys; sys.path.insert(0, 'reference'); import blincs\n"
                 "for fn, args in [(blincs.SignetId,(b'x',)),(blincs.Signet,(b'x',)),"
                 "(blincs.frame_context,(b'0'*256,)),"
-                "(blincs.mix_pool,([b'0'*33],b'0'*32,b'')),(blincs.expand_pool,(b'x',)),(blincs.draw,(b'x',0))]:\n"
+                "(blincs.mix_pool,(b'0'*33,b'0'*32,0,b'')),(blincs.expand_pool,(b'x',)),(blincs.draw,(b'x',0))]:\n"
                 "    try:\n        fn(*args)\n        raise SystemExit(1)\n"
                 "    except ValueError:\n        pass\n"
                 f"ba = bytearray(bytes.fromhex('{REF_SIGNET_ID}'))\n"
@@ -131,48 +131,59 @@ def check_vectors_and_references():
         fail("node not found in PATH (required to verify reference/blincs.ts)")
     print("==> Checking Node TypeScript reference (reference/blincs.ts) against all 5 vectors + RNG mix")
     ts_path = os.path.join(ROOT, "reference", "blincs.ts")
+    # Single in-process Node run over all 5 positive vectors, negative cases, and RNG mix/draw:
+    ts_check_script = f"""
+import {{ readFileSync }} from "node:fs";
+import {{ verify, mixPool, expandPool, draw }} from {json.dumps(ts_path)};
+const hex = (s) => Uint8Array.from(s.match(/../g) ?? [], (b) => parseInt(b, 16));
+const toHex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+const enc = new TextEncoder();
+const vk = hex({json.dumps(REF_SIGNET_ID)});
+const refCtx = hex({json.dumps(REF_CTX.hex())});
+const refMsg = enc.encode("hello, BLINCS");
+const refSig = new Uint8Array(readFileSync({json.dumps(REF_IMP)}));
+if (!verify(vk, refCtx, refMsg, refSig)) throw new Error("rejected reference-imprint-1.bin");
+if (verify(vk, new Uint8Array(0), refMsg, refSig)) throw new Error("accepted wrong context");
+const tampered = Uint8Array.from(refSig); tampered[4096] ^= 1;
+if (verify(vk, refCtx, refMsg, tampered)) throw new Error("accepted tampered sig");
+const wrongId = Uint8Array.from(vk); wrongId[0] ^= 1;
+if (verify(wrongId, refCtx, refMsg, refSig)) throw new Error("accepted wrong SignetId");
+if (verify(vk, refCtx, refMsg, refSig.slice(0, -1))) throw new Error("accepted truncated sig");
+const edges = JSON.parse(readFileSync({json.dumps(EDGE_VEC)}, "utf8"));
+const edgeMsgs = {{
+  "empty": new Uint8Array(0),
+  "one-byte-zero": new Uint8Array([0]),
+  "chunk-1024": Uint8Array.from({{ length: 1024 }}, (_, i) => (i * 31) & 0xff),
+  "stream-16385-high-leaf": Uint8Array.from({{ length: 16385 }}, (_, i) => (i * 37 + 5) & 0xff),
+}};
+for (const e of edges) {{
+  if (!verify(vk, hex(e.ctx_hex), edgeMsgs[e.name], hex(e.imprint_hex))) {{
+    throw new Error("rejected edge vector " + e.name);
+  }}
+}}
+const [ns, rk, kk] = expandPool(mixPool(hex("01".repeat(32)), hex("02".repeat(32)), 4242, enc.encode("clock-reading")));
+const got = [ns, rk, kk, draw(rk, 0n)].map(toHex);
+const want = [
+  "e25f6194f016297e9ede065cdda5791ac021a69fbc0912e318ecb321d70f7d24",
+  "f3454e55d82b6e1350a46c01a4be23a55f9f6ebb51baadf364ee91fa11c3d84c",
+  "9f080816264c88adc6207059744e0d64f739a1b984e7db047fea9ffe15e47615",
+  "5f2db2b96c8a6873291819498bec87e7c5d514877f21f55452125372f93f034f",
+];
+if (JSON.stringify(got) !== JSON.stringify(want)) throw new Error("mixPool/draw mismatch: " + got.join(" "));
+"""
+    r_inproc = subprocess.run([node, "--input-type=module", "-e", ts_check_script], text=True, capture_output=True)
+    if r_inproc.returncode != 0:
+        fail(f"blincs.ts verification failed: rc={r_inproc.returncode} out={r_inproc.stdout!r} err={r_inproc.stderr!r}")
+    # Plus one real CLI smoke test (positive + negative):
     with tempfile.TemporaryDirectory(prefix="signet-ts-") as td:
         msg1 = os.path.join(td, "msg1.bin")
         open(msg1, "wb").write(b"hello, BLINCS")
         r = subprocess.run([node, ts_path, "--verify", REF_SIGNET_ID, REF_CTX.hex(), REF_IMP, msg1], text=True, capture_output=True)
         if r.returncode != 0 or r.stdout.strip() != "true":
-            fail(f"blincs.ts rejected reference-imprint-1.bin: rc={r.returncode} out={r.stdout!r} err={r.stderr!r}")
+            fail(f"blincs.ts CLI rejected reference-imprint-1.bin: rc={r.returncode} out={r.stdout!r} err={r.stderr!r}")
         rb = subprocess.run([node, ts_path, "--verify", REF_SIGNET_ID, "", REF_IMP, msg1], text=True, capture_output=True)
         if rb.returncode != 1 or rb.stdout.strip() != "false":
-            fail(f"blincs.ts did not reject wrong context: rc={rb.returncode} out={rb.stdout!r}")
-        # Negative TS checks: tampered signature byte, wrong SignetId, wrong imprint length.
-        tampered = bytearray(raw)
-        tampered[4096] ^= 1
-        tampered_path = os.path.join(td, "tampered.sig")
-        open(tampered_path, "wb").write(tampered)
-        rt = subprocess.run([node, ts_path, "--verify", REF_SIGNET_ID, REF_CTX.hex(), tampered_path, msg1], text=True, capture_output=True)
-        if rt.returncode != 1 or rt.stdout.strip() != "false":
-            fail(f"blincs.ts did not reject tampered signature: rc={rt.returncode} out={rt.stdout!r}")
-        wrong_id = f"{int(REF_SIGNET_ID[:2], 16) ^ 1:02x}" + REF_SIGNET_ID[2:]
-        ri = subprocess.run([node, ts_path, "--verify", wrong_id, REF_CTX.hex(), REF_IMP, msg1], text=True, capture_output=True)
-        if ri.returncode != 1 or ri.stdout.strip() != "false":
-            fail(f"blincs.ts did not reject wrong SignetId: rc={ri.returncode} out={ri.stdout!r}")
-        short_sig = os.path.join(td, "short.sig")
-        open(short_sig, "wb").write(raw[:-1])
-        rs = subprocess.run([node, ts_path, "--verify", REF_SIGNET_ID, REF_CTX.hex(), short_sig, msg1], text=True, capture_output=True)
-        if rs.returncode != 1 or rs.stdout.strip() != "false":
-            fail(f"blincs.ts did not reject truncated signature: rc={rs.returncode} out={rs.stdout!r}")
-        for entry in edge_entries:
-            sp = os.path.join(td, f"{entry['name']}.sig")
-            mp = os.path.join(td, f"{entry['name']}.msg")
-            open(sp, "wb").write(bytes.fromhex(entry["imprint_hex"]))
-            open(mp, "wb").write(EDGE_MSGS[entry["name"]])
-            re_ts = subprocess.run([node, ts_path, "--verify", REF_SIGNET_ID, entry["ctx_hex"], sp, mp], text=True, capture_output=True)
-            if re_ts.returncode != 0 or re_ts.stdout.strip() != "true":
-                fail(f"blincs.ts rejected edge vector {entry['name']}: rc={re_ts.returncode} out={re_ts.stdout!r} err={re_ts.stderr!r}")
-        mix = subprocess.run([node, ts_path, "--mix", "01" * 32 + ",aabb", "02" * 32, "clock-reading", "0"], text=True, capture_output=True)
-        expected_lines = [
-            "a927779e28c7d4d6e9b90fce92b7d968 fe3349e18bfbb00aa7c01e353a77116c60a815f9c4c2d2c0975b378013860ceb "
-            "c8957425119b74d75e27985c4a1dbc9854fa0ad485361642b13fb927e17770c2 a10872041d434e01fd6c8761bfc3f25e84a697c255c1dbd26959cec5c5ad1cc6",
-            "2654e875d07988376ff03a027fc5168c708341b72c01a97e29f143bc9429caea",
-        ]
-        if mix.returncode != 0 or mix.stdout.strip().splitlines() != expected_lines:
-            fail(f"blincs.ts --mix mismatch: rc={mix.returncode} out={mix.stdout!r} err={mix.stderr!r}")
+            fail(f"blincs.ts CLI did not reject wrong context: rc={rb.returncode} out={rb.stdout!r}")
 
 
 def main():

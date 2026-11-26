@@ -36,6 +36,7 @@ pub const IMPRINT_LEN: usize = 2 * N + FORS_LEN + LAYERS * LAYER_LEN;
 const _: () = {
     assert!(W == (CHAIN_STEPS as usize) + 1 && CHAINS == 35 && MSG_CHAINS * 4 == N * 8);
     assert!(FORS_TREES * FORS_HEIGHT == 160 && HYPER_BITS == 35 && HYPER_BITS < 48);
+    assert!(LAYERS <= 256 && TREE_LEAVES <= 65536 && FORS_TREES <= 65536 && FORS_HEIGHT <= 65535 && CHAINS <= 65536);
     assert!(IMPRINT_LEN == 7392 && 2 * N + FORS_LEN + 7 * LAYER_LEN == IMPRINT_LEN);
 };
 
@@ -49,7 +50,6 @@ pub(crate) const CTX_PUBLIC_HASH: &str = "BLINCS-128-7x5 2026-11-25 public hash"
 pub(crate) const CTX_CONTENT: &str = "BLINCS-128-7x5 2026-11-25 content";
 pub(crate) const CTX_GENERATE_SIGNET: &str = "Signet BLINCS-128-7x5 2026-11-25 generate signet";
 pub(crate) const CTX_MIX: &str = "Signet 2026-11-25 randomness: mix";
-pub(crate) const CTX_FILE_ID: &str = "Signet 2026-11-25 randomness: file id";
 pub(crate) const CTX_NEXT_SEED: &str = "Signet 2026-11-25 randomness: next seed";
 pub(crate) const CTX_RUN_KEY: &str = "Signet 2026-11-25 randomness: key of this run";
 pub(crate) const CTX_KEYGEN_KEY: &str = "Signet 2026-11-25 randomness: keygen key";
@@ -92,6 +92,9 @@ fn tree_hasher(key: &[u8; 32], use_sme2: bool) -> TreeHasher {
 }
 
 /// Separate newtypes for secret (`K_sec`) vs. public (`K_pub`) tree keys prevent cross-role mixups.
+///
+/// `SecretKey` exposes only the exact secret-domain batch derivations (`ChainSecret` and
+/// `FewSecret`) and never hands out a raw `TreeHasher`, so public-tweak callers cannot misuse it.
 #[derive(Clone, Copy)]
 pub(crate) struct SecretKey([u8; 32]);
 
@@ -100,8 +103,38 @@ impl SecretKey {
         Self(derive_key(CTX_SECRET_VALUES, seed))
     }
 
-    pub(crate) fn hasher(&self, use_sme2: bool) -> TreeHasher {
-        tree_hasher(&self.0, use_sme2)
+    /// Derive all `TREE_LEAVES * CHAINS` WOTS+ start values for hypertree `(layer, tree)`.
+    pub(crate) fn derive_wots_tree_starts(&self, layer: Layer, tree: u64, b16: &mut [[u8; 16]], out: &mut [[u8; 32]]) {
+        assert!(tree < layer.trees());
+        let layer_u8 = layer.as_u8();
+        let total = TREE_LEAVES * CHAINS;
+        for i in 0..TREE_LEAVES {
+            let leaf = u16::try_from(i).unwrap();
+            for c in 0..CHAINS {
+                b16[i * CHAINS + c] = tweak(TweakKind::ChainSecret, layer_u8, tree, leaf, u16::try_from(c).unwrap(), 0);
+            }
+        }
+        tree_hasher(&self.0, true).hash_many(&b16[..total], &mut out[..total]);
+    }
+
+    /// Derive the `CHAINS` WOTS+ start values for one hypertree leaf `(layer, tree, leaf)`.
+    pub(crate) fn derive_wots_leaf_starts(&self, layer: Layer, tree: u64, leaf: u16) -> [[u8; N]; CHAINS] {
+        assert!(tree < layer.trees() && usize::from(leaf) < TREE_LEAVES);
+        let layer_u8 = layer.as_u8();
+        let mut b16 = [[0u8; 16]; CHAINS];
+        let mut hashes = [[0u8; 32]; CHAINS];
+        for (c, slot) in b16.iter_mut().enumerate() {
+            *slot = tweak(TweakKind::ChainSecret, layer_u8, tree, leaf, u16::try_from(c).unwrap(), 0);
+        }
+        tree_hasher(&self.0, false).hash_many(&b16[..], &mut hashes[..]);
+        core::array::from_fn(|c| first_n(&hashes[c]))
+    }
+
+    /// Derive all `FORS_LEAVES` secret values for one FORS tree `fors_tree` under `leaf_addr`.
+    pub(crate) fn derive_fors_tree_secrets(&self, leaf_addr: LeafAddr, fors_tree: u16, out: &mut [[u8; 32]]) {
+        assert!(usize::from(fors_tree) < FORS_TREES && out.len() == FORS_LEAVES);
+        let secret_template = tweak(TweakKind::FewSecret, 0, leaf_addr.as_u64(), fors_tree, 0, 0);
+        tree_hasher(&self.0, true).hash_counter_range(&secret_template, 3, 0, out);
     }
 }
 

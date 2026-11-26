@@ -32,25 +32,25 @@ Measured on a quiet Apple M6 (`bench/`, `blake3-servil-core = "=0.11.0"`, single
 
 | Operation (1 core) | Wall time | Core cycles | Instructions | IPC | Clock | Throughput |
 |---|---:|---:|---:|---:|---:|---:|
-| `Signet::from_seed` (1 KiB top tree, no disk cache) | **170.2 µs** | 696.5k | 916.9k | 1.32 | 4,093 MHz | **5,875 / s** |
-| `Signet::imprint` 64 B | **1.25 ms** | 5.15M | 8.41M | 1.63 | 4,128 MHz | **800 / s** |
-| `Signet::imprint_reader` 64 B | **1.25 ms** | 5.15M | 8.41M | 1.63 | 4,128 MHz | **800 / s** |
-| `SignetId::verify` 64 B | **34.2 µs** | 158.9k | 1.12M | **7.02** | 4,653 MHz | **29,200 / s** |
-| `SignetId::verify_reader` 64 B | **34.3 µs** | 159.5k | 1.12M | **7.01** | 4,655 MHz | **29,200 / s** |
-| `SignetId::verify` 1 KiB | 35.7 µs | 165.7k | 1.17M | 7.08 | 4,641 MHz | — |
-| `SignetId::verify` 64 KiB | 49.2 µs | 210.0k | 1.23M | 5.86 | 4,274 MHz | 1,333 MB/s |
-| `SignetId::verify` 256 KiB | 72.1 µs | 320.6k | 1.56M | 4.87 | 4,446 MHz | 3,634 MB/s |
-| `SignetId::verify_reader` 256 KiB | 100.0 µs | 427.5k | 1.55M | 3.63 | 4,277 MHz | 2,622 MB/s |
-| `Signet::imprint` 1 MiB | **1.39 ms** | 5.75M | 10.70M | 1.86 | 4,152 MHz | 757 MB/s |
-| `SignetId::verify` 1 MiB | 171.0 µs | 762.7k | 3.44M | 4.51 | 4,462 MHz | 6,133 MB/s |
-| `SignetId::verify_reader` 1 MiB | 295.5 µs | 1.21M | 2.75M | 2.26 | 4,108 MHz | 3,548 MB/s |
-| `Signet::imprint` 16 MiB | **3.50 ms** | 14.96M | 45.61M | 3.05 | 4,282 MHz | **4,799 MB/s** |
-| `SignetId::verify` 16 MiB | **2.28 ms** | 9.96M | 38.33M | 3.85 | 4,373 MHz | **7,366 MB/s** |
-| `Signet::imprint` 100 MiB | **16.28 ms** | 70.99M | 241.05M | 3.40 | 4,362 MHz | **6,440 MB/s** |
-| `Signet::imprint_reader` 100 MiB (16 KiB stack buf) | 25.59 ms | 103.54M | 168.37M | 1.63 | 4,049 MHz | 4,098 MB/s |
-| `SignetId::verify` 100 MiB | **15.09 ms** | 66.09M | 233.79M | 3.54 | 4,383 MHz | **6,951 MB/s** |
-| `SignetId::verify_reader` 100 MiB (16 KiB stack buf) | 24.32 ms | 98.30M | 161.11M | 1.64 | 4,044 MHz | 4,311 MB/s |
-| `Randomness::initialize` (lock-free seed dir) | 72.0 µs | 326.0k | 1.55M | 4.75 | 4,550 MHz | — |
+| `Signet::from_seed` (1 KiB top tree, no disk cache) | **170.1 µs** | 695.6k | 984.4k | 1.42 | 4,091 MHz | **5,879 / s** |
+| `Signet::imprint` 64 B | **1.24 ms** | 5.13M | 8.74M | 1.70 | 4,124 MHz | **806 / s** |
+| `Signet::imprint_with` 64 B | **1.24 ms** | 5.13M | 8.74M | 1.70 | 4,124 MHz | **806 / s** |
+| `SignetId::verify` 64 B | **34.3 µs** | 158.3k | 1.11M | **7.01** | 4,616 MHz | **29,200 / s** |
+| `SignetId::verify_with` 64 B | **34.8 µs** | 160.4k | 1.12M | **6.98** | 4,613 MHz | **28,700 / s** |
+| `SignetId::verify` 1 KiB | 35.1 µs | 161.5k | 1.13M | 7.02 | 4,607 MHz | — |
+| `SignetId::verify` 64 KiB | 47.3 µs | 201.0k | 1.16M | 5.78 | 4,255 MHz | 1,387 MB/s |
+| `SignetId::verify` 256 KiB | 72.5 µs | 322.4k | 1.57M | 4.86 | 4,447 MHz | 3,615 MB/s |
+| `SignetId::verify_with` 256 KiB | 101.5 µs | 433.9k | 1.61M | 3.71 | 4,277 MHz | 2,583 MB/s |
+| `Signet::imprint` 1 MiB | **1.38 ms** | 5.73M | 11.03M | 1.93 | 4,149 MHz | 759 MB/s |
+| `SignetId::verify` 1 MiB | 171.2 µs | 763.6k | 3.44M | 4.50 | 4,461 MHz | 6,124 MB/s |
+| `SignetId::verify_with` 1 MiB | 300.9 µs | 1.24M | 2.87M | 2.32 | 4,116 MHz | 3,485 MB/s |
+| `Signet::imprint` 16 MiB | **3.51 ms** | 15.01M | 45.94M | 3.06 | 4,281 MHz | **4,781 MB/s** |
+| `SignetId::verify` 16 MiB | **2.29 ms** | 10.00M | 38.35M | 3.83 | 4,373 MHz | **7,330 MB/s** |
+| `Signet::imprint` 100 MiB | **16.29 ms** | 70.96M | 241.38M | 3.40 | 4,359 MHz | **6,438 MB/s** |
+| `Signet::imprint_with` 100 MiB (`Sink` / `io::copy`) | 27.73 ms | 112.00M | 181.59M | 1.62 | 4,041 MHz | 3,782 MB/s |
+| `SignetId::verify` 100 MiB | **15.05 ms** | 65.91M | 233.76M | 3.55 | 4,381 MHz | **6,966 MB/s** |
+| `SignetId::verify_with` 100 MiB (`Sink` / `io::copy`) | 26.31 ms | 106.29M | 173.97M | 1.64 | 4,041 MHz | 3,985 MB/s |
+| `Randomness::initialize` (lock-free atomic file) | 92.9 µs | 421.3k | 2.17M | 5.16 | 4,536 MHz | — |
 
 ## 3. Reproducing
 

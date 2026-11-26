@@ -21,13 +21,24 @@
 //!
 //! const RELEASE_CTX: Context<'static> = Context::new(b"example.org release manifest v1");
 //!
-//! Randomness::create("/path/to/signet.state.d")?;
-//! let randomness = Randomness::initialize("/path/to/signet.state.d")?;
+//! Randomness::create("/path/to/signet.salt")?;
+//! let randomness = Randomness::initialize("/path/to/signet.salt")?;
 //! let publisher = Signet::generate(&randomness)?;
 //! let expected_publisher: SignetId = publisher.id();
 //!
 //! let imprint = publisher.imprint(&randomness, RELEASE_CTX, b"hello, BLINCS");
 //! expected_publisher.verify(RELEASE_CTX, b"hello, BLINCS", &imprint)?;
+//!
+//! // Streaming or structured messages push bytes into a `Sink` (which implements `std::io::Write`):
+//! let streamed = publisher.imprint_with(&randomness, RELEASE_CTX, |sink| {
+//!     sink.update(b"hello, ");
+//!     sink.update(b"BLINCS");
+//!     Ok::<(), std::io::Error>(())
+//! })?;
+//! expected_publisher.verify_with(RELEASE_CTX, &streamed, |sink| {
+//!     std::io::copy(&mut &b"hello, BLINCS"[..], sink)?;
+//!     Ok::<(), std::io::Error>(())
+//! })?;
 //!
 //! // A valid imprint from a different signet or a different context must be rejected.
 //! let other = Signet::generate(&randomness)?;
@@ -48,10 +59,11 @@ mod randomness;
 #[cfg(test)]
 mod test;
 
+pub use content::Sink;
 pub use params::{IMPRINT_LEN, MAX_CONTEXT_LEN, SEED_LEN, SIGNET_ID_LEN, SUITE_NAME};
 pub use randomness::Randomness;
 
-use content::{content_from_reader, content_from_slice};
+use content::{content_from_slice, content_with};
 use few_time::{build_all_fors, fors_verify, parse_digest};
 use one_time::{Pos, SignWorkspace, build_tree_heap, verify_layer, write_layer_signature};
 use params::{
@@ -62,7 +74,7 @@ use randomness::read_os_randomness;
 use std::array::TryFromSliceError;
 use std::error::Error;
 use std::fmt;
-use std::io::{self, Read};
+use std::io;
 
 /// Error returned when a [`Context`] exceeds [`MAX_CONTEXT_LEN`] (`255`) bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,6 +124,14 @@ impl<'a> Context<'a> {
     pub const fn as_bytes(&self) -> &'a [u8] {
         self.0
     }
+
+    /// Write the length-prefixed frame `u8(len) || bytes` into `dst` and return bytes written (`1 + len`).
+    pub(crate) fn write_framed(&self, dst: &mut [u8]) -> usize {
+        let len = self.0.len();
+        dst[0] = u8::try_from(len).unwrap();
+        dst[1..1 + len].copy_from_slice(self.0);
+        1 + len
+    }
 }
 
 impl<'a> TryFrom<&'a [u8]> for Context<'a> {
@@ -134,40 +154,40 @@ impl fmt::Display for InvalidImprint {
 
 impl Error for InvalidImprint {}
 
-/// Error returned by [`SignetId::verify_reader`], distinguishing stream I/O failure from an invalid imprint.
+/// Error returned by [`SignetId::verify_with`], distinguishing producer failure from an invalid imprint.
 #[derive(Debug)]
-pub enum VerifyError {
-    /// Reading the message stream failed.
-    Io(io::Error),
-    /// The imprint is not valid for this [`SignetId`], [`Context`], and stream.
+pub enum VerifyError<E = io::Error> {
+    /// Producing the message bytes failed.
+    Source(E),
+    /// The imprint is not valid for this [`SignetId`], [`Context`], and message.
     Invalid,
 }
 
-impl fmt::Display for VerifyError {
+impl<E: fmt::Display> fmt::Display for VerifyError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(e) => write!(f, "failed to read message stream: {e}"),
+            Self::Source(e) => write!(f, "failed to produce message bytes: {e}"),
             Self::Invalid => f.write_str("invalid BLINCS imprint"),
         }
     }
 }
 
-impl Error for VerifyError {
+impl<E: Error + 'static> Error for VerifyError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Io(e) => Some(e),
+            Self::Source(e) => Some(e),
             Self::Invalid => None,
         }
     }
 }
 
-impl From<io::Error> for VerifyError {
+impl From<io::Error> for VerifyError<io::Error> {
     fn from(err: io::Error) -> Self {
-        Self::Io(err)
+        Self::Source(err)
     }
 }
 
-impl From<InvalidImprint> for VerifyError {
+impl<E> From<InvalidImprint> for VerifyError<E> {
     fn from(_: InvalidImprint) -> Self {
         Self::Invalid
     }
@@ -189,24 +209,20 @@ const MSG_DIGEST_INPUT_MAX_LEN: usize = 16 + N + N + SHORT_LEN + 1 + MAX_CONTEXT
 const _: () = assert!(RANDOMIZER_INPUT_MAX_LEN == 304 && MSG_DIGEST_INPUT_MAX_LEN == 352);
 
 pub(crate) fn compute_randomizer(randomizer_key: &[u8; 32], short: &[u8; SHORT_LEN], ctx: Context<'_>) -> [u8; N] {
-    let ctx_bytes = ctx.as_bytes();
     let mut buf = [0u8; RANDOMIZER_INPUT_MAX_LEN];
     buf[..SHORT_LEN].copy_from_slice(short);
-    buf[SHORT_LEN] = u8::try_from(ctx_bytes.len()).unwrap();
-    buf[SHORT_LEN + 1..SHORT_LEN + 1 + ctx_bytes.len()].copy_from_slice(ctx_bytes);
-    first_n(&keyed(randomizer_key, &buf[..SHORT_LEN + 1 + ctx_bytes.len()]))
+    let ctx_len = ctx.write_framed(&mut buf[SHORT_LEN..]);
+    first_n(&keyed(randomizer_key, &buf[..SHORT_LEN + ctx_len]))
 }
 
 pub(crate) fn compute_message_digest(public_key: &PublicKey, randomizer: &[u8; N], root: &[u8; N], short: &[u8; SHORT_LEN], ctx: Context<'_>) -> [u8; 32] {
-    let ctx_bytes = ctx.as_bytes();
     let mut buf = [0u8; MSG_DIGEST_INPUT_MAX_LEN];
     buf[..16].copy_from_slice(&tweak(TweakKind::Message, 0, 0, 0, 0, 0));
     buf[16..32].copy_from_slice(randomizer);
     buf[32..48].copy_from_slice(root);
     buf[48..96].copy_from_slice(short);
-    buf[96] = u8::try_from(ctx_bytes.len()).unwrap();
-    buf[97..97 + ctx_bytes.len()].copy_from_slice(ctx_bytes);
-    public_key.keyed(&buf[..97 + ctx_bytes.len()])
+    let ctx_len = ctx.write_framed(&mut buf[96..]);
+    public_key.keyed(&buf[..96 + ctx_len])
 }
 
 /// A 7,392-byte BLINCS-128-7x5 imprint (proof produced by pressing a [`Signet`] onto a context and message).
@@ -315,14 +331,18 @@ impl SignetId {
         self.verify_short(ctx, &short, imprint)
     }
 
-    /// Verify that `imprint` was made by this signet for `ctx` and a streaming `reader` in one salted pass
-    /// (zero heap allocation; uses a local zero-initialized 16 KiB stack buffer).
+    /// Verify that `imprint` was made by this signet for `ctx` and bytes streamed into [`Sink`]
+    /// by `produce` in one salted pass (zero heap allocation).
     ///
-    /// Fails closed: returns `Ok(())` only if the stream read succeeds and the imprint is valid.
-    /// Verify against an expected [`SignetId`] obtained from a pinned or authenticated channel.
+    /// Fails closed: returns `Ok(())` only if `produce` succeeds without overflow and the imprint
+    /// is valid. For any `std::io::Read` source, call `std::io::copy(&mut reader, sink)` inside
+    /// `produce`. Verify against an expected [`SignetId`] obtained from a pinned or authenticated
+    /// channel.
     #[must_use = "imprint verification result must be checked"]
-    pub fn verify_reader(&self, ctx: Context<'_>, reader: impl Read, imprint: &Imprint) -> Result<(), VerifyError> {
-        let short = content_from_reader(&self.content_key, imprint.salt(), ctx, reader)?;
+    pub fn verify_with<E>(&self, ctx: Context<'_>, imprint: &Imprint, produce: impl FnOnce(&mut Sink) -> Result<(), E>) -> Result<(), VerifyError<E>> {
+        let Some(short) = content_with(&self.content_key, imprint.salt(), ctx, produce).map_err(VerifyError::Source)? else {
+            return Err(VerifyError::Invalid);
+        };
         self.verify_short(ctx, &short, imprint)?;
         Ok(())
     }
@@ -449,10 +469,15 @@ impl Signet {
         self.finish_imprint(ctx, &short)
     }
 
-    pub(crate) fn imprint_reader_with_draw(&self, draw: &[u8; 32], ctx: Context<'_>, reader: impl Read) -> io::Result<Imprint> {
+    pub(crate) fn imprint_with_draw_stream<E>(
+        &self,
+        draw: &[u8; 32],
+        ctx: Context<'_>,
+        produce: impl FnOnce(&mut Sink) -> Result<(), E>,
+    ) -> Result<Imprint, E> {
         ensure_init();
         let salt = first_n(&keyed(&self.salt_key, draw));
-        let short = content_from_reader(&self.id.content_key, &salt, ctx, reader)?;
+        let short = content_with(&self.id.content_key, &salt, ctx, produce)?.expect("stream length exceeds u64::MAX");
         Ok(self.finish_imprint(ctx, &short))
     }
 
@@ -466,13 +491,16 @@ impl Signet {
         self.imprint_with_draw(&draw, ctx, message)
     }
 
-    /// Imprint a streaming `reader` under `ctx` in one salted pass, drawing fresh per-imprint
-    /// randomness from `randomness`.
+    /// Imprint bytes streamed into [`Sink`] by `produce` under `ctx` in one salted pass, drawing
+    /// fresh per-imprint randomness from `randomness`.
     ///
-    /// Self-verifies the finished imprint against `short` before returning. Do not imprint more
-    /// than 2³² things with one signet.
-    pub fn imprint_reader(&self, randomness: &Randomness, ctx: Context<'_>, reader: impl Read) -> io::Result<Imprint> {
+    /// Signet chooses the fresh salt and initializes keyed BLAKE3 before invoking `produce`; if
+    /// `produce` returns `Err(e)`, imprinting aborts and returns `Err(e)`. For any `std::io::Read`
+    /// source, call `std::io::copy(&mut reader, sink)` inside `produce`. Self-verifies the
+    /// finished imprint against `short` before returning. Do not imprint more than 2³² things with
+    /// one signet.
+    pub fn imprint_with<E>(&self, randomness: &Randomness, ctx: Context<'_>, produce: impl FnOnce(&mut Sink) -> Result<(), E>) -> Result<Imprint, E> {
         let draw = randomness.draw();
-        self.imprint_reader_with_draw(&draw, ctx, reader)
+        self.imprint_with_draw_stream(&draw, ctx, produce)
     }
 }

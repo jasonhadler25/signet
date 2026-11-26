@@ -2,7 +2,7 @@ include!("../tools/require_nextest.rs");
 
 use signet::{Context, Imprint, InvalidImprint, Randomness, SEED_LEN, Signet, SignetId};
 use std::fs;
-use std::io::Cursor;
+use std::io::{self, Cursor};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -28,9 +28,9 @@ fn to_hex(bytes: &[u8]) -> String {
 #[test]
 fn public_api_round_trip_and_python_reference_cross_check() {
     let dir = temp_dir("cross-check");
-    let state_dir = dir.join("state.d");
-    Randomness::create(&state_dir).unwrap();
-    let rng = Randomness::initialize(&state_dir).unwrap();
+    let state_file = dir.join("signet.salt");
+    Randomness::create(&state_file).unwrap();
+    let rng = Randomness::initialize(&state_file).unwrap();
 
     let publisher = Signet::generate(&rng).unwrap();
     let expected_publisher = SignetId::from_bytes(publisher.id().as_bytes());
@@ -43,7 +43,12 @@ fn public_api_round_trip_and_python_reference_cross_check() {
         let msg: Vec<u8> = (0..len).map(|i| u8::try_from((i * 73 + 11) & 0xff).unwrap()).collect();
         let sig = publisher.imprint(&rng, INT_CTX, &msg);
         expected_publisher.verify(INT_CTX, &msg, &sig).unwrap();
-        expected_publisher.verify_reader(INT_CTX, Cursor::new(&msg), &sig).unwrap();
+        expected_publisher
+            .verify_with(INT_CTX, &sig, |sink| {
+                io::copy(&mut Cursor::new(&msg), sink)?;
+                Ok::<(), io::Error>(())
+            })
+            .unwrap();
 
         // Differential cross-check against standalone #![no_std] `signet-verify` (one-shot + streaming).
         let nostd_id = signet_verify::SignetId::from_bytes(expected_publisher.as_bytes());
@@ -76,7 +81,13 @@ fn public_api_round_trip_and_python_reference_cross_check() {
 
     // Two signatures of the same message have distinct salts (different draws).
     let s1 = publisher.imprint(&rng, INT_CTX, b"same message");
-    let s2 = publisher.imprint_reader(&rng, INT_CTX, Cursor::new(b"same message")).unwrap();
+    let s2 = publisher
+        .imprint_with(&rng, INT_CTX, |sink| {
+            sink.update(b"same ");
+            sink.update(b"message");
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
     assert_ne!(&s1.as_bytes()[..16], &s2.as_bytes()[..16]);
     expected_publisher.verify(INT_CTX, b"same message", &s1).unwrap();
     expected_publisher.verify(INT_CTX, b"same message", &s2).unwrap();

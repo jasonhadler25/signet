@@ -18,21 +18,18 @@ pub(crate) struct SignWorkspace {
     pub b48: Vec<[u8; 48]>,
     pub b_pk: Batch<'static>,
     pub out: Vec<[u8; 32]>,
-    pub fors_nodes: Vec<[u8; N]>,
 }
 
 impl SignWorkspace {
     pub(crate) fn new(for_imprint: bool) -> Self {
         let batch_32 = if for_imprint { FORS_TOTAL_LEAVES } else { WOTS_BATCH_SLOTS };
         let batch_48 = if for_imprint { MERKLE_BATCH_SLOTS } else { TREE_LEAVES / 2 };
-        let fors_len = if for_imprint { FORS_TOTAL_LEAVES } else { 0 };
         Self {
             b16: vec![[0u8; 16]; WOTS_BATCH_SLOTS],
             b32: vec![[0u8; 32]; batch_32],
             b48: vec![[0u8; 48]; batch_48],
             b_pk: Batch::new(16 + N * CHAINS, TREE_LEAVES),
             out: vec![[0u8; 32]; batch_32],
-            fors_nodes: vec![[0u8; N]; fors_len],
         }
     }
 }
@@ -111,15 +108,9 @@ pub(crate) fn advance_chains(public: &TreeHasher, pos: Pos, values: &mut [[u8; N
 pub(crate) fn build_tree_heap(secret: &SecretKey, public: &PublicKey, layer: Layer, tree: u64, ws: &mut SignWorkspace) -> [[u8; N]; 2 * TREE_LEAVES] {
     assert!(tree < layer.trees());
     let layer_u8 = layer.as_u8();
-    let (sec_h, pub_h) = (secret.hasher(true), public.hasher(true));
+    let pub_h = public.hasher(true);
 
-    for i in 0..TREE_LEAVES {
-        let leaf = u16::try_from(i).unwrap();
-        for c in 0..CHAINS {
-            ws.b16[i * CHAINS + c] = tweak(TweakKind::ChainSecret, layer_u8, tree, leaf, u16::try_from(c).unwrap(), 0);
-        }
-    }
-    sec_h.hash_many(&ws.b16[..WOTS_BATCH_SLOTS], &mut ws.out[..WOTS_BATCH_SLOTS]);
+    secret.derive_wots_tree_starts(layer, tree, &mut ws.b16, &mut ws.out);
 
     for i in 0..TREE_LEAVES {
         let leaf = u16::try_from(i).unwrap();
@@ -179,15 +170,8 @@ pub(crate) fn build_tree_heap(secret: &SecretKey, public: &PublicKey, layer: Lay
 pub(crate) fn write_layer_signature(secret: &SecretKey, public: &PublicKey, pos: Pos, node: &[u8; N], tree_nodes: &[[u8; N]; 2 * TREE_LEAVES], out: &mut [u8]) {
     assert_eq!(out.len(), LAYER_LEN);
 
-    let (sec_h, pub_h) = (secret.hasher(false), public.hasher(false));
-    let layer_u8 = pos.layer.as_u8();
-    let mut b16 = [[0u8; 16]; CHAINS];
-    let mut hashes = [[0u8; 32]; CHAINS];
-    for (c, slot) in b16.iter_mut().enumerate() {
-        *slot = tweak(TweakKind::ChainSecret, layer_u8, pos.tree, pos.leaf, u16::try_from(c).unwrap(), 0);
-    }
-    sec_h.hash_many(&b16[..], &mut hashes[..]);
-    let mut values: [[u8; N]; CHAINS] = core::array::from_fn(|c| first_n(&hashes[c]));
+    let pub_h = public.hasher(false);
+    let mut values = secret.derive_wots_leaf_starts(pos.layer, pos.tree, pos.leaf);
     advance_chains(&pub_h, pos, &mut values, &[0u8; CHAINS], &digits(node));
 
     for c in 0..CHAINS {

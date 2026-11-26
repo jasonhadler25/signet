@@ -34,30 +34,7 @@ jobs:
           rm /tmp/nextest.tar.gz
           cargo nextest --version
 
-      - name: Fetch crates and verify Cargo.lock hashsets (BLAKE3 + SHA-256) before building
-        run: |
-          cargo fetch --locked
-          python3 tools/cargo_lock_hashsets.py
-
-      - name: Format, lint, and rustdoc
-        run: |
-          cargo fmt --all -- --check
-          cargo clippy --workspace --all-targets --locked -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
-
-      - name: Unit, integration, doc tests, unpacked crate verification, and freestanding WASM execution
-        run: |
-          cargo nextest run --workspace --locked
-          cargo test --workspace --doc --locked
-          cargo package -p signet --locked
-          cargo package -p signet-verify --locked
-          cargo build --manifest-path wasm-test/Cargo.toml --target wasm32-unknown-unknown --release --locked
-          node wasm-test/run_wasm.mjs
-
-      - name: Python & TypeScript references, optimizer self-check, safety counts, domain separation, and vector digests (SHA-256 + BLAKE3)
+      - name: Run full landing gate (tools/land.py)
         run: |
           node --version
-          python3 tools/land.py --skip-clean-check --skip-rust
-
-      - name: Planted-fault controls
-        run: python3 tools/controls.py
+          python3 tools/land.py --skip-clean-check

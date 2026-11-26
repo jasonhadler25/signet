@@ -4,7 +4,7 @@
 
 use signet::{Context, Randomness, SEED_LEN, Signet, SignetId};
 use std::hint::black_box;
-use std::io::Cursor;
+use std::io::{self, Cursor};
 
 const BENCH_CTX: Context<'static> = Context::new(b"signet bench v1");
 
@@ -88,7 +88,7 @@ fn main() {
     let dir = std::env::temp_dir().join(format!("blincs-bench-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let state = dir.join("state.d");
+    let state = dir.join("signet.salt");
     Randomness::create(&state).unwrap();
     let rng = Randomness::initialize(&state).unwrap();
 
@@ -132,14 +132,26 @@ fn main() {
 
         if len == 64 || len == 262144 || len == 1024 * 1024 || len == 100 * 1024 * 1024 {
             let sr = clocks::measure(10, 150_000_000, || {
-                black_box(sk.imprint_reader(&rng, BENCH_CTX, Cursor::new(black_box(&msg))).unwrap());
+                black_box(
+                    sk.imprint_with(&rng, BENCH_CTX, |sink| {
+                        io::copy(&mut Cursor::new(black_box(&msg)), sink)?;
+                        Ok::<(), io::Error>(())
+                    })
+                    .unwrap(),
+                );
             });
-            report(&format!("sign_reader {label}"), &sr, if len >= 65536 { len as u64 } else { 0 });
+            report(&format!("imprint_with {label}"), &sr, if len >= 65536 { len as u64 } else { 0 });
 
             let vr = clocks::measure(10, 100_000_000, || {
-                assert!(black_box(vk.verify_reader(BENCH_CTX, Cursor::new(black_box(&msg)), black_box(&sig))).is_ok());
+                assert!(
+                    black_box(vk.verify_with(BENCH_CTX, black_box(&sig), |sink| {
+                        io::copy(&mut Cursor::new(black_box(&msg)), sink)?;
+                        Ok::<(), io::Error>(())
+                    }))
+                    .is_ok()
+                );
             });
-            report(&format!("verify_reader {label}"), &vr, if len >= 65536 { len as u64 } else { 0 });
+            report(&format!("verify_with {label}"), &vr, if len >= 65536 { len as u64 } else { 0 });
         }
     }
 

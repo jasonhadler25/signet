@@ -135,6 +135,13 @@ impl<'a> Context<'a> {
     pub const fn as_bytes(&self) -> &'a [u8] {
         self.0
     }
+
+    fn write_framed(&self, dst: &mut [u8]) -> usize {
+        let len = self.0.len();
+        dst[0] = u8::try_from(len).unwrap();
+        dst[1..1 + len].copy_from_slice(self.0);
+        1 + len
+    }
 }
 
 /// Returned by [`SignetId::verify`] when an imprint does not verify against the expected
@@ -244,12 +251,10 @@ impl SignetId {
     }
 
     fn derive_msg_key(&self, salt: &[u8; N], ctx: Context<'_>) -> [u8; 32] {
-        let ctx_bytes = ctx.as_bytes();
         let mut buf = [0u8; N + 1 + MAX_CONTEXT_LEN];
         buf[..N].copy_from_slice(salt);
-        buf[N] = u8::try_from(ctx_bytes.len()).unwrap();
-        buf[N + 1..N + 1 + ctx_bytes.len()].copy_from_slice(ctx_bytes);
-        keyed(&self.content_key, &buf[..N + 1 + ctx_bytes.len()])
+        let ctx_len = ctx.write_framed(&mut buf[N..]);
+        keyed(&self.content_key, &buf[..N + ctx_len])
     }
 
     /// Verify a `7,392`-byte imprint over `message` under `ctx` in one pass (zero heap allocations).
@@ -398,16 +403,14 @@ fn pack_short(salt: &[u8; N], msg_hash: &[u8; 32]) -> [u8; SHORT_LEN] {
 }
 
 fn compute_message_digest(pub_key: &[u8; 32], randomizer: &[u8; N], root: &[u8; N], short: &[u8; SHORT_LEN], ctx: Context<'_>) -> [u8; 32] {
-    let ctx_bytes = ctx.as_bytes();
     let mut input = [0u8; MSG_DIGEST_INPUT_MAX_LEN];
     input[..16].copy_from_slice(&tweak(TweakKind::Message, 0, 0, 0, 0, 0));
     input[16..16 + N].copy_from_slice(randomizer);
     input[16 + N..16 + 2 * N].copy_from_slice(root);
     input[16 + 2 * N..16 + 2 * N + SHORT_LEN].copy_from_slice(short);
     let len_off = 16 + 2 * N + SHORT_LEN;
-    input[len_off] = u8::try_from(ctx_bytes.len()).unwrap();
-    input[len_off + 1..len_off + 1 + ctx_bytes.len()].copy_from_slice(ctx_bytes);
-    keyed(pub_key, &input[..len_off + 1 + ctx_bytes.len()])
+    let ctx_len = ctx.write_framed(&mut input[len_off..]);
+    keyed(pub_key, &input[..len_off + ctx_len])
 }
 
 fn parse_digest(digest: &[u8; 32]) -> ([u8; FORS_TREES], u64) {

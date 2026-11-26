@@ -54,7 +54,6 @@ Every derived 32-byte key uses a distinct UTF-8 context string. All algorithm ke
 | `CONTENT` | `"BLINCS-128-7x5 2026-11-25 content"` |
 | `GENERATE_SIGNET` | `"Signet BLINCS-128-7x5 2026-11-25 generate signet"` |
 | `MIX` | `"Signet 2026-11-25 randomness: mix"` |
-| `FILE_ID` | `"Signet 2026-11-25 randomness: file id"` |
 | `NEXT_SEED` | `"Signet 2026-11-25 randomness: next seed"` |
 | `RUN_KEY` | `"Signet 2026-11-25 randomness: key of this run"` |
 | `KEYGEN_KEY` | `"Signet 2026-11-25 randomness: keygen key"` |
@@ -210,20 +209,21 @@ Wire layout of an `Imprint` (`7,392` bytes):
 
 The BLINCS wire format does not depend on how the signer chooses `draw`; the scheme below is Signet's local host policy for keeping `draw` non-repeating across restarts without file locking (`flock`).
 
-State lives in a private directory on a trusted local filesystem (created once with `Randomness::create`, mode `0700` on Unix) containing a `.stage/` staging subdirectory (`0700`) and one or more regular files named `signet-r2-<32 lowercase hex chars>`, each holding **exact 32 raw bytes**:
+State lives in a single private regular file on a trusted local filesystem (created once with `Randomness::create`, mode `0600` on Unix) holding **exact 32 raw bytes**:
 
 1. **State mixing (`mix_pool` and `expand_pool`):**
-   Given seed file contents `s_0, ..., s_{m-1}` sorted by filename (each `32` bytes), 32 bytes `system` from OS cryptographic randomness (`getrandom(2)` / `getentropy`), and opaque `clock` bytes from the monotonic clock:
+   Given optional prior 32-byte state `prior` (`None` on `create`, `Some(prior)` on `initialize`), 32 bytes `system` from OS cryptographic randomness (`getrandom(2)` / `getentropy`), 4-byte little-endian process ID `pid`, and opaque `clock` bytes from the monotonic clock:
    ```text
-   material   = (u8(len(s_0)) || s_0) || ... || (u8(len(s_{m-1})) || s_{m-1}) || 0xff || system || clock
+   prefix     = 0x00 (on create)  or  0x20 || prior (on initialize)
+   material   = prefix || system || u32_le(pid) || clock
    pool       = Derive(MIX,        material)
-   file_id    = Derive(FILE_ID,    pool)[..16]    # pool-derived filename, domain-separated from secrets below
-   next_seed  = Derive(NEXT_SEED,  pool)          # 32 bytes published inside signet-r2-<hex(file_id)>
+   next_seed  = Derive(NEXT_SEED,  pool)          # 32 bytes atomically renamed onto the state file
    run_key    = Derive(RUN_KEY,    pool)          # in-memory key for per-imprint draws
    keygen_key = Derive(KEYGEN_KEY, pool)          # in-memory key for Signet::generate
    ```
-2. **Staged lock-free directory update (`Randomness::initialize`):**
-   Check that the directory is a private (`0700`) non-symlink directory, then read all `signet-r2-<32hex>` regular files (ignoring only the `.stage` directory; rejecting symlinks, unexpected entries, empty/truncated/oversized files, or an empty directory without modifying anything; re-scanning if concurrent rotation unlinks listed entries before open). Compute `pool`, write all 32 bytes of `next_seed` to a fresh `0600` temp file in `.stage/`, and publish `signet-r2-<hex(file_id)>` atomically via no-replace `hard_link` (then unlink the temp file). No partial seed file is ever visible in the seed directory. If `AlreadyExists` occurs, advance `pool = Derive(MIX, pool)` and retry up to 64 times. After publishing the successor, unlink the old filenames that were read (ignoring `NotFound`). `create` syncs the staged file, seed directory, and parent directory; `initialize` omits `fsync` for low startup latency (best-effort across power loss).
+   Splitting `next_seed` from `run_key`/`keygen_key` preserves forward secrecy on disk: reading the persisted file after a run does not reveal that run's draws.
+2. **Lock-free atomic state rotation (`Randomness::initialize`):**
+   Check that the path is a private (`0600`) regular non-symlink file and read its exact 32 bytes (failing closed without modifying anything on missing paths, symlinks, directories, group/world-accessible permissions, or wrong lengths). Compute `pool`, write all 32 bytes of `next_seed` to a fresh `0600` sibling temp file, and atomically publish it onto the state path via POSIX `rename` (with no locks and no torn reads). `create` syncs the temp file, publishes it via no-replace `hard_link` (never overwriting an existing path), and syncs the parent directory; `initialize` omits `fsync` for low startup latency (best-effort across power loss).
 3. **Per-imprint draw and signet generation:**
    Each `draw` or `generate` reserves the current 64-bit counter `n` (starting at `0`) and increments it, panicking before `u64::MAX` overflow:
    - Imprint draw: `draw = Keyed(run_key, u64_le(n))`.
@@ -234,4 +234,4 @@ State lives in a private directory on a trusted local filesystem (created once w
 
 - **Design target:** 128-bit classical security at up to $q = 2^{32}$ imprints per signet (single-query FORS leaf-cover exponent under ideal hashes: **134.5 bits** at $2^{32}$, **128.8 bits** at $2^{33}$, **122.4 bits** at $2^{34}$, **114.9 bits** at $2^{35}$, **106.2 bits** at $2^{36}$; verified by `python3 tools/optimize.py --check`). These are single-key ideal-hash cover estimates, not a complete multi-user or quantum proof of BLINCS.
 - **Unenforced budget:** Signet does not count imprints across runs or across copies of a seed. Do not imprint more than $2^{32}$ things with one signet.
-- **Memory retention:** `Signet` retains its 32-byte seed, derived keys, and 1 KiB top tree; signing allocates a transient local `SignWorkspace` (~555 KiB for cross-tree FORS batching; ~110 KiB for `from_seed`) freed on return. Neither Signet nor `blake3-servil-core` wipes secret key memory on drop. Verification uses only local stack buffers (zero heap allocation in Signet's code; standalone `#![no_std]` crate `crates/signet-verify` links with zero allocator). Streaming readers use a fresh local 16 KiB stack buffer, zeroing each lent slice before every `Read::read` call.
+- **Memory retention:** `Signet` retains its 32-byte seed, derived keys, and 1 KiB top tree; signing allocates a transient local `SignWorkspace` (~475 KiB for cross-tree FORS batching; ~110 KiB for `from_seed`) freed on return. Neither Signet nor `blake3-servil-core` wipes secret key memory on drop. Verification uses only local stack buffers (zero heap allocation in Signet's code; standalone `#![no_std]` crate `crates/signet-verify` links with zero allocator).

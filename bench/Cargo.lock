@@ -29,6 +29,12 @@ version = "0.1.0"
 source = "git+https://github.com/servil-software-factory/bench-hashes?rev=cade30fdb71682719f5fa3e586ff96146ae9fc25#cade30fdb71682719f5fa3e586ff96146ae9fc25"
 
 [[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
+
+[[package]]
 name = "getrandom"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -56,6 +62,7 @@ name = "signet"
 version = "0.1.0"
 dependencies = [
  "blake3-servil-core",
+ "constant_time_eq",
  "getrandom",
 ]
 

@@ -31,7 +31,6 @@ CTX_PUBLIC_HASH = "BLINCS-128-7x5 2026-11-25 public hash"
 CTX_CONTENT = "BLINCS-128-7x5 2026-11-25 content"
 CTX_GENERATE_SIGNET = "Signet BLINCS-128-7x5 2026-11-25 generate signet"
 CTX_MIX = "Signet 2026-11-25 randomness: mix"
-CTX_FILE_ID = "Signet 2026-11-25 randomness: file id"
 CTX_NEXT_SEED = "Signet 2026-11-25 randomness: next seed"
 CTX_RUN_KEY = "Signet 2026-11-25 randomness: key of this run"
 CTX_KEYGEN_KEY = "Signet 2026-11-25 randomness: keygen key"
@@ -142,23 +141,23 @@ def generate_seed(local, os_bytes):
     return blake3.derive_key(CTX_GENERATE_SIGNET, local + os_bytes)
 
 
-def mix_pool(seeds, system, clock):
+def mix_pool(prior_salt, system, pid, clock):
     system = _check_len("system", system, 32)
     clock = _to_bytes("clock", clock)
-    parts = []
-    for s in seeds:
-        sb = _to_bytes("seed", s)
-        if len(sb) > 32:
-            raise ValueError(f"seed file exceeds 32 bytes: {len(sb)}")
-        parts.append(bytes([len(sb)]) + sb)
-    material = b"".join(parts) + b"\xff" + system + clock
+    if not isinstance(pid, int) or isinstance(pid, bool) or not (0 <= pid < 1 << 32):
+        raise ValueError("pid must be a u32")
+    if prior_salt is None:
+        prefix = b"\x00"
+    else:
+        prior = _check_len("prior_salt", prior_salt, 32)
+        prefix = bytes([32]) + prior
+    material = prefix + system + pid.to_bytes(4, "little") + clock
     return blake3.derive_key(CTX_MIX, material)
 
 
 def expand_pool(pool):
     pool = _check_len("pool", pool, 32)
     return (
-        blake3.derive_key(CTX_FILE_ID, pool)[:N],
         blake3.derive_key(CTX_NEXT_SEED, pool),
         blake3.derive_key(CTX_RUN_KEY, pool),
         blake3.derive_key(CTX_KEYGEN_KEY, pool),

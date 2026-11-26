@@ -27,7 +27,7 @@ reference/
 test_vectors/           Checked-in primary & edge-case reference imprints (SHA-256 + BLAKE3 recorded)
 tools/
   require_nextest.rs    Sentinel test failing plain `cargo test`
-  controls.py           17 planted-fault controls (executed inside a disposable copy)
+  controls.py           planted-fault controls (executed inside a disposable copy)
   counts.py             Shipped-code safety counts (0 unsafe, 0 debug_assert!, 0 truncation allows, 0 Drop)
   domain_sep.py         Static SPEC-table & dynamic domain-separation / tweak-uniqueness check
   optimize.py           Reproducible constrained-device-first parameter search (inspired by Conor Deegan, Project 11)
@@ -56,4 +56,4 @@ python3 tools/land.py
 python3 tools/mutants/check.py
 ```
 
-`tools/land.py` checks a clean working tree, `reference/blake3.py`, `tools/optimize.py --check`, `tools/counts.py`, `tools/domain_sep.py`, checked-in test vector SHA-256 and BLAKE3 digests + Python `-O` validation + live Node 24 `reference/blincs.ts` verification, `Cargo.lock` hashsets, `cargo fmt -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked`, `cargo nextest run --locked`, `cargo test --doc --locked`, `cargo package --locked`, and all 17 planted-fault controls in `tools/controls.py`.
+`tools/land.py` checks a clean working tree, `reference/blake3.py`, `tools/optimize.py --check`, `tools/counts.py`, `tools/domain_sep.py`, checked-in test vector SHA-256 and BLAKE3 digests + Python `-O` validation + live Node 24 `reference/blincs.ts` verification, `Cargo.lock` hashsets, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked`, `cargo nextest run --workspace --locked`, `cargo test --workspace --doc --locked`, `cargo package --locked` for both `signet` and `signet-verify`, freestanding `wasm32-unknown-unknown` build & execution (`wasm-test/run_wasm.mjs`), and all planted-fault controls in `tools/controls.py`.

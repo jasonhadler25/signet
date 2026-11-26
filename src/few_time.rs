@@ -26,13 +26,12 @@ pub(crate) fn build_all_fors(
 ) -> [u8; N] {
     let tree = leaf_addr.as_u64();
     let stride = (1 + FORS_HEIGHT) * N;
-    let (sec_h, pub_h) = (secret.hasher(true), public.hasher(true));
+    let pub_h = public.hasher(true);
 
     for (t, &chosen) in indices.iter().enumerate() {
         let base = t * FORS_LEAVES;
         let tree_u16 = u16::try_from(t).unwrap();
-        let secret_template = tweak(TweakKind::FewSecret, 0, tree, tree_u16, 0, 0);
-        sec_h.hash_counter_range(&secret_template, 3, 0, &mut ws.out[base..base + FORS_LEAVES]);
+        secret.derive_fors_tree_secrets(leaf_addr, tree_u16, &mut ws.out[base..base + FORS_LEAVES]);
         out_sig[t * stride..t * stride + N].copy_from_slice(&ws.out[base + usize::from(chosen)][..N]);
 
         for i in 0..FORS_LEAVES {
@@ -41,9 +40,6 @@ pub(crate) fn build_all_fors(
     }
 
     pub_h.hash_many(&ws.b32[..FORS_TOTAL_LEAVES], &mut ws.out[..FORS_TOTAL_LEAVES]);
-    for i in 0..FORS_TOTAL_LEAVES {
-        ws.fors_nodes[i] = first_n(&ws.out[i]);
-    }
 
     let mut cur_idx: [usize; FORS_TREES] = core::array::from_fn(|t| usize::from(indices[t]));
     let mut width = FORS_LEAVES;
@@ -54,27 +50,24 @@ pub(crate) fn build_all_fors(
         for t in 0..FORS_TREES {
             let tree_u16 = u16::try_from(t).unwrap();
             let base = t * width;
-            out_sig[t * stride + level * N..t * stride + (level + 1) * N].copy_from_slice(&ws.fors_nodes[base + (cur_idx[t] ^ 1)]);
+            out_sig[t * stride + level * N..t * stride + (level + 1) * N].copy_from_slice(&ws.out[base + (cur_idx[t] ^ 1)][..N]);
             let p_base = t * parents;
             for p in 0..parents {
                 pack_pair(
                     &mut ws.b48[p_base + p],
                     tweak(TweakKind::FewNode, 0, tree, tree_u16, level_u16, u32::try_from(p).unwrap()),
-                    &ws.fors_nodes[base + 2 * p],
-                    &ws.fors_nodes[base + 2 * p + 1],
+                    &ws.out[base + 2 * p][..N],
+                    &ws.out[base + 2 * p + 1][..N],
                 );
             }
             cur_idx[t] >>= 1;
         }
         pub_h.hash_many(&ws.b48[..total_parents], &mut ws.out[..total_parents]);
-        for i in 0..total_parents {
-            ws.fors_nodes[i] = first_n(&ws.out[i]);
-        }
         width = parents;
     }
 
-    let roots: &[[u8; N]; FORS_TREES] = ws.fors_nodes[..FORS_TREES].try_into().unwrap();
-    fors_root(&public.hasher(false), leaf_addr, roots)
+    let roots: [[u8; N]; FORS_TREES] = core::array::from_fn(|t| first_n(&ws.out[t]));
+    fors_root(&public.hasher(false), leaf_addr, &roots)
 }
 
 /// Compress the 20 FORS tree roots into the 16-byte FORS root signed by hypertree layer 0.

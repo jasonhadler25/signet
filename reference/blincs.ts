@@ -83,7 +83,7 @@ const N = 16, LAYERS = 7, TREE_HEIGHT = 5, CHAINS = 35, FORS_TREES = 20, FORS_HE
 const BP = "BLINCS-128-7x5 2026-11-25 ";
 const SP = "Signet 2026-11-25 randomness: ";
 const CTX_PUBLIC_HASH = BP + "public hash", CTX_CONTENT = BP + "content",
-  CTX_MIX = SP + "mix", CTX_FILE_ID = SP + "file id", CTX_NEXT_SEED = SP + "next seed",
+  CTX_MIX = SP + "mix", CTX_NEXT_SEED = SP + "next seed",
   CTX_RUN_KEY = SP + "key of this run", CTX_KEYGEN_KEY = SP + "keygen key";
 const CHAIN = 2, ONE_TIME_KEY = 3, NODE = 4, FEW_LEAF = 6, FEW_NODE = 7, FEW_ROOT = 8, MESSAGE = 9;
 
@@ -166,19 +166,19 @@ export function verify(vk: Uint8Array, ctx: Uint8Array, message: Uint8Array, sig
   return diff === 0;
 }
 
-export function mixPool(seeds: Uint8Array[], system: Uint8Array, clock: Uint8Array): Uint8Array {
+export function mixPool(priorSalt: Uint8Array | null, system: Uint8Array, pid: number, clock: Uint8Array): Uint8Array {
   if (system.length !== 32) throw new Error("system randomness must be 32 bytes");
-  const parts: Uint8Array[] = [];
-  for (const s of seeds) {
-    if (s.length > 32) throw new Error("seed file exceeds 32 bytes");
-    parts.push(new Uint8Array([s.length]), s);
-  }
-  parts.push(new Uint8Array([0xff]), system, clock);
-  return derive(CTX_MIX, cat(...parts));
+  if (!Number.isInteger(pid) || pid < 0 || pid > 0xffffffff) throw new Error("pid must be a u32");
+  const prefix = priorSalt === null ? new Uint8Array([0]) : (() => {
+    if (priorSalt.length !== 32) throw new Error("prior salt must be 32 bytes");
+    return cat(new Uint8Array([32]), priorSalt);
+  })();
+  const pidBytes = new Uint8Array([pid & 0xff, (pid >>> 8) & 0xff, (pid >>> 16) & 0xff, (pid >>> 24) & 0xff]);
+  return derive(CTX_MIX, cat(prefix, system, pidBytes, clock));
 }
-export function expandPool(pool: Uint8Array): [Uint8Array, Uint8Array, Uint8Array, Uint8Array] {
+export function expandPool(pool: Uint8Array): [Uint8Array, Uint8Array, Uint8Array] {
   if (pool.length !== 32) throw new Error("pool must be 32 bytes");
-  return [derive(CTX_FILE_ID, pool).slice(0, N), derive(CTX_NEXT_SEED, pool), derive(CTX_RUN_KEY, pool), derive(CTX_KEYGEN_KEY, pool)];
+  return [derive(CTX_NEXT_SEED, pool), derive(CTX_RUN_KEY, pool), derive(CTX_KEYGEN_KEY, pool)];
 }
 export function draw(key: Uint8Array, n: bigint): Uint8Array { return keyed(key, u64le(n)); }
 
@@ -204,15 +204,16 @@ if (isMain) {
       const ok = verify(hex(a[1], 32), hex(a[2]), new Uint8Array(readFileSync(a[4])), new Uint8Array(readFileSync(a[3])));
       console.log(ok ? "true" : "false");
       proc.exit(ok ? 0 : 1);
-    } else if (a[0] === "--mix" && a.length === 5) {
-      const seeds = a[1] === "" ? [] : a[1].split(",").map((s) => hex(s));
-      const [fid, ns, rk, kk] = expandPool(mixPool(seeds, hex(a[2], 32), enc.encode(a[3])));
-      console.log([fid, ns, rk, kk].map(toHex).join(" "));
-      if (a[4] !== "-") console.log(toHex(draw(rk, u64arg(a[4]))));
+    } else if (a[0] === "--mix" && a.length === 6) {
+      const prior = a[1] === "-" ? null : hex(a[1], 32);
+      const pid = Number(a[3]);
+      const [ns, rk, kk] = expandPool(mixPool(prior, hex(a[2], 32), pid, enc.encode(a[4])));
+      console.log([ns, rk, kk].map(toHex).join(" "));
+      if (a[5] !== "-") console.log(toHex(draw(rk, u64arg(a[5]))));
     } else if (a[0] === "--draw" && a.length === 3) {
       console.log(toHex(draw(hex(a[1], 32), u64arg(a[2]))));
     } else {
-      console.error("usage: --verify <vk_hex> <ctx_hex> <sig_path> <msg_path> | --mix <csv_seed_hex> <sys_hex> <clock_utf8> <draw_n|-> | --draw <key_hex> <n>");
+      console.error("usage: --verify <vk_hex> <ctx_hex> <sig_path> <msg_path> | --mix <prior_hex|-> <sys_hex> <pid> <clock_utf8> <draw_n|-> | --draw <key_hex> <n>");
       proc.exit(2);
     }
   } catch (err) {

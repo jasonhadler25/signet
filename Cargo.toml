@@ -3,12 +3,24 @@ members = [".", "crates/signet-verify"]
 exclude = ["bench", "wasm-test"]
 resolver = "3"
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+unreachable_patterns = "deny"
+
+[workspace.lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"
+
 [package]
 name = "signet"
 version = "0.1.0"
 edition = "2024"
 description = "Signet: Rust implementation of BLINCS (BLINCS-128-7x5), stateless hash-based post-quantum signatures on BLAKE3."
-repository = "https://github.com/jasonhadler25/blincs"
+repository = "https://github.com/jasonhadler25/signet"
 license = "MIT OR Apache-2.0 OR TGPPL-1.0" # OR BOSL-1.0, see LICENSE-BOSL.txt
 readme = "README.md"
 include = [
@@ -54,14 +66,5 @@ overflow-checks = true
 inherits = "release"
 incremental = true
 
-[lints.rust]
-unsafe_code = "forbid"
-unused_must_use = "deny"
-unreachable_patterns = "deny"
-
-[lints.clippy]
-correctness = { level = "deny", priority = -1 }
-suspicious = { level = "deny", priority = -1 }
-cast_possible_truncation = "deny"
-cast_sign_loss = "deny"
-cast_possible_wrap = "deny"
+[lints]
+workspace = true

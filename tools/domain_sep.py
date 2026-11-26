@@ -88,8 +88,8 @@ def check_static(params_src, spec_text, shipped_sources, verify_src=None):
 
     # 1. Exact 1-to-1 CTX_* name -> value equality between src/params.rs and SPEC.md table.
     ctxs = re.findall(r'const\s+CTX_([A-Z0-9_]+)\s*:\s*&str\s*=\s*"([^"]+)";', params_src)
-    if len(ctxs) != 12:
-        errors.append(f"expected 12 CTX_* constants in src/params.rs, found {len(ctxs)}")
+    if len(ctxs) != 11:
+        errors.append(f"expected 11 CTX_* constants in src/params.rs, found {len(ctxs)}")
     rust_ctx_map = {}
     seen_vals = {}
     for name, val in ctxs:
@@ -143,63 +143,26 @@ def check_static(params_src, spec_text, shipped_sources, verify_src=None):
             if v_tweaks != want_v_tweaks:
                 errors.append(f"signet-verify TweakKind {v_tweaks} != expected {want_v_tweaks}")
 
-    # 3. Every tweak(TweakKind::...) call site in shipped src/ matches its key role.
+    # 3. Structural key-role boundary: SecretKey never exports a raw TreeHasher, and secret tweak
+    # kinds (ChainSecret, FewSecret) may appear ONLY inside src/params.rs (SecretKey methods),
+    # while public tweak kinds appear only in algorithm modules outside SecretKey.
+    sec_impl = re.search(r"impl\s+SecretKey\s*\{(.*?)\n\}", params_src, re.S)
+    if not sec_impl or re.search(r"\bfn\s+hasher\b|->\s*TreeHasher\b", sec_impl.group(1)):
+        errors.append("SecretKey must not expose a raw TreeHasher (use narrow secret-domain methods)")
     used_kinds = set()
     for rel, src in shipped_sources.items():
         code = strip_cfg_test_items(src)
-        lines = code.splitlines()
-        for lineno, line in enumerate(lines, 1):
-            for kind in re.findall(r"tweak\(\s*TweakKind::([A-Za-z0-9_]+)", line):
-                used_kinds.add(kind)
-                window = "\n".join(lines[max(0, lineno - 3) : min(len(lines), lineno + 12)])
-                if kind in SECRET_KINDS:
-                    if "sec_h.hash_many" not in window and "sec_h.hash_counter_range" not in window:
-                        errors.append(f"{rel}:{lineno}: secret tweak {kind} not paired with sec_h.hash_many/hash_counter_range")
-                    after = "\n".join(lines[lineno - 1 : min(len(lines), lineno + 6)])
-                    if "pub_h.hash_many" in after or "pub_h.hash_counter_range" in after or "public.hash" in after:
-                        errors.append(f"{rel}:{lineno}: secret tweak {kind} appears adjacent to public hasher")
-                elif kind in PUBLIC_KINDS:
-                    after = "\n".join(lines[lineno - 1 : min(len(lines), lineno + 8)])
-                    if "sec_h.hash_many" in after or "sec_h.hash_counter_range" in after:
-                        errors.append(f"{rel}:{lineno}: public tweak {kind} appears adjacent to sec_h")
-                else:
-                    errors.append(f"{rel}:{lineno}: unknown TweakKind::{kind}")
+        for kind in re.findall(r"tweak\(\s*TweakKind::([A-Za-z0-9_]+)", code):
+            used_kinds.add(kind)
+            if kind in SECRET_KINDS and rel != "src/params.rs":
+                errors.append(f"{rel}: secret tweak TweakKind::{kind} used outside SecretKey in src/params.rs")
+            elif kind in PUBLIC_KINDS and rel == "src/params.rs":
+                errors.append(f"{rel}: public tweak TweakKind::{kind} used inside src/params.rs")
+            elif kind not in ALL_KINDS:
+                errors.append(f"{rel}: unknown TweakKind::{kind}")
 
     if used_kinds != ALL_KINDS:
         errors.append(f"unused TweakKind variants in shipped src/: {sorted(ALL_KINDS - used_kinds)}")
-
-    # 4. Verify parameter constants parsed directly from src/params.rs stay within wire tweak bit widths.
-    def const_int(cname):
-        cm = re.search(rf"const\s+{cname}\s*:\s*(?:usize|u8)\s*=\s*(\d+);", params_src)
-        if not cm:
-            errors.append(f"const {cname} not found in src/params.rs")
-            return 0
-        return int(cm.group(1))
-
-    n_bytes = const_int("N")
-    csum_chains = const_int("CSUM_CHAINS")
-    layers = const_int("LAYERS")
-    tree_h = const_int("TREE_HEIGHT")
-    hyper_bits = layers * tree_h
-    fors_h = const_int("FORS_HEIGHT")
-    fors_trees = const_int("FORS_TREES")
-    chain_steps = const_int("CHAIN_STEPS")
-    chains = 2 * n_bytes + csum_chains
-    if hyper_bits != 35 or chains != 35:
-        errors.append(f"unexpected HYPER_BITS={hyper_bits} or CHAINS={chains}")
-    for layer in range(layers):
-        max_tree = (1 << (hyper_bits - (layer + 1) * tree_h)) - 1
-        max_leaf = (1 << tree_h) - 1
-        if not (0 <= layer < (1 << 8) and 0 <= max_tree < (1 << 48) and 0 <= max_leaf < (1 << 16)):
-            errors.append(f"hypertree wire bound exceeded at layer {layer}")
-    if not (
-        chains - 1 < (1 << 16)
-        and chain_steps < (1 << 32)
-        and (1 << hyper_bits) - 1 < (1 << 48)
-        and fors_trees - 1 < (1 << 16)
-        and (1 << fors_h) - 1 < (1 << 32)
-    ):
-        errors.append("FORS/WOTS wire bound exceeded")
 
     return errors
 
@@ -220,13 +183,9 @@ def self_test(params_src, spec_text, shipped_sources, verify_src):
         raise RuntimeError(f"self-test failed: duplicate TweakKind tag escaped: {tag_errs}")
 
     bad_role = dict(shipped_sources)
-    bad_role["src/few_time.rs"] = bad_role["src/few_time.rs"].replace(
-        "sec_h.hash_counter_range(&secret_template, 3, 0, &mut ws.out[base..base + FORS_LEAVES])",
-        "pub_h.hash_counter_range(&secret_template, 3, 0, &mut ws.out[base..base + FORS_LEAVES])",
-        1,
-    )
+    bad_role["src/few_time.rs"] = bad_role["src/few_time.rs"] + "\nlet _ = tweak(TweakKind::FewSecret, 0, 0, 0, 0, 0);\n"
     if not check_static(params_src, spec_text, bad_role, verify_src):
-        raise RuntimeError("self-test failed: secret/public role mixup escaped")
+        raise RuntimeError("self-test failed: secret tweak outside SecretKey escaped")
 
     bad_verify = verify_src.replace("Message = 9,", "Message = 8,", 1)
     if not check_static(params_src, spec_text, shipped_sources, bad_verify):
@@ -322,7 +281,7 @@ def main():
 
     n_ver, n_fors, n_wots, n_ctx = check_dynamic_reference()
     print(
-        f"domain_sep.py PASSED (self-test 5/5 caught; 12 CTX + 9 TweakKind SPEC-table exact match, signet-verify parity & finite-domain bounds; "
+        f"domain_sep.py PASSED (self-test 5/5 caught; 11 CTX + 9 TweakKind SPEC-table exact match, SecretKey boundary & signet-verify parity; "
         f"dynamic trace: {n_ver} unique verify K_pub / 0 K_sec, {n_fors} FORS + {n_wots} WOTS+/Merkle disjoint tweaks, {n_ctx} contexts)."
     )
     return 0
