@@ -127,9 +127,19 @@ def merkle_tree(public, kind, layer, tree, extra_leaf, leaves):
     return levels
 
 
-def content(content_key, salt, ctx, message):
-    msg_key = blake3.keyed_hash(content_key, salt + frame_context(ctx))
+def content_framed(content_key, salt, framed_ctx, message):
+    msg_key = blake3.keyed_hash(content_key, salt + framed_ctx)
     return salt + blake3.keyed_hash(msg_key, message)
+
+
+def content(content_key, salt, ctx, message):
+    return content_framed(content_key, salt, frame_context(ctx), message)
+
+
+def generate_seed(local, os_bytes):
+    local = _check_len("local", local, 32)
+    os_bytes = _check_len("os", os_bytes, 32)
+    return blake3.derive_key(CTX_GENERATE_SIGNET, local + os_bytes)
 
 
 def mix_pool(seeds, system, clock):
@@ -177,7 +187,7 @@ class SignetId:
         if len(imprint) != IMPRINT_LEN:
             return False
         salt, randomizer, at = imprint[:N], imprint[N : 2 * N], 2 * N
-        short = content(self.content_key, salt, ctx, message)
+        short = content_framed(self.content_key, salt, framed_ctx, message)
         digest = blake3.keyed_hash(self.public, tweak(KIND_MESSAGE) + randomizer + self.root + short + framed_ctx)
         indices, leaf_addr = parse_digest(digest)
 
@@ -240,7 +250,7 @@ class Signet:
         draw_bytes = _check_len("draw", draw_bytes, 32)
         public, sid = self.public, self.id
         salt = blake3.keyed_hash(self.salt_key, draw_bytes)[:N]
-        short = content(sid.content_key, salt, ctx, message)
+        short = content_framed(sid.content_key, salt, framed_ctx, message)
         randomizer = blake3.keyed_hash(self.randomizer_key, short + framed_ctx)[:N]
         digest = blake3.keyed_hash(public, tweak(KIND_MESSAGE) + randomizer + sid.root + short + framed_ctx)
         indices, leaf_addr = parse_digest(digest)

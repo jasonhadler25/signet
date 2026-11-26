@@ -62,7 +62,6 @@ use randomness::read_os_randomness;
 use std::array::TryFromSliceError;
 use std::error::Error;
 use std::fmt;
-use std::hint::black_box;
 use std::io::{self, Read};
 
 /// Error returned when a [`Context`] exceeds [`MAX_CONTEXT_LEN`] (`255`) bytes.
@@ -175,11 +174,7 @@ impl From<InvalidImprint> for VerifyError {
 }
 
 fn ct_eq_n(a: &[u8; N], b: &[u8; N]) -> bool {
-    let mut diff = 0u8;
-    for i in 0..N {
-        diff |= a[i] ^ b[i];
-    }
-    black_box(diff) == 0
+    constant_time_eq::constant_time_eq_16(a, b)
 }
 
 fn fmt_hex(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
@@ -366,16 +361,19 @@ impl fmt::Debug for Signet {
     }
 }
 
+/// Pure key-generation seed combiner (`SPEC.md`, "Key-derivation contexts").
+pub(crate) fn generate_seed(local: &[u8; 32], os: &[u8; 32]) -> [u8; SEED_LEN] {
+    let mut material = [0u8; 64];
+    material[..32].copy_from_slice(local);
+    material[32..].copy_from_slice(os);
+    derive_key(CTX_GENERATE_SIGNET, &material)
+}
+
 impl Signet {
     /// Generate a fresh signet by mixing a domain-separated draw from `randomness` with fresh OS
     /// randomness (`getrandom`). Persist [`Signet::seed`] securely if you need to reload this signet.
     pub fn generate(randomness: &Randomness) -> io::Result<Self> {
-        let local = randomness.draw_for_keygen();
-        let os_bytes = read_os_randomness()?;
-        let mut material = [0u8; 64];
-        material[..32].copy_from_slice(&local);
-        material[32..].copy_from_slice(&os_bytes);
-        let seed = derive_key(CTX_GENERATE_SIGNET, &material);
+        let seed = generate_seed(&randomness.draw_for_keygen(), &read_os_randomness()?);
         Ok(Self::from_seed(&seed))
     }
 

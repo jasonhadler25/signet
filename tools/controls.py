@@ -73,36 +73,36 @@ CONTROLS = [
     (
         "Streaming content_from_reader zeroes read buffer before each read",
         "src/content.rs",
-        "    buf[filled..].fill(0);",
-        "    let _ = filled;",
+        "        slice.fill(0);",
+        "        let _ = slice.len();",
         "reader_never_sees_previous_callers_bytes",
     ),
     (
         "Randomness::initialize rejects non-directory paths",
         "src/randomness.rs",
-        "        if !meta.file_type().is_dir() {",
-        "        if false {",
+        "    if !meta.file_type().is_dir() {",
+        "    if false {",
         "hostile_directory_and_unexpected_files_are_rejected_without_deletion",
     ),
     (
         "Randomness::initialize rejects unexpected filenames/symlinks in directory",
         "src/randomness.rs",
-        "            if !is_seed_filename(&name) || !entry.file_type()?.is_file() {",
+        "            if !is_seed_filename(&name) || !ftype.is_file() {",
         "            if false {",
         "hostile_directory_and_unexpected_files_are_rejected_without_deletion",
     ),
     (
-        "Randomness::initialize rejects seed files exceeding 32 bytes",
+        "Randomness::initialize rejects seed files not exactly 32 bytes",
         "src/randomness.rs",
-        "    if filled > SEED_FILE_MAX_LEN {",
+        "    if filled != SEED_FILE_LEN {",
         "    if false {",
         "hostile_directory_and_unexpected_files_are_rejected_without_deletion",
     ),
     (
         "Randomness::create refuses to overwrite existing directory",
         "src/randomness.rs",
-        "        builder.create(dir)?;",
-        "        fs::create_dir_all(dir)?;",
+        "    builder.create(path)",
+        "    fs::create_dir_all(path)",
         "randomness_seed_directory_lifecycle_concurrency_and_self_healing",
     ),
     (
@@ -133,11 +133,18 @@ CONTROLS = [
         "    pub fn initialize(dir: impl AsRef<Path>) -> io::Result<Self> {",
         "initialize_alone_initializes_blake3_in_fresh_process",
     ),
+    (
+        "signet-verify top-root constant-time equality check",
+        "crates/signet-verify/src/lib.rs",
+        "        if constant_time_eq::constant_time_eq_16(&node, &root) { Ok(()) } else { Err(InvalidImprint) }",
+        "        let _ = (node, root);\n        Ok(())",
+        "reference_and_edge_vectors_verify_oneshot_and_streamed",
+    ),
 ]
 
 
 def run_nextest(workdir, target_dir, test_filter=None):
-    cmd = ["cargo", "nextest", "run", "--locked", "--no-fail-fast", "--color", "never"]
+    cmd = ["cargo", "nextest", "run", "--workspace", "--locked", "--no-fail-fast", "--color", "never"]
     if test_filter is not None:
         cmd += ["-E", f"test(/{test_filter}$/)"]
     env = os.environ.copy()

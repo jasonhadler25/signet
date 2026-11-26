@@ -53,24 +53,37 @@ def strip_cfg_test_items(src):
 
 
 def parse_spec_contexts(spec_text):
-    """Parse exact name -> value table from SPEC.md 'Key-derivation contexts'."""
+    """Parse exact name -> value table from SPEC.md 'Key-derivation contexts', rejecting duplicate rows."""
     m = re.search(r"## Key-derivation contexts(.*?)(?=\n## |\Z)", spec_text, re.S)
     if not m:
-        return None
+        return None, ["Key-derivation contexts table not found in SPEC.md"]
     rows = re.findall(r'^\|\s*`([A-Z0-9_]+)`\s*\|\s*`"([^"]+)"`\s*\|', m.group(1), re.M)
-    return dict(rows)
+    out = {}
+    errs = []
+    for name, val in rows:
+        if name in out:
+            errs.append(f"duplicate SPEC.md context row for {name}")
+        out[name] = val
+    return out, errs
 
 
 def parse_spec_tweaks(spec_text):
-    """Parse exact tag -> (SPEC_NAME, key_role) table from SPEC.md 'Tweaks'."""
+    """Parse exact tag -> (SPEC_NAME, key_role) table from SPEC.md 'Tweaks', rejecting duplicate rows."""
     m = re.search(r"## Tweaks(.*?)(?=\n## |\Z)", spec_text, re.S)
     if not m:
-        return None
+        return None, ["Tweaks table not found in SPEC.md"]
     rows = re.findall(r"^\|\s*(\d+)\s*\|\s*`([A-Z0-9_]+)`\s*\|\s*`(K_sec|K_pub)`\s*\|", m.group(1), re.M)
-    return {int(tag): (name, role) for tag, name, role in rows}
+    out = {}
+    errs = []
+    for tag_s, name, role in rows:
+        tag = int(tag_s)
+        if tag in out:
+            errs.append(f"duplicate SPEC.md tweak tag {tag}")
+        out[tag] = (name, role)
+    return out, errs
 
 
-def check_static(params_src, spec_text, shipped_sources):
+def check_static(params_src, spec_text, shipped_sources, verify_src=None):
     errors = []
 
     # 1. Exact 1-to-1 CTX_* name -> value equality between src/params.rs and SPEC.md table.
@@ -85,10 +98,9 @@ def check_static(params_src, spec_text, shipped_sources):
         seen_vals[val] = name
         rust_ctx_map[name] = val
 
-    spec_ctx_map = parse_spec_contexts(spec_text)
-    if spec_ctx_map is None:
-        errors.append("Key-derivation contexts table not found in SPEC.md")
-    elif rust_ctx_map != spec_ctx_map:
+    spec_ctx_map, spec_ctx_errs = parse_spec_contexts(spec_text)
+    errors.extend(spec_ctx_errs)
+    if spec_ctx_map is not None and rust_ctx_map != spec_ctx_map:
         errors.append(f"src/params.rs CTX_* map != SPEC.md table (rust={sorted(rust_ctx_map.items())}, spec={sorted(spec_ctx_map.items())})")
 
     # 2. Exact 1-to-1 TweakKind tag -> name and key-role match between src/params.rs and SPEC.md table.
@@ -111,11 +123,25 @@ def check_static(params_src, spec_text, shipped_sources):
         role = "K_sec" if name in SECRET_KINDS else "K_pub"
         rust_tweak_map[tag] = (KIND_TO_SPEC.get(name, name), role)
 
-    spec_tweak_map = parse_spec_tweaks(spec_text)
-    if spec_tweak_map is None:
-        errors.append("Tweaks table not found in SPEC.md")
-    elif rust_tweak_map != spec_tweak_map:
+    spec_tweak_map, spec_tweak_errs = parse_spec_tweaks(spec_text)
+    errors.extend(spec_tweak_errs)
+    if spec_tweak_map is not None and rust_tweak_map != spec_tweak_map:
         errors.append(f"src/params.rs TweakKind table != SPEC.md table (rust={rust_tweak_map}, spec={spec_tweak_map})")
+
+    # 2b. Verify standalone #![no_std] signet-verify matches SPEC.md public contexts and tweak tags.
+    if verify_src is not None and spec_ctx_map is not None and spec_tweak_map is not None:
+        v_ctxs = dict(re.findall(r'const\s+CTX_([A-Z0-9_]+)\s*:\s*&str\s*=\s*"([^"]+)";', verify_src))
+        want_v_ctxs = {k: spec_ctx_map[k] for k in ("PUBLIC_HASH", "CONTENT")}
+        if v_ctxs != want_v_ctxs:
+            errors.append(f"signet-verify CTX_* {v_ctxs} != expected {want_v_ctxs}")
+        vm = re.search(r"enum\s+TweakKind\s*\{([^}]+)\}", verify_src, re.S)
+        if not vm:
+            errors.append("enum TweakKind not found in crates/signet-verify/src/lib.rs")
+        else:
+            v_tweaks = {int(t): (KIND_TO_SPEC.get(n, n), "K_pub") for n, t in re.findall(r"([A-Za-z0-9_]+)\s*=\s*(\d+)", vm.group(1))}
+            want_v_tweaks = {t: v for t, v in spec_tweak_map.items() if v[1] == "K_pub"}
+            if v_tweaks != want_v_tweaks:
+                errors.append(f"signet-verify TweakKind {v_tweaks} != expected {want_v_tweaks}")
 
     # 3. Every tweak(TweakKind::...) call site in shipped src/ matches its key role.
     used_kinds = set()
@@ -150,15 +176,17 @@ def check_static(params_src, spec_text, shipped_sources):
             return 0
         return int(cm.group(1))
 
+    n_bytes = const_int("N")
+    csum_chains = const_int("CSUM_CHAINS")
     layers = const_int("LAYERS")
     tree_h = const_int("TREE_HEIGHT")
     hyper_bits = layers * tree_h
     fors_h = const_int("FORS_HEIGHT")
     fors_trees = const_int("FORS_TREES")
     chain_steps = const_int("CHAIN_STEPS")
-    chains = 35
-    if hyper_bits != 35:
-        errors.append(f"unexpected HYPER_BITS {hyper_bits}")
+    chains = 2 * n_bytes + csum_chains
+    if hyper_bits != 35 or chains != 35:
+        errors.append(f"unexpected HYPER_BITS={hyper_bits} or CHAINS={chains}")
     for layer in range(layers):
         max_tree = (1 << (hyper_bits - (layer + 1) * tree_h)) - 1
         max_leaf = (1 << tree_h) - 1
@@ -176,18 +204,20 @@ def check_static(params_src, spec_text, shipped_sources):
     return errors
 
 
-def self_test(params_src, spec_text, shipped_sources):
-    bad_ctx = params_src.replace("BLINCS-128-7x5 2026-11-25 content", "BLINCS-128-7x5 2026-11-25 public hash", 1)
-    if not check_static(bad_ctx, spec_text, shipped_sources):
-        raise RuntimeError("self-test failed: duplicate CTX escaped")
+def self_test(params_src, spec_text, shipped_sources, verify_src):
+    bad_ctx = params_src.replace('"BLINCS-128-7x5 2026-11-25 content"', '"BLINCS-128-7x5 2026-11-25 public hash"', 1)
+    ctx_errs = check_static(bad_ctx, spec_text, shipped_sources, verify_src)
+    if not any("duplicate context string" in e for e in ctx_errs):
+        raise RuntimeError(f"self-test failed: duplicate CTX diagnostic not triggered: {ctx_errs}")
 
-    bad_spec = spec_text.replace("| `CONTENT` | `\"BLINCS-128-7x5 2026-11-25 content\"` |", "| `CONTENT` | `\"BLINCS-128-7x5 2026-11-25 wrong\"` |", 1)
-    if not check_static(params_src, bad_spec, shipped_sources):
+    bad_spec = spec_text.replace('| `CONTENT` | `"BLINCS-128-7x5 2026-11-25 content"` |', '| `CONTENT` | `"BLINCS-128-7x5 2026-11-25 wrong"` |', 1)
+    if not check_static(params_src, bad_spec, shipped_sources, verify_src):
         raise RuntimeError("self-test failed: SPEC.md name-to-value mismatch escaped")
 
     bad_tag = params_src.replace("Message = 9,", "Message = 8,", 1)
-    if not check_static(bad_tag, spec_text, shipped_sources):
-        raise RuntimeError("self-test failed: duplicate TweakKind tag escaped")
+    tag_errs = check_static(bad_tag, spec_text, shipped_sources, verify_src)
+    if not any("duplicate TweakKind tag" in e for e in tag_errs):
+        raise RuntimeError(f"self-test failed: duplicate TweakKind tag escaped: {tag_errs}")
 
     bad_role = dict(shipped_sources)
     bad_role["src/few_time.rs"] = bad_role["src/few_time.rs"].replace(
@@ -195,8 +225,12 @@ def self_test(params_src, spec_text, shipped_sources):
         "pub_h.hash_counter_range(&secret_template, 3, 0, &mut ws.out[base..base + FORS_LEAVES])",
         1,
     )
-    if not check_static(params_src, spec_text, bad_role):
+    if not check_static(params_src, spec_text, bad_role, verify_src):
         raise RuntimeError("self-test failed: secret/public role mixup escaped")
+
+    bad_verify = verify_src.replace("Message = 9,", "Message = 8,", 1)
+    if not check_static(params_src, spec_text, shipped_sources, bad_verify):
+        raise RuntimeError("self-test failed: signet-verify TweakKind mismatch escaped")
 
 
 def check_dynamic_reference():
@@ -277,9 +311,10 @@ def main():
     for fname in sorted(os.listdir(SRC_DIR)):
         if fname.endswith(".rs") and fname != "test.rs":
             shipped[f"src/{fname}"] = open(os.path.join(SRC_DIR, fname)).read()
+    verify_src = open(os.path.join(ROOT, "crates", "signet-verify", "src", "lib.rs")).read()
 
-    self_test(params_src, spec_text, shipped)
-    errors = check_static(params_src, spec_text, shipped)
+    self_test(params_src, spec_text, shipped, verify_src)
+    errors = check_static(params_src, spec_text, shipped, verify_src)
     if errors:
         for e in errors:
             print("FAIL:", e, file=sys.stderr)
@@ -287,7 +322,7 @@ def main():
 
     n_ver, n_fors, n_wots, n_ctx = check_dynamic_reference()
     print(
-        f"domain_sep.py PASSED (self-test 4/4 caught; 12 CTX + 9 TweakKind SPEC-table exact match & finite-domain bounds; "
+        f"domain_sep.py PASSED (self-test 5/5 caught; 12 CTX + 9 TweakKind SPEC-table exact match, signet-verify parity & finite-domain bounds; "
         f"dynamic trace: {n_ver} unique verify K_pub / 0 K_sec, {n_fors} FORS + {n_wots} WOTS+/Merkle disjoint tweaks, {n_ctx} contexts)."
     )
     return 0

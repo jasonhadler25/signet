@@ -89,24 +89,26 @@ fn main() -> io::Result<()> {
     // Generates a fresh 32-byte seed mixing local persisted randomness + OS getrandom(2).
     // Prefer a secrets manager; never derive a seed from a password.
     let publisher = Signet::generate(&rng)?;
-    OpenOptions::new().write(true).create_new(true).mode(0o600).open("signet.seed")?.write_all(publisher.seed())
+    let mut f = OpenOptions::new().write(true).create_new(true).mode(0o600).open("signet.seed")?;
+    f.write_all(publisher.seed())?;
+    f.sync_all()
 }
 ```
 
 **Sign, serialize, and verify (fail-closed)** at every process start:
 
 ```rust
-use std::fs::File;
-use std::io::Read;
+use std::fs;
+use std::io;
 
-use signet::{Context, Imprint, Randomness, SEED_LEN, SIGNET_ID_LEN, Signet, SignetId, VerifyError};
+use signet::{Context, Imprint, InvalidImprint, Randomness, SEED_LEN, SIGNET_ID_LEN, Signet, SignetId, VerifyError};
 
 const RELEASE_CTX: Context<'static> = Context::new(b"example.org release manifest v1");
 
 fn main() -> Result<(), VerifyError> {
     let rng = Randomness::initialize("signet.state.d")?; // once per process
-    let mut seed = [0u8; SEED_LEN];
-    File::open("signet.seed")?.read_exact(&mut seed)?;
+    let raw_seed = fs::read("signet.seed")?;
+    let seed: [u8; SEED_LEN] = raw_seed.try_into().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "seed must be 32 bytes"))?;
     let publisher = Signet::from_seed(&seed); // ~0.17 ms: rebuilds the 1 KiB top tree in memory
 
     // Publish these 32 bytes through a channel your verifiers can authenticate.
@@ -117,9 +119,9 @@ fn main() -> Result<(), VerifyError> {
     let wire: Vec<u8> = publisher.imprint(&rng, RELEASE_CTX, message).as_bytes().to_vec();
 
     // Verify against the expected publisher's pinned SignetId and protocol Context.
-    // Fails closed: `?` propagates Err(InvalidImprint) on invalid imprints.
+    // Fails closed: `?` propagates Err(InvalidImprint) on wrong length or invalid imprint.
     let expected_publisher = SignetId::from_bytes(&pinned_id_bytes);
-    let imprint = Imprint::try_from(wire.as_slice()).expect("imprint must be 7,392 bytes");
+    let imprint = Imprint::try_from(wire.as_slice()).map_err(|_| InvalidImprint)?;
     expected_publisher.verify(RELEASE_CTX, message, &imprint)?;
     assert!(expected_publisher.verify(RELEASE_CTX, b"tampered", &imprint).is_err());
     assert!(expected_publisher.verify(Context::new(b"other-protocol"), message, &imprint).is_err());
@@ -135,9 +137,11 @@ fn main() -> Result<(), VerifyError> {
 **Stream large inputs** directly (fails closed on both I/O errors and invalid imprints). This continues inside the same `main`:
 
 ```rust
-let file_imprint = publisher.imprint_reader(&rng, RELEASE_CTX, File::open("artifact.bin")?)?;
-expected_publisher.verify_reader(RELEASE_CTX, File::open("artifact.bin")?, &file_imprint)?;
+let file_imprint = publisher.imprint_reader(&rng, RELEASE_CTX, fs::File::open("artifact.bin")?)?;
+expected_publisher.verify_reader(RELEASE_CTX, fs::File::open("artifact.bin")?, &file_imprint)?;
 ```
+
+**Standalone `#![no_std]` verification (`crates/signet-verify`):** verifiers that want zero `std`, zero heap allocator, and zero-copy signature views (`ImprintRef<'_>`) can depend on `signet-verify`, which provides both one-shot `SignetId::verify` and incremental `SignetId::verifier` (`update` / `finalize`) on pure-Rust BLAKE3 and is tested on host and freestanding `wasm32-unknown-unknown` (23 KiB `.wasm`, zero imports).
 
 **Return types:**
 
@@ -149,14 +153,14 @@ expected_publisher.verify_reader(RELEASE_CTX, File::open("artifact.bin")?, &file
 
 ### 1. The lock-free `Randomness` seed directory
 
-Signet stores startup randomness in a private directory (created once with `Randomness::create`, mode `0700`) holding one or more small regular files named `signet-r2-<32 hex>` (up to 32 raw seed bytes each). Its only job is to keep per-imprint **content salts** fresh across restarts and hedge `Signet::generate`, even if boot-time OS randomness is weak or repeats. It holds no key index or one-time-key counter.
+Signet stores startup randomness in a private directory on a local filesystem (created once with `Randomness::create`, mode `0700`) holding one or more exact-32-byte regular files named `signet-r2-<32 hex>` (plus a private `.stage/` staging subdirectory). Its only job is to keep per-imprint **content salts** fresh across restarts and hedge `Signet::generate`, even if boot-time OS randomness is weak or repeats. It holds no key index or one-time-key counter.
 
 **How `Randomness::initialize` works (~72 µs, zero `flock`, zero `fsync`):**
 
-- Reads every `signet-r2-<32 hex>` regular file in the directory (rejecting unexpected files, symlinks, files `> 32` bytes, or empty directories without touching anything; re-scanning if concurrent rotation unlinks listed entries during listing).
+- Verifies `dir` is a private (`0700`) non-symlink directory, and reads every `signet-r2-<32 hex>` exact-32-byte regular file sorted by filename (ignoring only `.stage`; rejecting unexpected files, symlinks, wrong-sized files, or empty directories without touching anything; re-scanning if concurrent rotation unlinks listed entries during listing).
 - Mixes all read seeds with 32 bytes from OS `getrandom(2)` / `getentropy` and the monotonic clock.
-- Derives four independent, domain-separated keys from that pool: `file_id` (filename only — **reveals zero bits of the file's `next_seed`, `run_key`, or future salts/signets**), `next_seed` (32 bytes written inside the new `0600` file via atomic `O_CREAT | O_EXCL`), `run_key` (in-memory imprint draws), and `keygen_key` (in-memory draws for `Signet::generate`).
-- Unlinks the old filenames it read. If concurrent processes or crashes leave multiple files or a 0-byte partial file, the next `initialize` folds them all together into one fresh 32-byte file and cleans up the rest automatically.
+- Derives four independent, domain-separated outputs from that pool: `file_id` (pool-derived filename, domain-separated from the secret outputs), `next_seed` (32 bytes written completely to a `0600` temp file in `.stage/` and published atomically via no-replace `hard_link` so no partial file ever appears in `dir`), `run_key` (in-memory imprint draws), and `keygen_key` (in-memory draws for `Signet::generate`).
+- Unlinks the old filenames it read. If concurrent processes leave multiple complete seed files, the next `initialize` folds them all together into one fresh 32-byte file and cleans up the rest automatically.
 - Each subsequent imprint draws from `run_key` in memory, with no syscalls or disk writes.
 
 **Losing, cloning, or resetting the seed directory does not cause XMSS/LMS-style one-time-key reuse.**
@@ -168,7 +172,7 @@ Signet stores startup randomness in a private directory (created once with `Rand
 
 **If the seed directory, OS randomness, and the clock all repeat together**, salts repeat. Signing secrets stay hidden. Content hashing degrades from salted (randomized target-collision) security to the 128-bit collision resistance of keyed BLAKE3.
 
-**Forks and live VM snapshots:** after `fork()` (without `exec()`) or restoring a live VM snapshot, call `Randomness::initialize` again so cloned processes or images do not repeat `(run_key, count)`.
+**Forks and live VM snapshots:** in multithreaded POSIX processes, call `exec()` before initializing Signet rather than calling `Randomness::initialize` directly after `fork()`. After restoring a live VM snapshot, ensure genuinely fresh unshared OS entropy before initializing so cloned images do not repeat `(run_key, count)`.
 
 ### 2. Per-signet signing budget
 
@@ -202,20 +206,22 @@ Signet does not count imprints across runs or across copies of a seed. When reti
 
 **Supported platforms:**
 
-- **Linux** (`x86_64`, `aarch64`)
-- **macOS** (`x86_64`, `aarch64`)
+- **Host signer & verifier (`signet`):** Linux (`x86_64`, `aarch64`) and macOS (`x86_64`, `aarch64`).
+- **Standalone `#![no_std]` verifier (`crates/signet-verify`):** host targets above plus freestanding `wasm32-unknown-unknown` (tested with zero imports and zero allocator under Node 24).
 
 If your platform is not on this list, this software is not expected to work for that use.
 
 **Dependencies and code:**
 
-- **Runtime dependencies:** `blake3-servil-core = "=0.11.0"` (single-threaded SIMD/SME2 BLAKE3, zero background worker threads) and `getrandom = "=0.4.3"` (OS `getrandom(2)` / `getentropy`) — **6 external crates** total in `Cargo.lock`, all BLAKE3 + SHA-256 hashset-verified.
-- **Rust code:** `signet` itself is pure safe Rust (`#![forbid(unsafe_code)]`, zero explicit `Drop` implementations, ~1,045 lines of shipped code).
+- **Host `signet` runtime dependencies:** `blake3-servil-core = "=0.11.0"` (single-threaded SIMD/SME2 BLAKE3, zero background worker threads), `constant_time_eq = "=0.4.2"` (`no_std`), and `getrandom = "=0.4.3"` (OS `getrandom(2)` / `getentropy`), all BLAKE3 + SHA-256 hashset-verified in `Cargo.lock`.
+- **Standalone `signet-verify` dependencies:** `blake3 = "=1.8.7"` (`default-features = false, features = ["pure"]`) and `constant_time_eq = "=0.4.2"` (`default-features = false`) — `#![no_std]`, zero `alloc`, `#![forbid(unsafe_code)]`.
+- **Rust code:** both crates are `#![forbid(unsafe_code)]` with zero explicit `Drop` implementations.
 
 **Other implementations of `BLINCS-128-7x5`:**
 
-- an independent pure-Python reference, `reference/blincs.py`, which matches `signet` byte for byte;
-- an educational TypeScript reference verifier (`reference/blincs.ts`), verified live under Node 24 in `tools/land.py` and CI.
+- standalone `#![no_std]` verifier crate `crates/signet-verify` (tested natively and on freestanding `wasm32-unknown-unknown`);
+- an independent pure-Python reference, `reference/blincs.py`, which matches `signet` byte for byte (both signing and verification checked live in `tools/land.py`);
+- an educational TypeScript reference verifier (`reference/blincs.ts`), verified live (positive and negative cases) under Node 24 in `tools/land.py` and CI.
 
 **Caller obligations:**
 

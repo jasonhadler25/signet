@@ -138,12 +138,17 @@ def measure_map(files):
 
 def shipped_files():
     out = {}
-    for path in sorted(glob.glob(os.path.join(ROOT, "src", "*.rs"))):
-        rel = os.path.relpath(path, ROOT)
-        if rel == os.path.join("src", "test.rs"):
-            continue
-        with open(path) as f:
-            out[rel] = f.read()
+    patterns = [
+        os.path.join(ROOT, "src", "**", "*.rs"),
+        os.path.join(ROOT, "crates", "*", "src", "**", "*.rs"),
+    ]
+    for pat in patterns:
+        for path in sorted(glob.glob(pat, recursive=True)):
+            rel = os.path.relpath(path, ROOT)
+            if rel == os.path.join("src", "test.rs"):
+                continue
+            with open(path) as f:
+                out[rel] = f.read()
     return out
 
 

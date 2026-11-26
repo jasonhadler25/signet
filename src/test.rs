@@ -1,17 +1,19 @@
 include!("../tools/require_nextest.rs");
 
 use crate::content::{checked_add_stream_len, content_from_reader, content_from_slice, derive_msg_key};
-use crate::few_time::parse_digest;
-use crate::one_time::{Pos, advance_chains, digits};
+use crate::few_time::{build_all_fors, fors_verify, parse_digest};
+use crate::one_time::{Pos, SignWorkspace, advance_chains, digits};
 use crate::params::{
-    CHAIN_STEPS, CHAINS, CTX_CONTENT, FORS_HEIGHT, FORS_TREES, HYPER_BITS, IMPRINT_LEN, LAYER_LEN, Layer, MAX_CONTEXT_LEN, MSG_CHAINS, N, PublicKey,
-    SUITE_NAME, TREE_HEIGHT, TweakKind, derive_key, ensure_init, tweak,
+    CHAIN_STEPS, CHAINS, CTX_CONTENT, FORS_LEN, FORS_TREES, HYPER_BITS, IMPRINT_LEN, LAYER_LEN, Layer, LeafAddr, MAX_CONTEXT_LEN, MSG_CHAINS, N, PublicKey,
+    SUITE_NAME, SecretKey, TweakKind, derive_key, ensure_init, tweak,
 };
 use crate::randomness::{
-    SEED_FILE_MAX_LEN, expand_pool, is_seed_filename, mix_pool, read_bounded_seed, read_monotonic_clock, read_os_randomness, read_seed_if_present,
-    remove_if_present, seed_filename, write_next_seed,
+    SEED_FILE_LEN, expand_pool, is_seed_filename, mix_pool, read_exact_seed, read_monotonic_clock, read_os_randomness, read_seed_if_present, remove_if_present,
+    seed_filename, write_next_seed,
 };
-use crate::{Context, ContextTooLong, Imprint, InvalidImprint, Randomness, SEED_LEN, SIGNET_ID_LEN, Signet, SignetId, VerifyError, compute_message_digest};
+use crate::{
+    Context, ContextTooLong, Imprint, InvalidImprint, Randomness, SEED_LEN, SIGNET_ID_LEN, Signet, SignetId, VerifyError, compute_message_digest, generate_seed,
+};
 use std::error::Error;
 use std::fs;
 use std::io::{self, Cursor, ErrorKind, Read};
@@ -329,25 +331,11 @@ fn every_signature_region_is_checked() {
         vk.verify(REF_CTX, msg, &Imprint::from_bytes(&raw)).is_ok()
     };
 
-    for &off in &[0, 15, 16, 31] {
-        assert!(!flip(off), "accepted flip at offset {off}");
-    }
-
-    let fors_stride = (1 + FORS_HEIGHT) * N;
-    for t in 0..FORS_TREES {
-        let base_off = 2 * N + t * fors_stride;
-        assert!(!flip(base_off), "accepted flip in FORS tree {t} secret");
-        assert!(!flip(base_off + N), "accepted flip in FORS tree {t} auth 0");
-        assert!(!flip(base_off + FORS_HEIGHT * N), "accepted flip in FORS tree {t} last auth");
-    }
-
-    for layer in Layer::ALL {
-        let at = layer.sig_offset();
-        for c in 0..CHAINS {
-            assert!(!flip(at + c * N), "accepted flip in layer {} chain {c}", layer.as_u8());
-        }
-        assert!(!flip(at + CHAINS * N), "accepted flip in layer {} auth 0", layer.as_u8());
-        assert!(!flip(at + (CHAINS + TREE_HEIGHT - 1) * N), "accepted flip in layer {} last auth", layer.as_u8());
+    // Mutate one byte in EVERY 16-byte wire field across the entire 7,392-byte imprint (462 fields):
+    // salt (0..16), randomizer (16..32), every FORS secret & sibling, and every WOTS chain & Merkle sibling.
+    for field in 0..(IMPRINT_LEN / N) {
+        let off = field * N + (field % N);
+        assert!(!flip(off), "accepted flip in 16-byte wire field {field} (offset {off})");
     }
     assert_eq!(Layer::TOP.sig_offset() + LAYER_LEN, IMPRINT_LEN);
 
@@ -507,9 +495,13 @@ fn randomness_seed_directory_lifecycle_concurrency_and_self_healing() {
     let list_files = |d: &PathBuf| -> Vec<(String, Vec<u8>)> {
         let mut v: Vec<_> = fs::read_dir(d)
             .unwrap()
-            .map(|e| {
+            .filter_map(|e| {
                 let e = e.unwrap();
-                (e.file_name().into_string().unwrap(), fs::read(e.path()).unwrap())
+                let name = e.file_name().into_string().unwrap();
+                if name == ".stage" {
+                    return None;
+                }
+                Some((name, fs::read(e.path()).unwrap()))
             })
             .collect();
         v.sort();
@@ -551,15 +543,8 @@ fn randomness_seed_directory_lifecycle_concurrency_and_self_healing() {
     assert_ne!(after2[0].0, after1[0].0);
     assert_ne!(rng1.draw(), rng2.draw());
 
-    // Self-healing: leave a simulated 0-byte crash file alongside the valid 32-byte seed file.
-    let crash_name = "signet-r2-00000000000000000000000000000000";
-    fs::write(dir.join(crash_name), b"").unwrap();
-    assert_eq!(list_files(&dir).len(), 2);
-    let _rng3 = Randomness::initialize(&dir).unwrap();
-    let healed = list_files(&dir);
-    assert_eq!(healed.len(), 1);
-    assert_ne!(healed[0].0, crash_name);
-    assert_eq!(healed[0].1.len(), 32);
+    // Staging directory has no leftover temp files after normal publish.
+    assert_eq!(fs::read_dir(dir.join(".stage")).unwrap().count(), 0);
 
     // Concurrent lock-free startups across 8 threads x 10 rounds (= 80 overlapping rotations) all succeed with distinct draws, and a follow-up startup collapses cleanly back to 1 file.
     let shared = Arc::new(dir.clone());
@@ -575,6 +560,7 @@ fn randomness_seed_directory_lifecycle_concurrency_and_self_healing() {
     assert_eq!(draws.len(), 80);
     let _collapse = Randomness::initialize(&dir).unwrap();
     assert_eq!(list_files(&dir).len(), 1);
+    assert_eq!(fs::read_dir(dir.join(".stage")).unwrap().count(), 0);
 
     // read_os_randomness returns fresh, non-constant 32-byte OS entropy.
     let os_a = read_os_randomness().unwrap();
@@ -592,7 +578,8 @@ fn randomness_seed_directory_lifecycle_concurrency_and_self_healing() {
     assert!(read_seed_if_present(&impossible_child).is_err());
     assert!(remove_if_present(&impossible_child).is_err());
 
-    // write_next_seed re-hashes pool with CTX_MIX on AlreadyExists without clobbering the colliding file.
+    // write_next_seed re-hashes pool with CTX_MIX on AlreadyExists without clobbering the colliding file,
+    // and returns non-AlreadyExists errors immediately (without looping).
     let pool = [0x42u8; 32];
     let (id1, _, _, _) = expand_pool(&pool);
     let pool2 = derive_key(crate::params::CTX_MIX, &pool);
@@ -603,13 +590,18 @@ fn randomness_seed_directory_lifecycle_concurrency_and_self_healing() {
     assert_eq!((got_rk, got_kk), (rk2, kk2));
     assert_eq!(fs::read(&collider).unwrap(), vec![0xeeu8; 32]);
     assert_eq!(fs::read(dir.join(seed_filename(&id2))).unwrap(), seed2.to_vec());
+    assert_eq!(write_next_seed(&dir.join("no-such-subdir"), pool).unwrap_err().kind(), ErrorKind::NotFound);
 
-    // read_bounded_seed accepts 0..=32 bytes and rejects 33 bytes.
-    let mut frag32 = FragmentedReader::new(&[0x55u8; SEED_FILE_MAX_LEN], 5, 2);
-    assert_eq!(read_bounded_seed(&mut frag32).unwrap(), vec![0x55u8; SEED_FILE_MAX_LEN]);
-    let mut frag33 = FragmentedReader::new(&[0x55u8; SEED_FILE_MAX_LEN + 1], 7, 3);
-    assert_eq!(read_bounded_seed(&mut frag33).unwrap_err().kind(), ErrorKind::InvalidData);
-    assert_eq!(read_bounded_seed(&mut FailingReader::default()).unwrap_err().kind(), ErrorKind::BrokenPipe);
+    // read_exact_seed accepts exact 32 bytes and rejects empty, 31-byte, and 33-byte files.
+    let mut frag32 = FragmentedReader::new(&[0x55u8; SEED_FILE_LEN], 5, 2);
+    assert_eq!(read_exact_seed(&mut frag32).unwrap(), [0x55u8; SEED_FILE_LEN]);
+    let mut frag0 = FragmentedReader::new(b"", 5, 2);
+    assert_eq!(read_exact_seed(&mut frag0).unwrap_err().kind(), ErrorKind::InvalidData);
+    let mut frag31 = FragmentedReader::new(&[0x55u8; SEED_FILE_LEN - 1], 5, 2);
+    assert_eq!(read_exact_seed(&mut frag31).unwrap_err().kind(), ErrorKind::InvalidData);
+    let mut frag33 = FragmentedReader::new(&[0x55u8; SEED_FILE_LEN + 1], 7, 3);
+    assert_eq!(read_exact_seed(&mut frag33).unwrap_err().kind(), ErrorKind::InvalidData);
+    assert_eq!(read_exact_seed(&mut FailingReader::default()).unwrap_err().kind(), ErrorKind::BrokenPipe);
 
     let _ = fs::remove_dir_all(dir.parent().unwrap());
 }
@@ -620,33 +612,54 @@ fn hostile_directory_and_unexpected_files_are_rejected_without_deletion() {
     let _ = fs::remove_dir_all(&base);
     fs::create_dir_all(&base).unwrap();
 
-    // Regular file is not a directory.
+    // Regular file (exact 32 bytes so only directory/symlink/filename checks reject it!) is not a directory.
     let reg = base.join("regular.bin");
-    fs::write(&reg, b"not a dir").unwrap();
+    let reg_bytes = [0x33u8; 32];
+    fs::write(&reg, reg_bytes).unwrap();
     assert_eq!(Randomness::initialize(&reg).unwrap_err().kind(), ErrorKind::InvalidInput);
 
-    // Empty directory is rejected.
+    // Empty private directory is rejected.
     let empty_dir = base.join("empty.d");
     fs::create_dir_all(&empty_dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&empty_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     assert_eq!(Randomness::initialize(&empty_dir).unwrap_err().kind(), ErrorKind::InvalidData);
 
-    // Directory containing an unrelated file is rejected without touching it.
+    // Non-private (0755) directory is rejected with PermissionDenied.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let pub_dir = base.join("public.d");
+        Randomness::create(&pub_dir).unwrap();
+        fs::set_permissions(&pub_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(Randomness::initialize(&pub_dir).unwrap_err().kind(), ErrorKind::PermissionDenied);
+    }
+
+    // Directory containing an unrelated 32-byte file is rejected without touching it.
     let mixed_dir = base.join("mixed.d");
     Randomness::create(&mixed_dir).unwrap();
     let unrelated = mixed_dir.join("notes.txt");
-    fs::write(&unrelated, b"keep me").unwrap();
+    let keep = [0x44u8; 32];
+    fs::write(&unrelated, keep).unwrap();
     assert_eq!(Randomness::initialize(&mixed_dir).unwrap_err().kind(), ErrorKind::InvalidData);
-    assert_eq!(fs::read(&unrelated).unwrap(), b"keep me");
+    assert_eq!(fs::read(&unrelated).unwrap(), keep.to_vec());
 
-    // Directory containing an oversized (>32 B) seed-named file is rejected without touching it.
-    let over_dir = base.join("over.d");
-    Randomness::create(&over_dir).unwrap();
-    let big_seed = over_dir.join("signet-r2-ffffffffffffffffffffffffffffffff");
-    fs::write(&big_seed, [0x77u8; 33]).unwrap();
-    assert_eq!(Randomness::initialize(&over_dir).unwrap_err().kind(), ErrorKind::InvalidData);
-    assert!(big_seed.exists());
+    // Directory containing an empty (0-byte), truncated (31-byte), or oversized (33-byte) seed file
+    // is rejected without touching or retiring the valid sibling seed file.
+    for (tag, bad_bytes) in [("zero", vec![]), ("short", vec![0x66u8; 31]), ("over", vec![0x77u8; 33])] {
+        let d = base.join(format!("badsize-{tag}.d"));
+        Randomness::create(&d).unwrap();
+        let bad_seed = d.join("signet-r2-ffffffffffffffffffffffffffffffff");
+        fs::write(&bad_seed, &bad_bytes).unwrap();
+        assert_eq!(Randomness::initialize(&d).unwrap_err().kind(), ErrorKind::InvalidData);
+        assert!(bad_seed.exists());
+        assert_eq!(fs::read_dir(&d).unwrap().count(), 3); // original seed + bad seed + .stage
+    }
 
-    // Symlink to directory or symlink inside directory is rejected.
+    // Symlink to directory, symlink inside directory, or symlinked .stage is rejected.
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
@@ -660,6 +673,12 @@ fn hostile_directory_and_unexpected_files_are_rejected_without_deletion() {
         Randomness::create(&sym_inside).unwrap();
         symlink(&reg, sym_inside.join("signet-r2-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")).unwrap();
         assert_eq!(Randomness::initialize(&sym_inside).unwrap_err().kind(), ErrorKind::InvalidData);
+
+        let sym_stage = base.join("sym-stage.d");
+        Randomness::create(&sym_stage).unwrap();
+        fs::remove_dir(sym_stage.join(".stage")).unwrap();
+        symlink(&empty_dir, sym_stage.join(".stage")).unwrap();
+        assert_eq!(Randomness::initialize(&sym_stage).unwrap_err().kind(), ErrorKind::InvalidData);
     }
 
     let _ = fs::remove_dir_all(&base);
@@ -680,6 +699,23 @@ fn monotonic_clock_advances_and_is_nontrivial() {
 
 #[test]
 fn signet_generate_produces_distinct_valid_signets() {
+    ensure_init();
+    // Pure keygen combiner KAT: depends on BOTH local draw and OS bytes independently.
+    let local_a = [0x11u8; 32];
+    let local_b = [0x22u8; 32];
+    let os_a = [0x33u8; 32];
+    let os_b = [0x44u8; 32];
+    let s_aa = generate_seed(&local_a, &os_a);
+    let s_ba = generate_seed(&local_b, &os_a);
+    let s_ab = generate_seed(&local_a, &os_b);
+    assert_ne!(s_aa, s_ba);
+    assert_ne!(s_aa, s_ab);
+    assert_ne!(s_ba, s_ab);
+    let mut expected_input = [0u8; 64];
+    expected_input[..32].copy_from_slice(&local_a);
+    expected_input[32..].copy_from_slice(&os_a);
+    assert_eq!(s_aa, derive_key(crate::params::CTX_GENERATE_SIGNET, &expected_input));
+
     let dir = temp_state_dir("generate");
     Randomness::create(&dir).unwrap();
     let rng = Randomness::initialize(&dir).unwrap();
@@ -695,6 +731,37 @@ fn signet_generate_produces_distinct_valid_signets() {
     assert_eq!(s2.id().verify(TEST_CTX, b"release-1", &imp1), Err(InvalidImprint));
 
     let _ = fs::remove_dir_all(dir.parent().unwrap());
+}
+
+#[test]
+fn fors_batched_root_is_index_independent_at_extreme_addresses() {
+    ensure_init();
+    let secret = SecretKey::derive(&[0x77u8; SEED_LEN]);
+    let public = PublicKey::from_seed(&[0x88u8; N]);
+    let pub_h = public.hasher(false);
+    let mut ws = SignWorkspace::new(true);
+
+    for raw_addr in [0u64, 1, (1u64 << HYPER_BITS) - 1] {
+        let addr = LeafAddr::from_digest_word(raw_addr);
+        let idx_zero = [0u8; FORS_TREES];
+        let idx_max = [255u8; FORS_TREES];
+        let idx_mix: [u8; FORS_TREES] = core::array::from_fn(|t| if t % 2 == 0 { 0 } else { 255 });
+
+        let (mut sig_z, mut sig_m, mut sig_x) = ([0u8; FORS_LEN], [0u8; FORS_LEN], [0u8; FORS_LEN]);
+        let r_z = build_all_fors(&secret, &public, addr, &idx_zero, &mut ws, &mut sig_z);
+        let r_m = build_all_fors(&secret, &public, addr, &idx_max, &mut ws, &mut sig_m);
+        let r_x = build_all_fors(&secret, &public, addr, &idx_mix, &mut ws, &mut sig_x);
+
+        // Changing FORS indices at the same leaf address must change openings while preserving the FORS root!
+        assert_eq!(r_z, r_m);
+        assert_eq!(r_z, r_x);
+        assert_ne!(sig_z, sig_m);
+        assert_ne!(sig_z, sig_x);
+
+        assert_eq!(fors_verify(&pub_h, addr, &idx_zero, &sig_z), r_z);
+        assert_eq!(fors_verify(&pub_h, addr, &idx_max, &sig_m), r_m);
+        assert_eq!(fors_verify(&pub_h, addr, &idx_mix, &sig_x), r_x);
+    }
 }
 
 #[test]
@@ -717,7 +784,7 @@ fn debug_redacts_secrets() {
 fn create_alone_initializes_blake3_in_fresh_process() {
     let dir = temp_state_dir("create-only");
     Randomness::create(&dir).unwrap();
-    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 2); // 32-byte seed + .stage
     let _ = fs::remove_dir_all(dir.parent().unwrap());
 }
 
@@ -725,6 +792,11 @@ fn create_alone_initializes_blake3_in_fresh_process() {
 fn initialize_alone_initializes_blake3_in_fresh_process() {
     let dir = temp_state_dir("init-only");
     fs::create_dir_all(&dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     fs::write(dir.join("signet-r2-0123456789abcdef0123456789abcdef"), [0x42u8; 32]).unwrap();
     let rng = Randomness::initialize(&dir).unwrap();
     let _ = rng.draw();
@@ -793,6 +865,40 @@ fn reader_never_sees_previous_callers_bytes() {
     let mut snoop_ver = SnoopingReader { data: &big_data, pos: 0, saw_nonzero: false };
     vk.verify_reader(TEST_CTX, &mut snoop_ver, &sig_big).unwrap();
     assert!(!snoop_ver.saw_nonzero, "stream verify_reader observed nonzero buffer bytes");
+
+    // A reader that dirties tail bytes on partial read or Interrupted retry never sees them on the next read.
+    struct DirtyTailRetry {
+        step: usize,
+        saw_nonzero: bool,
+    }
+    impl Read for DirtyTailRetry {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if buf.iter().any(|&b| b != 0) {
+                self.saw_nonzero = true;
+            }
+            self.step += 1;
+            match self.step {
+                1 => {
+                    buf.fill(0xCC);
+                    Err(io::Error::new(ErrorKind::Interrupted, "retry after dirtying"))
+                }
+                2 => {
+                    buf.fill(0xDD);
+                    buf[..3].copy_from_slice(b"abc");
+                    Ok(3)
+                }
+                3 => {
+                    buf[..3].copy_from_slice(b"def");
+                    Ok(3)
+                }
+                _ => Ok(0),
+            }
+        }
+    }
+    let mut dtr = DirtyTailRetry { step: 0, saw_nonzero: false };
+    let sig_dtr = sk.imprint_reader_with_draw(&[4u8; 32], TEST_CTX, &mut dtr).unwrap();
+    assert!(!dtr.saw_nonzero, "fill_buf leaked dirty tail across Interrupted/partial read");
+    vk.verify(TEST_CTX, b"abcdef", &sig_dtr).unwrap();
 }
 
 #[test]
@@ -906,7 +1012,7 @@ fn oversized_read_return_fails_stop() {
 
     assert!(catch_unwind(|| content_from_reader(&ck, &[0u8; N], TEST_CTX, OversizedReader { prefix: 0 })).is_err());
     assert!(catch_unwind(|| content_from_reader(&ck, &[0u8; N], TEST_CTX, OversizedReader { prefix: 32_768 })).is_err());
-    assert!(catch_unwind(|| read_bounded_seed(&mut OversizedReader { prefix: 0 })).is_err());
+    assert!(catch_unwind(|| read_exact_seed(&mut OversizedReader { prefix: 0 })).is_err());
 }
 
 #[test]

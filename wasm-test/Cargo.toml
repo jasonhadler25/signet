@@ -1,0 +1,18 @@
+[workspace]
+
+[package]
+name = "signet-verify-wasm-test"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+signet-verify = { path = "../crates/signet-verify" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"

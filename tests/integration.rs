@@ -45,6 +45,17 @@ fn public_api_round_trip_and_python_reference_cross_check() {
         expected_publisher.verify(INT_CTX, &msg, &sig).unwrap();
         expected_publisher.verify_reader(INT_CTX, Cursor::new(&msg), &sig).unwrap();
 
+        // Differential cross-check against standalone #![no_std] `signet-verify` (one-shot + streaming).
+        let nostd_id = signet_verify::SignetId::from_bytes(expected_publisher.as_bytes());
+        let nostd_ctx = signet_verify::Context::new(INT_CTX.as_bytes());
+        let nostd_sig = signet_verify::ImprintRef::from_bytes(sig.as_bytes());
+        nostd_id.verify(nostd_ctx, &msg, nostd_sig).unwrap();
+        let mut nostd_v = nostd_id.verifier(nostd_ctx, nostd_sig);
+        for chunk in msg.chunks(1021) {
+            nostd_v.update(chunk).unwrap();
+        }
+        nostd_v.finalize().unwrap();
+
         let msg_path = dir.join(format!("{name}.msg"));
         let sig_path = dir.join(format!("{name}.sig"));
         fs::write(&msg_path, &msg).unwrap();

@@ -1,0 +1,23 @@
+[package]
+name = "signet-verify"
+version = "0.1.0"
+edition = "2024"
+description = "Standalone #![no_std], zero-alloc verifier for BLINCS (BLINCS-128-7x5) signatures."
+repository = "https://github.com/jasonhadler25/blincs"
+license = "MIT OR Apache-2.0 OR TGPPL-1.0" # OR BOSL-1.0, see LICENSE-BOSL.txt
+
+[dependencies]
+blake3 = { version = "=1.8.7", default-features = false, features = ["pure"] }
+constant_time_eq = { version = "=0.4.2", default-features = false }
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+unreachable_patterns = "deny"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"

@@ -80,6 +80,13 @@ def check_vectors_and_references():
         fail("Python reference rejected reference-imprint-1.bin")
     if sid.verify(b"", b"hello, BLINCS", raw):
         fail("Python reference accepted wrong context on reference-imprint-1.bin")
+    # Also verify live Python reference SIGNER regenerates reference-imprint-1.bin byte-for-byte.
+    py_signer = blincs.Signet(bytes(range(32)))
+    if py_signer.id.bytes != bytes.fromhex(REF_SIGNET_ID):
+        fail("Python reference signer derived wrong SignetId")
+    regen = py_signer.imprint(REF_CTX, b"hello, BLINCS", bytes([7] * 32))
+    if regen != raw:
+        fail("Python reference signer output differed from test_vectors/reference-imprint-1.bin")
 
     print("==> Checking edge-vectors.json digests (SHA-256 + BLAKE3) and Python verification")
     edge_raw = open(EDGE_VEC, "rb").read()
@@ -133,6 +140,23 @@ def check_vectors_and_references():
         rb = subprocess.run([node, ts_path, "--verify", REF_SIGNET_ID, "", REF_IMP, msg1], text=True, capture_output=True)
         if rb.returncode != 1 or rb.stdout.strip() != "false":
             fail(f"blincs.ts did not reject wrong context: rc={rb.returncode} out={rb.stdout!r}")
+        # Negative TS checks: tampered signature byte, wrong SignetId, wrong imprint length.
+        tampered = bytearray(raw)
+        tampered[4096] ^= 1
+        tampered_path = os.path.join(td, "tampered.sig")
+        open(tampered_path, "wb").write(tampered)
+        rt = subprocess.run([node, ts_path, "--verify", REF_SIGNET_ID, REF_CTX.hex(), tampered_path, msg1], text=True, capture_output=True)
+        if rt.returncode != 1 or rt.stdout.strip() != "false":
+            fail(f"blincs.ts did not reject tampered signature: rc={rt.returncode} out={rt.stdout!r}")
+        wrong_id = f"{int(REF_SIGNET_ID[:2], 16) ^ 1:02x}" + REF_SIGNET_ID[2:]
+        ri = subprocess.run([node, ts_path, "--verify", wrong_id, REF_CTX.hex(), REF_IMP, msg1], text=True, capture_output=True)
+        if ri.returncode != 1 or ri.stdout.strip() != "false":
+            fail(f"blincs.ts did not reject wrong SignetId: rc={ri.returncode} out={ri.stdout!r}")
+        short_sig = os.path.join(td, "short.sig")
+        open(short_sig, "wb").write(raw[:-1])
+        rs = subprocess.run([node, ts_path, "--verify", REF_SIGNET_ID, REF_CTX.hex(), short_sig, msg1], text=True, capture_output=True)
+        if rs.returncode != 1 or rs.stdout.strip() != "false":
+            fail(f"blincs.ts did not reject truncated signature: rc={rs.returncode} out={rs.stdout!r}")
         for entry in edge_entries:
             sp = os.path.join(td, f"{entry['name']}.sig")
             mp = os.path.join(td, f"{entry['name']}.msg")
@@ -180,15 +204,19 @@ def main():
     if "--skip-rust" not in args:
         run("cargo fetch", ["cargo", "fetch", "--locked"])
         run("Cargo.lock hashsets (BLAKE3 + SHA-256)", [sys.executable, "tools/cargo_lock_hashsets.py"])
-        run("rustfmt", ["cargo", "fmt", "--", "--check"])
-        run("clippy", ["cargo", "clippy", "--all-targets", "--locked", "--", "-D", "warnings"])
-        run("rustdoc", ["cargo", "doc", "--no-deps", "--locked"], extra_env={"RUSTDOCFLAGS": "-D warnings"})
-        run("nextest", ["cargo", "nextest", "run", "--locked"])
-        run("doctests", ["cargo", "test", "--doc", "--locked"])
-        pkg_cmd = ["cargo", "package", "--locked"]
-        if "--skip-clean-check" in args:
-            pkg_cmd.append("--allow-dirty")
-        run("cargo package (unpacked .crate build verification)", pkg_cmd)
+        run("rustfmt", ["cargo", "fmt", "--all", "--", "--check"])
+        run("clippy", ["cargo", "clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"])
+        run("rustdoc", ["cargo", "doc", "--workspace", "--no-deps", "--locked"], extra_env={"RUSTDOCFLAGS": "-D warnings"})
+        run("nextest", ["cargo", "nextest", "run", "--workspace", "--locked"])
+        run("doctests", ["cargo", "test", "--workspace", "--doc", "--locked"])
+        pkg_allow = ["--allow-dirty"] if "--skip-clean-check" in args else []
+        run("cargo package signet", ["cargo", "package", "-p", "signet", "--locked", *pkg_allow])
+        run("cargo package signet-verify", ["cargo", "package", "-p", "signet-verify", "--locked", *pkg_allow])
+        run(
+            "freestanding wasm32-unknown-unknown build (signet-verify)",
+            ["cargo", "build", "--manifest-path", "wasm-test/Cargo.toml", "--target", "wasm32-unknown-unknown", "--release", "--locked"],
+        )
+        run("freestanding wasm32-unknown-unknown execution (Node 24)", ["node", "wasm-test/run_wasm.mjs"])
         run("planted-fault controls", [sys.executable, "tools/controls.py"])
     else:
         skipped.append("rust-gates")

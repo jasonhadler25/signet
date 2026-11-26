@@ -5,4 +5,3 @@
 
 src/content.rs	replace <= with > in content_from_slice	[dispatch/resource] Selects TreeHasher::on_this_core() vs default SME2 dispatch for small slices; both compute identical BLAKE3 digests.
 src/randomness.rs	replace read_monotonic_clock::<impl Hasher for Collect>::finish -> u64 with 1	[functional-equiv] Hasher::finish is never called; Instant::now().hash only invokes Hasher::write.
-src/randomness.rs	replace match guard e.kind() == ErrorKind::AlreadyExists with true in write_next_seed	[dispatch/resource] Testing a non-AlreadyExists I/O error turns this guard-to-true mutant into an infinite loop (timeout) on the unbounded collision-rehash loop; AlreadyExists collision re-hash is directly tested.

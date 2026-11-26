@@ -1,3 +1,8 @@
+[workspace]
+members = [".", "crates/signet-verify"]
+exclude = ["bench", "wasm-test"]
+resolver = "3"
+
 [package]
 name = "signet"
 version = "0.1.0"
@@ -28,7 +33,11 @@ include = [
 
 [dependencies]
 blake3-servil-core = "=0.11.0"
+constant_time_eq = { version = "=0.4.2", default-features = false }
 getrandom = "=0.4.3"
+
+[dev-dependencies]
+signet-verify = { path = "crates/signet-verify" }
 
 # Tests run at release speed with debug assertions and overflow checks on.
 [profile.test]

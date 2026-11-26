@@ -32,11 +32,11 @@ pub(crate) fn checked_add_stream_len(total: u64, n: usize) -> io::Result<u64> {
     total.checked_add(n_u64).ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "stream length exceeds u64::MAX"))
 }
 
-/// Zero `buf[filled..]` and fill it from `reader`, retrying `Interrupted` and tracking `total`.
+/// Zero `buf[filled..]` before each `read`, retrying `Interrupted` and tracking `total`.
 pub(crate) fn fill_buf(reader: &mut impl Read, buf: &mut [u8], mut filled: usize, total: &mut u64) -> io::Result<(usize, bool)> {
-    buf[filled..].fill(0);
     while filled < buf.len() {
         let slice = &mut buf[filled..];
+        slice.fill(0);
         match reader.read(slice) {
             Ok(0) => return Ok((filled, true)),
             Ok(n) => {
