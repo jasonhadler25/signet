@@ -1,7 +1,7 @@
 use blake3_servil_core::throughput::TreeHasher;
 use blake3_servil_core::{Mode, convenience, initialize};
 
-/// Permanent suite identifier for this BLINCS parameter set (`7×5`, `FORS(8, 20)`, 2³² budget).
+/// Permanent suite identifier for this BLINCS parameter set (`7×5`, `U-FORS(3, 10, 16, 64, 5, 15)`, 2³² budget).
 pub const SUITE_NAME: &str = "BLINCS-128-7x5";
 /// Byte length of a [`crate::Signet`] secret seed (`32` bytes).
 pub const SEED_LEN: usize = 32;
@@ -21,38 +21,114 @@ pub(crate) const MSG_CHAINS: usize = 2 * N;
 pub(crate) const CSUM_CHAINS: usize = 3;
 pub(crate) const CHAINS: usize = MSG_CHAINS + CSUM_CHAINS;
 
-pub(crate) const FORS_HEIGHT: usize = 8;
-pub(crate) const FORS_LEAVES: usize = 1 << FORS_HEIGHT;
-pub(crate) const FORS_TREES: usize = 20;
-pub(crate) const FORS_TOTAL_LEAVES: usize = FORS_TREES * FORS_LEAVES;
+pub(crate) const UFORS_TREES: usize = 15;
+pub(crate) const UFORS_CHAINS: usize = 3;
+pub(crate) const UFORS_W: usize = 10;
+pub(crate) const UFORS_STEPS: u8 = 9;
+pub(crate) const UFORS_SUM: usize = 16;
+pub(crate) const UFORS_CODE_BITS: usize = 6;
+pub(crate) const UFORS_LAYER_BASE: u8 = 0x80;
+pub(crate) const UFORS_TOTAL_LEAVES: usize = UFORS_TREES * TREE_LEAVES;
+pub(crate) const UFORS_TOTAL_CHAINS: usize = UFORS_TOTAL_LEAVES * UFORS_CHAINS;
 pub(crate) const HYPER_BITS: usize = LAYERS * TREE_HEIGHT;
 
 pub(crate) const SHORT_LEN: usize = N + 32;
-pub(crate) const FORS_LEN: usize = FORS_TREES * (1 + FORS_HEIGHT) * N;
+pub(crate) const UFORS_TREE_LEN: usize = (UFORS_CHAINS + TREE_HEIGHT) * N;
+pub(crate) const UFORS_LEN: usize = UFORS_TREES * UFORS_TREE_LEN;
 pub(crate) const LAYER_LEN: usize = (CHAINS + TREE_HEIGHT) * N;
-/// Byte length of a BLINCS-128-7x5 [`crate::Imprint`] (`7,392` bytes).
-pub const IMPRINT_LEN: usize = 2 * N + FORS_LEN + LAYERS * LAYER_LEN;
+/// Byte length of a BLINCS-128-7x5 [`crate::Imprint`] (`6,432` bytes).
+pub const IMPRINT_LEN: usize = 2 * N + UFORS_LEN + LAYERS * LAYER_LEN;
 
 const _: () = {
     assert!(W == (CHAIN_STEPS as usize) + 1 && CHAINS == 35 && MSG_CHAINS * 4 == N * 8);
-    assert!(FORS_TREES * FORS_HEIGHT == 160 && HYPER_BITS == 35 && HYPER_BITS < 48);
-    assert!(LAYERS <= 256 && TREE_LEAVES <= 65536 && FORS_TREES <= 65536 && FORS_HEIGHT <= 65535 && CHAINS <= 65536);
-    assert!(IMPRINT_LEN == 7392 && 2 * N + FORS_LEN + 7 * LAYER_LEN == IMPRINT_LEN);
+    assert!(UFORS_W == (UFORS_STEPS as usize) + 1 && UFORS_CHAINS == 3 && UFORS_SUM == 16 && 16 + UFORS_CHAINS * N == 64);
+    assert!(UFORS_TREES * (TREE_HEIGHT + UFORS_CODE_BITS) + HYPER_BITS == 200 && HYPER_BITS == 35 && HYPER_BITS < 48);
+    assert!(LAYERS <= (UFORS_LAYER_BASE as usize) && (UFORS_LAYER_BASE as usize) + UFORS_TREES < 256);
+    assert!(UFORS_TOTAL_LEAVES == 480 && UFORS_TOTAL_CHAINS == 1440 && UFORS_LEN == 1920 && LAYER_LEN == 640);
+    assert!(IMPRINT_LEN == 6432 && 2 * N + UFORS_LEN + 7 * LAYER_LEN == IMPRINT_LEN && UFORS_CODE.len() == 64);
 };
+
+/// Canonical 64-entry upper-layer constant-sum extreme-variance code in `{0..=9}^3` with sum `16` (`SPEC.md`).
+pub(crate) const UFORS_CODE: [[u8; UFORS_CHAINS]; 1 << UFORS_CODE_BITS] = [
+    [0, 7, 9],
+    [0, 8, 8],
+    [0, 9, 7],
+    [1, 6, 9],
+    [1, 7, 8],
+    [1, 8, 7],
+    [1, 9, 6],
+    [2, 5, 9],
+    [2, 6, 8],
+    [2, 7, 7],
+    [2, 8, 6],
+    [2, 9, 5],
+    [3, 4, 9],
+    [3, 5, 8],
+    [3, 6, 7],
+    [3, 7, 6],
+    [3, 8, 5],
+    [3, 9, 4],
+    [4, 3, 9],
+    [4, 4, 8],
+    [4, 5, 7],
+    [4, 7, 5],
+    [4, 8, 4],
+    [4, 9, 3],
+    [5, 2, 9],
+    [5, 3, 8],
+    [5, 4, 7],
+    [5, 7, 4],
+    [5, 8, 3],
+    [5, 9, 2],
+    [6, 1, 9],
+    [6, 2, 8],
+    [6, 3, 7],
+    [6, 6, 4],
+    [6, 7, 3],
+    [6, 8, 2],
+    [6, 9, 1],
+    [7, 0, 9],
+    [7, 1, 8],
+    [7, 2, 7],
+    [7, 3, 6],
+    [7, 4, 5],
+    [7, 5, 4],
+    [7, 6, 3],
+    [7, 7, 2],
+    [7, 8, 1],
+    [7, 9, 0],
+    [8, 0, 8],
+    [8, 1, 7],
+    [8, 2, 6],
+    [8, 3, 5],
+    [8, 4, 4],
+    [8, 5, 3],
+    [8, 6, 2],
+    [8, 7, 1],
+    [8, 8, 0],
+    [9, 0, 7],
+    [9, 1, 6],
+    [9, 2, 5],
+    [9, 3, 4],
+    [9, 4, 3],
+    [9, 5, 2],
+    [9, 6, 1],
+    [9, 7, 0],
+];
 
 // Key-derivation contexts (SPEC.md, "Key-derivation contexts").
 // Algorithm contexts bind SUITE_NAME ("BLINCS-128-7x5") so suites never share derived keys.
-pub(crate) const CTX_SECRET_VALUES: &str = "BLINCS-128-7x5 2026-11-25 secret values";
-pub(crate) const CTX_CONTENT_SALT: &str = "BLINCS-128-7x5 2026-11-25 content salt";
-pub(crate) const CTX_RANDOMIZER: &str = "BLINCS-128-7x5 2026-11-25 randomizer";
-pub(crate) const CTX_PUBLIC_SEED: &str = "BLINCS-128-7x5 2026-11-25 public seed";
-pub(crate) const CTX_PUBLIC_HASH: &str = "BLINCS-128-7x5 2026-11-25 public hash";
-pub(crate) const CTX_CONTENT: &str = "BLINCS-128-7x5 2026-11-25 content";
-pub(crate) const CTX_GENERATE_SIGNET: &str = "Signet BLINCS-128-7x5 2026-11-25 generate signet";
-pub(crate) const CTX_MIX: &str = "Signet 2026-11-25 randomness: mix";
-pub(crate) const CTX_NEXT_SEED: &str = "Signet 2026-11-25 randomness: next seed";
-pub(crate) const CTX_RUN_KEY: &str = "Signet 2026-11-25 randomness: key of this run";
-pub(crate) const CTX_KEYGEN_KEY: &str = "Signet 2026-11-25 randomness: keygen key";
+pub(crate) const CTX_SECRET_VALUES: &str = "BLINCS-128-7x5 2026-11-26 secret values";
+pub(crate) const CTX_CONTENT_SALT: &str = "BLINCS-128-7x5 2026-11-26 content salt";
+pub(crate) const CTX_RANDOMIZER: &str = "BLINCS-128-7x5 2026-11-26 randomizer";
+pub(crate) const CTX_PUBLIC_SEED: &str = "BLINCS-128-7x5 2026-11-26 public seed";
+pub(crate) const CTX_PUBLIC_HASH: &str = "BLINCS-128-7x5 2026-11-26 public hash";
+pub(crate) const CTX_CONTENT: &str = "BLINCS-128-7x5 2026-11-26 content";
+pub(crate) const CTX_GENERATE_SIGNET: &str = "Signet BLINCS-128-7x5 2026-11-26 generate signet";
+pub(crate) const CTX_MIX: &str = "Signet 2026-11-26 randomness: mix";
+pub(crate) const CTX_NEXT_SEED: &str = "Signet 2026-11-26 randomness: next seed";
+pub(crate) const CTX_RUN_KEY: &str = "Signet 2026-11-26 randomness: key of this run";
+pub(crate) const CTX_KEYGEN_KEY: &str = "Signet 2026-11-26 randomness: keygen key";
 
 #[inline]
 pub(crate) fn ensure_init() {
@@ -87,14 +163,26 @@ pub(crate) fn pack_pair(dst: &mut [u8; 48], t: [u8; 16], left: &[u8], right: &[u
     dst[32..48].copy_from_slice(right);
 }
 
+/// Extract `width` bits (`1..=57`) starting at LSB-first bit offset `bit_off` from `d`.
+#[inline]
+pub(crate) fn read_bits(d: &[u8; 32], bit_off: usize, width: usize) -> u64 {
+    assert!((1..=57).contains(&width) && bit_off + width <= 256);
+    let byte_off = bit_off / 8;
+    let shift = bit_off % 8;
+    let mut raw = [0u8; 8];
+    let avail = (32 - byte_off).min(8);
+    raw[..avail].copy_from_slice(&d[byte_off..byte_off + avail]);
+    (u64::from_le_bytes(raw) >> shift) & ((1u64 << width) - 1)
+}
+
 fn tree_hasher(key: &[u8; 32], use_sme2: bool) -> TreeHasher {
     if use_sme2 { TreeHasher::new(Mode::Keyed(key)) } else { TreeHasher::new(Mode::Keyed(key)).on_this_core() }
 }
 
 /// Separate newtypes for secret (`K_sec`) vs. public (`K_pub`) tree keys prevent cross-role mixups.
 ///
-/// `SecretKey` exposes only the exact secret-domain batch derivations (`ChainSecret` and
-/// `FewSecret`) and never hands out a raw `TreeHasher`, so public-tweak callers cannot misuse it.
+/// `SecretKey` exposes only narrow secret-domain `ChainSecret` batch derivations and never hands
+/// out a raw `TreeHasher`, so public-tweak callers cannot misuse it.
 #[derive(Clone, Copy)]
 pub(crate) struct SecretKey([u8; 32]);
 
@@ -103,7 +191,7 @@ impl SecretKey {
         Self(derive_key(CTX_SECRET_VALUES, seed))
     }
 
-    /// Derive all `TREE_LEAVES * CHAINS` WOTS+ start values for hypertree `(layer, tree)`.
+    /// Derive all `TREE_LEAVES * CHAINS` (1,120) WOTS+ start values for hypertree `(layer, tree)`.
     pub(crate) fn derive_wots_tree_starts(&self, layer: Layer, tree: u64, b16: &mut [[u8; 16]], out: &mut [[u8; 32]]) {
         assert!(tree < layer.trees());
         let layer_u8 = layer.as_u8();
@@ -117,7 +205,7 @@ impl SecretKey {
         tree_hasher(&self.0, true).hash_many(&b16[..total], &mut out[..total]);
     }
 
-    /// Derive the `CHAINS` WOTS+ start values for one hypertree leaf `(layer, tree, leaf)`.
+    /// Derive the `CHAINS` (35) WOTS+ start values for one hypertree leaf `(layer, tree, leaf)`.
     pub(crate) fn derive_wots_leaf_starts(&self, layer: Layer, tree: u64, leaf: u16) -> [[u8; N]; CHAINS] {
         assert!(tree < layer.trees() && usize::from(leaf) < TREE_LEAVES);
         let layer_u8 = layer.as_u8();
@@ -130,11 +218,22 @@ impl SecretKey {
         core::array::from_fn(|c| first_n(&hashes[c]))
     }
 
-    /// Derive all `FORS_LEAVES` secret values for one FORS tree `fors_tree` under `leaf_addr`.
-    pub(crate) fn derive_fors_tree_secrets(&self, leaf_addr: LeafAddr, fors_tree: u16, out: &mut [[u8; 32]]) {
-        assert!(usize::from(fors_tree) < FORS_TREES && out.len() == FORS_LEAVES);
-        let secret_template = tweak(TweakKind::FewSecret, 0, leaf_addr.as_u64(), fors_tree, 0, 0);
-        tree_hasher(&self.0, true).hash_counter_range(&secret_template, 3, 0, out);
+    /// Derive all `UFORS_TOTAL_CHAINS` (`15 * 32 * 3 = 1,440`) U-FORS chain starts under `leaf_addr`.
+    pub(crate) fn derive_ufors_starts(&self, leaf_addr: LeafAddr, b16: &mut [[u8; 16]], out: &mut [[u8; 32]]) {
+        assert!(b16.len() >= UFORS_TOTAL_CHAINS && out.len() >= UFORS_TOTAL_CHAINS);
+        let tree = leaf_addr.as_u64();
+        let mut slot = 0usize;
+        for t in 0..UFORS_TREES {
+            let layer_u8 = UFORS_LAYER_BASE + u8::try_from(t).unwrap();
+            for leaf in 0..TREE_LEAVES {
+                let leaf_u16 = u16::try_from(leaf).unwrap();
+                for c in 0..UFORS_CHAINS {
+                    b16[slot] = tweak(TweakKind::ChainSecret, layer_u8, tree, leaf_u16, u16::try_from(c).unwrap(), 0);
+                    slot += 1;
+                }
+            }
+        }
+        tree_hasher(&self.0, true).hash_many(&b16[..UFORS_TOTAL_CHAINS], &mut out[..UFORS_TOTAL_CHAINS]);
     }
 }
 
@@ -155,7 +254,7 @@ impl PublicKey {
     }
 }
 
-/// Tweak domain tag (SPEC.md, "Tweaks").
+/// Six unified tweak domain tags (SPEC.md, "Tweaks").
 #[repr(u8)]
 #[derive(Clone, Copy)]
 pub(crate) enum TweakKind {
@@ -163,11 +262,8 @@ pub(crate) enum TweakKind {
     Chain = 2,
     OneTimeKey = 3,
     Node = 4,
-    FewSecret = 5,
-    FewLeaf = 6,
-    FewNode = 7,
-    FewRoot = 8,
-    Message = 9,
+    FewRoot = 5,
+    Message = 6,
 }
 
 /// Uniform hypertree layer (`0..7`), each of height `TREE_HEIGHT = 5` (`32` leaves).
@@ -202,7 +298,7 @@ impl Layer {
     }
 
     pub(crate) const fn sig_offset(self) -> usize {
-        2 * N + FORS_LEN + self.index() * LAYER_LEN
+        2 * N + UFORS_LEN + self.index() * LAYER_LEN
     }
 }
 

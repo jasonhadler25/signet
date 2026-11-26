@@ -33,12 +33,12 @@ import blincs  # noqa: E402
 
 REF_IMP = os.path.join(ROOT, "test_vectors", "reference-imprint-1.bin")
 REF_CTX = b"BLINCS-128-7x5 reference vector v1"
-REF_SHA256 = "056e4c91aab74cf3ae9dedc3b0799e25f0eb19d25070e285f3b114c601ffe993"
-REF_BLAKE3 = "1f90309febb00685d497c84edfae3bf9563206e15215f143a1eab51bcc5332bf"
+REF_SHA256 = "5d1b63aa041a6cd3f44b9e5a2c2ed27d4ab6b4d166d3a28a8d019a611472ced6"
+REF_BLAKE3 = "e9e433283ad714c487275b7dcc747fb5e93c7f43d98353d24dd98d2e4794b231"
 EDGE_VEC = os.path.join(ROOT, "test_vectors", "edge-vectors.json")
-EDGE_SHA256 = "4ef1f28a65247ee8a17981a6faa6d3dda99b68126ae721cd40572b0379e48299"
-EDGE_BLAKE3 = "0616c04735308daff990d1051a8992da5052d4f9d1fc63c18acba7a67df68483"
-REF_SIGNET_ID = "b58abfb655db7c92808f12c3a8ffd2d04841cf61994321648cf193638876c492"
+EDGE_SHA256 = "ef06e6fe467be56bae91434c2042f73bc7b994ae116a4de68f463de12fc747e1"
+EDGE_BLAKE3 = "981210f93509158996974e12f521a002e62b24ace355cbd720ff0ee7db8e6bb2"
+REF_SIGNET_ID = "98a5b8314b854e78f72cbadc9f5ed67c15bc2ad253cd98be1d5951595f217512"
 
 EDGE_MSGS = {
     "empty": b"",
@@ -66,7 +66,7 @@ def run(label, cmd, extra_env=None):
 def check_vectors_and_references():
     print("==> Checking reference-imprint-1.bin digests (SHA-256 + BLAKE3)")
     raw = open(REF_IMP, "rb").read()
-    if len(raw) != 7392:
+    if len(raw) != 6432:
         fail(f"unexpected length {len(raw)}")
     got_sha256 = hashlib.sha256(raw).hexdigest()
     got_blake3 = blake3.hash(raw).hex()
@@ -121,7 +121,7 @@ def check_vectors_and_references():
                 f"ba = bytearray(bytes.fromhex('{REF_SIGNET_ID}'))\n"
                 "sid = blincs.SignetId(ba)\n"
                 "ba[0] ^= 0xff\n"
-                "if sid.bytes[0] != 0xb5: raise SystemExit(1)\n"
+                "if sid.bytes[0] != 0x98: raise SystemExit(1)\n"
             ),
         ],
     )
@@ -164,10 +164,10 @@ for (const e of edges) {{
 const [ns, rk, kk] = expandPool(mixPool(hex("01".repeat(32)), hex("02".repeat(32)), 4242, enc.encode("clock-reading")));
 const got = [ns, rk, kk, draw(rk, 0n)].map(toHex);
 const want = [
-  "e25f6194f016297e9ede065cdda5791ac021a69fbc0912e318ecb321d70f7d24",
-  "f3454e55d82b6e1350a46c01a4be23a55f9f6ebb51baadf364ee91fa11c3d84c",
-  "9f080816264c88adc6207059744e0d64f739a1b984e7db047fea9ffe15e47615",
-  "5f2db2b96c8a6873291819498bec87e7c5d514877f21f55452125372f93f034f",
+  "97b8baab73eac1d7054392950f031281019b65b801470471fe558ab838bb18d8",
+  "0c098f138cdb2414e1d302cc2239c6083666a0a0df0a09b5e016f3425ebcb663",
+  "6c6e05e84a6afff9374640a0f0db963b696a501e88f175967efd5b8c8a74b8e7",
+  "7a6fcaeaa30742062cee1f2be0ac3aafb1ec114b1f14c44a87899e34cfd43d26",
 ];
 if (JSON.stringify(got) !== JSON.stringify(want)) throw new Error("mixPool/draw mismatch: " + got.join(" "));
 """

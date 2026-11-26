@@ -1,14 +1,15 @@
 use crate::params::{
-    CHAIN_STEPS, CHAINS, FORS_TOTAL_LEAVES, LAYER_LEN, Layer, MSG_CHAINS, N, PublicKey, SecretKey, TREE_HEIGHT, TREE_LEAVES, TweakKind, first_n, pack_pair,
-    pack_tagged, tweak,
+    CHAIN_STEPS, CHAINS, LAYER_LEN, Layer, MSG_CHAINS, N, PublicKey, SecretKey, TREE_HEIGHT, TREE_LEAVES, TweakKind, UFORS_TOTAL_CHAINS, UFORS_TOTAL_LEAVES,
+    first_n, pack_pair, pack_tagged, tweak,
 };
-use blake3_servil_core::throughput::{Batch, Prepared, TreeHasher};
+use blake3_servil_core::throughput::{Batch, Block, Prepared, TreeHasher};
 
 const WOTS_BATCH_SLOTS: usize = TREE_LEAVES * CHAINS;
-const MERKLE_BATCH_SLOTS: usize = FORS_TOTAL_LEAVES / 2;
+const MERKLE_BATCH_SLOTS: usize = UFORS_TOTAL_LEAVES / 2;
 
 const _: () = {
-    assert!(WOTS_BATCH_SLOTS == 1120 && FORS_TOTAL_LEAVES == 5120 && FORS_TOTAL_LEAVES >= WOTS_BATCH_SLOTS && MERKLE_BATCH_SLOTS == 2560);
+    assert!(WOTS_BATCH_SLOTS == 1120 && UFORS_TOTAL_CHAINS == 1440 && UFORS_TOTAL_CHAINS >= WOTS_BATCH_SLOTS);
+    assert!(UFORS_TOTAL_LEAVES == 480 && MERKLE_BATCH_SLOTS == 240);
 };
 
 /// Transient heap workspace owned by a single `Signet::from_seed` or `Signet::imprint` call.
@@ -16,20 +17,23 @@ pub(crate) struct SignWorkspace {
     pub b16: Vec<[u8; 16]>,
     pub b32: Vec<[u8; 32]>,
     pub b48: Vec<[u8; 48]>,
+    pub b64: Vec<Block>,
     pub b_pk: Batch<'static>,
     pub out: Vec<[u8; 32]>,
 }
 
 impl SignWorkspace {
     pub(crate) fn new(for_imprint: bool) -> Self {
-        let batch_32 = if for_imprint { FORS_TOTAL_LEAVES } else { WOTS_BATCH_SLOTS };
+        let batch_chains = if for_imprint { UFORS_TOTAL_CHAINS } else { WOTS_BATCH_SLOTS };
         let batch_48 = if for_imprint { MERKLE_BATCH_SLOTS } else { TREE_LEAVES / 2 };
+        let batch_64 = if for_imprint { UFORS_TOTAL_LEAVES } else { 0 };
         Self {
-            b16: vec![[0u8; 16]; WOTS_BATCH_SLOTS],
-            b32: vec![[0u8; 32]; batch_32],
+            b16: vec![[0u8; 16]; batch_chains],
+            b32: vec![[0u8; 32]; batch_chains],
             b48: vec![[0u8; 48]; batch_48],
+            b64: vec![Block::ZERO; batch_64],
             b_pk: Batch::new(16 + N * CHAINS, TREE_LEAVES),
-            out: vec![[0u8; 32]; batch_32],
+            out: vec![[0u8; 32]; batch_chains],
         }
     }
 }

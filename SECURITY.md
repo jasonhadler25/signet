@@ -18,20 +18,20 @@ Full mathematical and operational details are in [`SPEC.md`](SPEC.md) and [`DESI
 - **Supported platforms:** Linux (`x86_64`, `aarch64`) and macOS (`x86_64`, `aarch64`) for the host `signet` crate, plus freestanding `wasm32-unknown-unknown` (and host targets) for the standalone `#![no_std]` `signet-verify` verifier crate. If your platform is not on this list, this software is not expected to work for that use.
 - **State file placement:** provision a dedicated private 32-byte regular file (`0600` on Unix) inside a private directory on a local filesystem whose ancestor directories are writable only by the signing user or system administrator. `initialize` checks that the path is a private (`0600`) regular non-symlink file of exact length 32 bytes without touching invalid paths, derives independent `next_seed`, `run_key`, and `keygen_key` outputs (preserving forward secrecy on disk), and rotates `next_seed` atomically via a `0600` sibling temp file + POSIX `rename` with no locks.
 - **Process forks and VM snapshots:** in multithreaded POSIX processes, call `exec()` before initializing Signet rather than calling `Randomness::initialize` directly after `fork()`. After restoring a live VM snapshot, ensure genuinely fresh unshared OS entropy before initializing so cloned images do not repeat `(run_key, count)`.
-- **Memory retention:** `Signet` retains its 32-byte seed, derived keys, and inline 1 KiB top tree; signing allocates a transient local `SignWorkspace` (~475 KiB for cross-tree FORS batching) freed on return. Neither Signet nor `blake3-servil-core` wipes secret key memory on drop. Verification in `signet` uses local stack buffers, and standalone `crates/signet-verify` links with `#![no_std]` and zero allocator.
+- **Memory retention:** `Signet` retains its 32-byte seed, derived keys, and inline 1 KiB top tree; signing allocates a transient local `SignWorkspace` (~175 KiB for cross-tree U-FORS batching) freed on return. Neither Signet nor `blake3-servil-core` wipes secret key memory on drop. Verification in `signet` uses local stack buffers, and standalone `crates/signet-verify` links with `#![no_std]` and zero allocator.
 - **Pass the original message or stream directly:** call `imprint`/`imprint_with` and `verify`/`verify_with` on the full message so the entire input is hashed in BLINCS's single salted BLAKE3 pass at full speed, resting on randomized target-collision resistance rather than unsalted collision resistance.
 
 ## Timing and secret independence
 
-In Signet's Rust code, every branch and memory index during signing and verification depends only on public inputs or values reconstructible from the message, context, and imprint (`salt`, `randomizer`, `D`, `fors_indices`, `leaf_addr`, and WOTS+ chain digits). Secret values (`seed`, `SecretKey`, `salt_key`, `randomizer_key`, `run_key`, `keygen_key`, `draw`, and unrevealed leaf secrets) are only copied or hashed by `blake3-servil-core`, whose assembly kernels are proved branch- and address-independent of keys and inputs. Hardware timing guarantees (Arm `DIT`, Intel `DOITM`, and mitigation of frequency/prefetcher channels such as Hertzbleed or GoFetch) remain the caller's or platform's responsibility; see [`QUALITY.md`](QUALITY.md).
+In Signet's Rust code, every branch and memory index during signing and verification depends only on public inputs or values reconstructible from the message, context, and imprint (`salt`, `randomizer`, `D`, U-FORS selections, `leaf_addr`, and WOTS+ chain digits). Secret values (`seed`, `SecretKey`, `salt_key`, `randomizer_key`, `run_key`, `keygen_key`, `draw`, and unrevealed U-FORS/WOTS+ chain starts) are only copied or hashed by `blake3-servil-core`, whose assembly kernels are proved branch- and address-independent of keys and inputs. Hardware timing guarantees (Arm `DIT`, Intel `DOITM`, and mitigation of frequency/prefetcher channels such as Hertzbleed or GoFetch) remain the caller's or platform's responsibility; see [`QUALITY.md`](QUALITY.md).
 
 ## Verifying checked-in vectors
 
 Where this repository records digests, it records both SHA-256 and BLAKE3:
 
-- `test_vectors/reference-imprint-1.bin` (`7,392` bytes, `ctx = b"BLINCS-128-7x5 reference vector v1"`):
-  - SHA-256: `056e4c91aab74cf3ae9dedc3b0799e25f0eb19d25070e285f3b114c601ffe993`
-  - BLAKE3:  `1f90309febb00685d497c84edfae3bf9563206e15215f143a1eab51bcc5332bf`
+- `test_vectors/reference-imprint-1.bin` (`6,432` bytes, `ctx = b"BLINCS-128-7x5 reference vector v1"`):
+  - SHA-256: `5d1b63aa041a6cd3f44b9e5a2c2ed27d4ab6b4d166d3a28a8d019a611472ced6`
+  - BLAKE3:  `e9e433283ad714c487275b7dcc747fb5e93c7f43d98353d24dd98d2e4794b231`
 - `test_vectors/edge-vectors.json` (4 boundary vectors: empty/empty-ctx, 1 B, 1,024 B, 16,385 B with max 255-byte context and bit-34 `leaf_addr`):
-  - SHA-256: `4ef1f28a65247ee8a17981a6faa6d3dda99b68126ae721cd40572b0379e48299`
-  - BLAKE3:  `0616c04735308daff990d1051a8992da5052d4f9d1fc63c18acba7a67df68483`
+  - SHA-256: `ef06e6fe467be56bae91434c2042f73bc7b994ae116a4de68f463de12fc747e1`
+  - BLAKE3:  `981210f93509158996974e12f521a002e62b24ace355cbd720ff0ee7db8e6bb2`

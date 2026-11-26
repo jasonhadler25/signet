@@ -7,11 +7,11 @@
 //! Designed for post-quantum use with a 128-bit classical security target at up to 2³² imprints
 //! per signet (do not imprint more than 2³² things with one signet; see `SPEC.md` for bounds).
 //! Runs strictly on the calling thread (`blake3-servil-core`; no background worker threads) with
-//! zero counter grinding (`7×5` uniform hypertree, byte-aligned `FORS(8, 20)`, 1 KiB top tree).
+//! zero counter grinding (`7×5` uniform hypertree, `U-FORS(3, 10, 16, 64, 5, 15)`, 1 KiB top tree).
 //! Supported platforms: Linux (`x86_64`, `aarch64`) and macOS (`x86_64`, `aarch64`).
 //! Because a cryptographic key is a transferable bearer authority rather than a person's handwritten
 //! signature, this API calls the secret a [`Signet`], its 32-byte self-certifying identifier a
-//! [`SignetId`] (which names which signet you mean and verifies its imprints), and the 7,392-byte
+//! [`SignetId`] (which names which signet you mean and verifies its imprints), and the 6,432-byte
 //! proof an [`Imprint`]. Pass a domain-separating [`Context`] and the original message bytes or
 //! stream directly: BLINCS hashes the input in a single salted keyed-BLAKE3 pass under a fresh
 //! per-imprint salt.
@@ -64,11 +64,11 @@ pub use params::{IMPRINT_LEN, MAX_CONTEXT_LEN, SEED_LEN, SIGNET_ID_LEN, SUITE_NA
 pub use randomness::Randomness;
 
 use content::{content_from_slice, content_with};
-use few_time::{build_all_fors, fors_verify, parse_digest};
+use few_time::{build_all_ufors, parse_digest, ufors_verify};
 use one_time::{Pos, SignWorkspace, build_tree_heap, verify_layer, write_layer_signature};
 use params::{
-    CTX_CONTENT, CTX_CONTENT_SALT, CTX_GENERATE_SIGNET, CTX_PUBLIC_SEED, CTX_RANDOMIZER, FORS_LEN, LAYER_LEN, Layer, N, PublicKey, SHORT_LEN, SecretKey,
-    TREE_LEAVES, TweakKind, derive_key, ensure_init, first_n, keyed, tweak,
+    CTX_CONTENT, CTX_CONTENT_SALT, CTX_GENERATE_SIGNET, CTX_PUBLIC_SEED, CTX_RANDOMIZER, LAYER_LEN, Layer, N, PublicKey, SHORT_LEN, SecretKey, TREE_LEAVES,
+    TweakKind, UFORS_LEN, derive_key, ensure_init, first_n, keyed, tweak,
 };
 use randomness::read_os_randomness;
 use std::array::TryFromSliceError;
@@ -225,18 +225,18 @@ pub(crate) fn compute_message_digest(public_key: &PublicKey, randomizer: &[u8; N
     public_key.keyed(&buf[..96 + ctx_len])
 }
 
-/// A 7,392-byte BLINCS-128-7x5 imprint (proof produced by pressing a [`Signet`] onto a context and message).
+/// A 6,432-byte BLINCS-128-7x5 imprint (proof produced by pressing a [`Signet`] onto a context and message).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Imprint([u8; IMPRINT_LEN]);
 
 impl Imprint {
-    /// Wrap a raw 7,392-byte imprint array.
+    /// Wrap a raw 6,432-byte imprint array.
     #[must_use]
     pub fn from_bytes(bytes: &[u8; IMPRINT_LEN]) -> Self {
         Self(*bytes)
     }
 
-    /// Borrow the raw 7,392 imprint bytes.
+    /// Borrow the raw 6,432 imprint bytes.
     pub fn as_bytes(&self) -> &[u8; IMPRINT_LEN] {
         &self.0
     }
@@ -249,8 +249,8 @@ impl Imprint {
         self.0[N..2 * N].try_into().unwrap()
     }
 
-    fn fors(&self) -> &[u8; FORS_LEN] {
-        self.0[2 * N..2 * N + FORS_LEN].try_into().unwrap()
+    fn ufors(&self) -> &[u8; UFORS_LEN] {
+        self.0[2 * N..2 * N + UFORS_LEN].try_into().unwrap()
     }
 
     fn layer(&self, layer: Layer) -> &[u8] {
@@ -353,10 +353,10 @@ impl SignetId {
         }
         let digest = compute_message_digest(&self.public_key, imprint.randomizer(), self.root(), short, ctx);
         let public = self.public_key.hasher(false);
-        let (fors_indices, leaf_addr) = parse_digest(&digest);
+        let (ufors_sel, leaf_addr) = parse_digest(&digest);
         let coords = leaf_addr.split_layers();
 
-        let mut node = fors_verify(&public, leaf_addr, &fors_indices, imprint.fors());
+        let mut node = ufors_verify(&public, leaf_addr, &ufors_sel, imprint.ufors());
         for layer in Layer::ALL {
             let (tree, leaf) = coords[layer.index()];
             node = verify_layer(&public, Pos::new(layer, tree, leaf), &node, imprint.layer(layer));
@@ -436,13 +436,13 @@ impl Signet {
         sig[N..2 * N].copy_from_slice(&randomizer);
 
         let digest = compute_message_digest(&self.id.public_key, &randomizer, self.id.root(), short, ctx);
-        let (fors_indices, leaf_addr) = parse_digest(&digest);
+        let (ufors_sel, leaf_addr) = parse_digest(&digest);
         let coords = leaf_addr.split_layers();
         let (sec, pubk) = (self.secret_key, self.id.public_key);
         let mut ws = SignWorkspace::new(true);
 
-        let fors_slice: &mut [u8; FORS_LEN] = (&mut sig[2 * N..2 * N + FORS_LEN]).try_into().unwrap();
-        let mut node = build_all_fors(&sec, &pubk, leaf_addr, &fors_indices, &mut ws, fors_slice);
+        let ufors_slice: &mut [u8; UFORS_LEN] = (&mut sig[2 * N..2 * N + UFORS_LEN]).try_into().unwrap();
+        let mut node = build_all_ufors(&sec, &pubk, leaf_addr, &ufors_sel, &mut ws, ufors_slice);
 
         // Build the 6 lower Merkle heaps and imprint all 7 uniform hypertree layers.
         for layer in Layer::LOWER {

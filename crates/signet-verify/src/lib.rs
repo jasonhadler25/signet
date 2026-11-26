@@ -1,4 +1,4 @@
-//! Standalone `#![no_std]`, zero-allocation verifier for **`BLINCS-128-7x5`** signatures.
+//! Standalone `#![no_std]`, zero-allocation verifier for **`BLINCS-128-7x5`** (`U-FORS`) signatures.
 //!
 //! **Pre-1.0 experimental software (unsupported):** wire formats, context strings, and APIs may
 //! change before 1.0, and no independent human cryptographic audit has been performed.
@@ -17,12 +17,12 @@ use core::array::TryFromSliceError;
 use core::error::Error;
 use core::fmt;
 
-/// Permanent suite identifier for this BLINCS parameter set (`7×5`, `FORS(8, 20)`, 2³² budget).
+/// Permanent suite identifier for this BLINCS parameter set (`7×5`, `U-FORS(3, 10, 16, 64, 5, 15)`, 2³² budget).
 pub const SUITE_NAME: &str = "BLINCS-128-7x5";
 /// Byte length of a [`SignetId`] wire encoding (`32` bytes: `public_seed || top_root`).
 pub const SIGNET_ID_LEN: usize = 32;
-/// Byte length of a `BLINCS-128-7x5` signature (`7,392` bytes).
-pub const IMPRINT_LEN: usize = 7392;
+/// Byte length of a `BLINCS-128-7x5` signature (`6,432` bytes).
+pub const IMPRINT_LEN: usize = 6432;
 /// Maximum byte length of a [`Context`] application domain tag (`255` bytes).
 pub const MAX_CONTEXT_LEN: usize = 255;
 
@@ -33,24 +33,97 @@ const CHAIN_STEPS: u8 = 15;
 const MSG_CHAINS: usize = 2 * N;
 const CSUM_CHAINS: usize = 3;
 const CHAINS: usize = MSG_CHAINS + CSUM_CHAINS;
-const FORS_HEIGHT: usize = 8;
-const FORS_TREES: usize = 20;
+
+const UFORS_TREES: usize = 15;
+const UFORS_CHAINS: usize = 3;
+const UFORS_STEPS: u8 = 9;
+const UFORS_CODE_BITS: usize = 6;
+const UFORS_LAYER_BASE: u8 = 0x80;
+const UFORS_TREE_LEN: usize = (UFORS_CHAINS + TREE_HEIGHT) * N;
+const UFORS_LEN: usize = UFORS_TREES * UFORS_TREE_LEN;
+
 const HYPER_BITS: usize = LAYERS * TREE_HEIGHT;
 const SHORT_LEN: usize = N + 32;
-const FORS_LEN: usize = FORS_TREES * (1 + FORS_HEIGHT) * N;
 const LAYER_LEN: usize = (CHAINS + TREE_HEIGHT) * N;
 const MSG_DIGEST_INPUT_MAX_LEN: usize = 16 + N + N + SHORT_LEN + 1 + MAX_CONTEXT_LEN;
 
 const _: () = {
     assert!(CHAINS == 35 && MSG_CHAINS * 4 == N * 8);
-    assert!(FORS_TREES * FORS_HEIGHT == 160 && HYPER_BITS == 35);
-    assert!(2 * N + FORS_LEN + LAYERS * LAYER_LEN == IMPRINT_LEN);
+    assert!(UFORS_TREES * (TREE_HEIGHT + UFORS_CODE_BITS) + HYPER_BITS == 200 && HYPER_BITS == 35);
+    assert!(2 * N + UFORS_LEN + LAYERS * LAYER_LEN == IMPRINT_LEN);
     assert!(MSG_DIGEST_INPUT_MAX_LEN == 352);
 };
 
+const UFORS_CODE: [[u8; UFORS_CHAINS]; 1 << UFORS_CODE_BITS] = [
+    [0, 7, 9],
+    [0, 8, 8],
+    [0, 9, 7],
+    [1, 6, 9],
+    [1, 7, 8],
+    [1, 8, 7],
+    [1, 9, 6],
+    [2, 5, 9],
+    [2, 6, 8],
+    [2, 7, 7],
+    [2, 8, 6],
+    [2, 9, 5],
+    [3, 4, 9],
+    [3, 5, 8],
+    [3, 6, 7],
+    [3, 7, 6],
+    [3, 8, 5],
+    [3, 9, 4],
+    [4, 3, 9],
+    [4, 4, 8],
+    [4, 5, 7],
+    [4, 7, 5],
+    [4, 8, 4],
+    [4, 9, 3],
+    [5, 2, 9],
+    [5, 3, 8],
+    [5, 4, 7],
+    [5, 7, 4],
+    [5, 8, 3],
+    [5, 9, 2],
+    [6, 1, 9],
+    [6, 2, 8],
+    [6, 3, 7],
+    [6, 6, 4],
+    [6, 7, 3],
+    [6, 8, 2],
+    [6, 9, 1],
+    [7, 0, 9],
+    [7, 1, 8],
+    [7, 2, 7],
+    [7, 3, 6],
+    [7, 4, 5],
+    [7, 5, 4],
+    [7, 6, 3],
+    [7, 7, 2],
+    [7, 8, 1],
+    [7, 9, 0],
+    [8, 0, 8],
+    [8, 1, 7],
+    [8, 2, 6],
+    [8, 3, 5],
+    [8, 4, 4],
+    [8, 5, 3],
+    [8, 6, 2],
+    [8, 7, 1],
+    [8, 8, 0],
+    [9, 0, 7],
+    [9, 1, 6],
+    [9, 2, 5],
+    [9, 3, 4],
+    [9, 4, 3],
+    [9, 5, 2],
+    [9, 6, 1],
+    [9, 7, 0],
+];
+
 // Public verifier key-derivation contexts (SPEC.md, "Key-derivation contexts").
-const CTX_PUBLIC_HASH: &str = "BLINCS-128-7x5 2026-11-25 public hash";
-const CTX_CONTENT: &str = "BLINCS-128-7x5 2026-11-25 content";
+const CTX_PUBLIC_HASH: &str = "BLINCS-128-7x5 2026-11-26 public hash";
+const CTX_CONTENT: &str = "BLINCS-128-7x5 2026-11-26 content";
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
@@ -58,10 +131,8 @@ enum TweakKind {
     Chain = 2,
     OneTimeKey = 3,
     Node = 4,
-    FewLeaf = 6,
-    FewNode = 7,
-    FewRoot = 8,
-    Message = 9,
+    FewRoot = 5,
+    Message = 6,
 }
 
 #[inline]
@@ -92,6 +163,17 @@ fn tweak(kind: TweakKind, layer: u8, tree: u64, leaf: u16, idx: u16, step: u32) 
     out[10..12].copy_from_slice(&idx.to_le_bytes());
     out[12..16].copy_from_slice(&step.to_le_bytes());
     out
+}
+
+#[inline]
+fn read_bits(d: &[u8; 32], bit_off: usize, width: usize) -> u64 {
+    assert!((1..=57).contains(&width) && bit_off + width <= 256);
+    let byte_off = bit_off / 8;
+    let shift = bit_off % 8;
+    let mut raw = [0u8; 8];
+    let avail = (32 - byte_off).min(8);
+    raw[..avail].copy_from_slice(&d[byte_off..byte_off + avail]);
+    (u64::from_le_bytes(raw) >> shift) & ((1u64 << width) - 1)
 }
 
 /// Returned by [`Context::try_new`] when a context slice exceeds [`MAX_CONTEXT_LEN`] (`255`) bytes.
@@ -189,17 +271,17 @@ impl fmt::Display for StreamVerifyError {
 
 impl Error for StreamVerifyError {}
 
-/// Zero-copy borrowed reference to a `7,392`-byte `BLINCS-128-7x5` imprint.
+/// Zero-copy borrowed reference to a `6,432`-byte `BLINCS-128-7x5` imprint.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ImprintRef<'a>(&'a [u8; IMPRINT_LEN]);
 
 impl<'a> ImprintRef<'a> {
-    /// Wrap a fixed-length `7,392`-byte imprint reference without copying.
+    /// Wrap a fixed-length `6,432`-byte imprint reference without copying.
     pub const fn from_bytes(bytes: &'a [u8; IMPRINT_LEN]) -> Self {
         Self(bytes)
     }
 
-    /// Return the underlying `7,392`-byte slice reference.
+    /// Return the underlying `6,432`-byte slice reference.
     pub const fn as_bytes(self) -> &'a [u8; IMPRINT_LEN] {
         self.0
     }
@@ -223,7 +305,7 @@ impl fmt::Debug for ImprintRef<'_> {
 /// Identifies a Signet (`32` bytes: `public_seed || top_root`) and verifies its imprints.
 ///
 /// The caller must supply the **expected** `SignetId` for the publisher or authority they rely on;
-/// accepting a `SignetId` sent alongside an untrusted message proves only internal consistency.
+/// accepting a `SignetId` sent alongside a message proves only internal consistency.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SignetId {
     bytes: [u8; SIGNET_ID_LEN],
@@ -257,7 +339,7 @@ impl SignetId {
         keyed(&self.content_key, &buf[..N + ctx_len])
     }
 
-    /// Verify a `7,392`-byte imprint over `message` under `ctx` in one pass (zero heap allocations).
+    /// Verify a `6,432`-byte imprint over `message` under `ctx` in one pass (zero heap allocations).
     #[must_use = "verification result must be checked"]
     pub fn verify(&self, ctx: Context<'_>, message: &[u8], sig: ImprintRef<'_>) -> Result<(), InvalidImprint> {
         let salt = read_n(sig.as_bytes(), 0);
@@ -289,12 +371,12 @@ impl SignetId {
         let randomizer = read_n(raw, N);
         let root = self.root();
         let digest = compute_message_digest(&self.pub_key, &randomizer, &root, short, ctx);
-        let (fors_indices, leaf_addr) = parse_digest(&digest);
+        let (ufors_sel, leaf_addr) = parse_digest(&digest);
 
-        let fors_slice = &raw[2 * N..2 * N + FORS_LEN];
-        let mut node = verify_fors(&self.pub_key, leaf_addr, &fors_indices, fors_slice);
+        let ufors_slice = &raw[2 * N..2 * N + UFORS_LEN];
+        let mut node = verify_ufors(&self.pub_key, leaf_addr, &ufors_sel, ufors_slice);
 
-        let mut offset = 2 * N + FORS_LEN;
+        let mut offset = 2 * N + UFORS_LEN;
         for layer in 0..LAYERS {
             let tree = leaf_addr >> ((layer + 1) * TREE_HEIGHT);
             let leaf = u16::try_from((leaf_addr >> (layer * TREE_HEIGHT)) & ((1u64 << TREE_HEIGHT) - 1)).unwrap();
@@ -303,7 +385,8 @@ impl SignetId {
             offset += LAYER_LEN;
 
             let layer_u8 = u8::try_from(layer).unwrap();
-            let pk = wots_pk_from_sig(&self.pub_key, layer_u8, tree, leaf, &node, wots_sig);
+            let digits = wots_digits(&node);
+            let pk = chain_pk_from_sig(&self.pub_key, layer_u8, tree, leaf, &digits, CHAIN_STEPS, wots_sig);
             node = verify_merkle_path(&self.pub_key, layer_u8, tree, leaf, pk, auth);
         }
         assert_eq!(offset, IMPRINT_LEN);
@@ -413,13 +496,13 @@ fn compute_message_digest(pub_key: &[u8; 32], randomizer: &[u8; N], root: &[u8; 
     keyed(pub_key, &input[..len_off + ctx_len])
 }
 
-fn parse_digest(digest: &[u8; 32]) -> ([u8; FORS_TREES], u64) {
-    let mut indices = [0u8; FORS_TREES];
-    indices.copy_from_slice(&digest[..FORS_TREES]);
-    let mut word = [0u8; 8];
-    word.copy_from_slice(&digest[FORS_TREES..FORS_TREES + 8]);
-    let leaf_addr = u64::from_le_bytes(word) & ((1u64 << HYPER_BITS) - 1);
-    (indices, leaf_addr)
+fn parse_digest(digest: &[u8; 32]) -> ([(u8, u8); UFORS_TREES], u64) {
+    let sel = core::array::from_fn(|t| {
+        let base = (TREE_HEIGHT + UFORS_CODE_BITS) * t;
+        (u8::try_from(read_bits(digest, base, TREE_HEIGHT)).unwrap(), u8::try_from(read_bits(digest, base + TREE_HEIGHT, UFORS_CODE_BITS)).unwrap())
+    });
+    let leaf_addr = read_bits(digest, UFORS_TREES * (TREE_HEIGHT + UFORS_CODE_BITS), HYPER_BITS);
+    (sel, leaf_addr)
 }
 
 fn wots_digits(message: &[u8; N]) -> [u8; CHAINS] {
@@ -438,8 +521,7 @@ fn wots_digits(message: &[u8; N]) -> [u8; CHAINS] {
     out
 }
 
-fn wots_pk_from_sig(pub_key: &[u8; 32], layer: u8, tree: u64, leaf: u16, msg: &[u8; N], sig: &[u8]) -> [u8; N] {
-    let digits = wots_digits(msg);
+fn chain_pk_from_sig(pub_key: &[u8; 32], layer: u8, tree: u64, leaf: u16, digits: &[u8], max_steps: u8, sig: &[u8]) -> [u8; N] {
     let mut pk_in = [0u8; 16 + CHAINS * N];
     pk_in[..16].copy_from_slice(&tweak(TweakKind::OneTimeKey, layer, tree, leaf, 0, 0));
 
@@ -447,14 +529,14 @@ fn wots_pk_from_sig(pub_key: &[u8; 32], layer: u8, tree: u64, leaf: u16, msg: &[
     for (chain, &d) in digits.iter().enumerate() {
         let mut cur = read_n(sig, chain * N);
         let chain_u16 = u16::try_from(chain).unwrap();
-        for step in d..CHAIN_STEPS {
+        for step in d..max_steps {
             step_in[..16].copy_from_slice(&tweak(TweakKind::Chain, layer, tree, leaf, chain_u16, u32::from(step)));
             step_in[16..].copy_from_slice(&cur);
             cur = keyed_n(pub_key, &step_in);
         }
         pk_in[16 + chain * N..16 + (chain + 1) * N].copy_from_slice(&cur);
     }
-    keyed_n(pub_key, &pk_in)
+    keyed_n(pub_key, &pk_in[..16 + digits.len() * N])
 }
 
 fn verify_merkle_path(pub_key: &[u8; 32], layer: u8, tree: u64, leaf: u16, mut node: [u8; N], auth: &[u8]) -> [u8; N] {
@@ -478,39 +560,18 @@ fn verify_merkle_path(pub_key: &[u8; 32], layer: u8, tree: u64, leaf: u16, mut n
     node
 }
 
-fn verify_fors(pub_key: &[u8; 32], leaf_addr: u64, indices: &[u8; FORS_TREES], sig: &[u8]) -> [u8; N] {
-    let mut root_in = [0u8; 16 + FORS_TREES * N];
+fn verify_ufors(pub_key: &[u8; 32], leaf_addr: u64, sel: &[(u8, u8); UFORS_TREES], sig: &[u8]) -> [u8; N] {
+    let mut root_in = [0u8; 16 + UFORS_TREES * N];
     root_in[..16].copy_from_slice(&tweak(TweakKind::FewRoot, 0, leaf_addr, 0, 0, 0));
 
-    let mut leaf_in = [0u8; 16 + N];
-    let mut pair_in = [0u8; 16 + 2 * N];
-    let tree_stride = (1 + FORS_HEIGHT) * N;
-
-    for (t, &idx_u8) in indices.iter().enumerate() {
-        let t_u16 = u16::try_from(t).unwrap();
-        let base = t * tree_stride;
-        let mut idx = u32::from(idx_u8);
-
-        leaf_in[..16].copy_from_slice(&tweak(TweakKind::FewLeaf, 0, leaf_addr, t_u16, 0, idx));
-        leaf_in[16..].copy_from_slice(&sig[base..base + N]);
-        let mut node = keyed_n(pub_key, &leaf_in);
-
-        for level in 0..FORS_HEIGHT {
-            let sib = read_n(sig, base + (1 + level) * N);
-            let parent = idx >> 1;
-            let level_u16 = u16::try_from(level + 1).unwrap();
-            pair_in[..16].copy_from_slice(&tweak(TweakKind::FewNode, 0, leaf_addr, t_u16, level_u16, parent));
-            if idx & 1 == 0 {
-                pair_in[16..16 + N].copy_from_slice(&node);
-                pair_in[16 + N..].copy_from_slice(&sib);
-            } else {
-                pair_in[16..16 + N].copy_from_slice(&sib);
-                pair_in[16 + N..].copy_from_slice(&node);
-            }
-            node = keyed_n(pub_key, &pair_in);
-            idx = parent;
-        }
-        root_in[16 + t * N..16 + (t + 1) * N].copy_from_slice(&node);
+    for (t, &(leaf_u8, code_u8)) in sel.iter().enumerate() {
+        let layer_u8 = UFORS_LAYER_BASE + u8::try_from(t).unwrap();
+        let base = t * UFORS_TREE_LEN;
+        let digits = UFORS_CODE[usize::from(code_u8)];
+        let leaf = u16::from(leaf_u8);
+        let pk = chain_pk_from_sig(pub_key, layer_u8, leaf_addr, leaf, &digits, UFORS_STEPS, &sig[base..base + UFORS_CHAINS * N]);
+        let tree_root = verify_merkle_path(pub_key, layer_u8, leaf_addr, leaf, pk, &sig[base + UFORS_CHAINS * N..base + UFORS_TREE_LEN]);
+        root_in[16 + t * N..16 + (t + 1) * N].copy_from_slice(&tree_root);
     }
     keyed_n(pub_key, &root_in)
 }
@@ -529,7 +590,6 @@ mod tests {
         assert_eq!(v.update(b""), Ok(()));
         assert_eq!(v.update(b"ab"), Ok(()));
         assert_eq!(v.update(b"c"), Err(MessageTooLong));
-        // Even an empty update or ignoring the earlier error stays poisoned!
         assert_eq!(v.update(b""), Err(MessageTooLong));
         assert_eq!(v.finalize(), Err(StreamVerifyError::MessageTooLong));
     }

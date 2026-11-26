@@ -22,17 +22,17 @@ CONTROLS = [
         "wots_digits_and_checksum_boundaries",
     ),
     (
-        "FORS 35-bit leaf_addr masking in LeafAddr::from_digest_word()",
+        "U-FORS 35-bit leaf_addr masking in LeafAddr::from_digest_word()",
         "src/params.rs",
         "        Self(word & ((1u64 << HYPER_BITS) - 1))",
         "        Self(word)",
-        "parse_digest_extracts_all_fors_indices_and_35bit_leaf_addr",
+        "parse_digest_extracts_all_ufors_selections_and_35bit_leaf_addr",
     ),
     (
-        "FORS root compression binds all 20 tree roots (fors_root)",
+        "U-FORS root compression binds all 15 tree roots (ufors_root)",
         "src/few_time.rs",
-        "    for t in 0..FORS_TREES {\n        input[16 + t * N..16 + (t + 1) * N].copy_from_slice(&roots[t]);\n    }",
-        "    for t in 0..FORS_TREES - 1 {\n        input[16 + t * N..16 + (t + 1) * N].copy_from_slice(&roots[t]);\n    }",
+        "    for t in 0..UFORS_TREES {\n        input[16 + t * N..16 + (t + 1) * N].copy_from_slice(&roots[t]);\n    }",
+        "    for t in 0..UFORS_TREES - 1 {\n        input[16 + t * N..16 + (t + 1) * N].copy_from_slice(&roots[t]);\n    }",
         "every_signature_region_is_checked",
     ),
     (

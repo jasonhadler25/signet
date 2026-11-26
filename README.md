@@ -2,7 +2,7 @@
 
 **Signet** (`signet` crate) is a Rust implementation of **BLINCS** (specifically the **`BLINCS-128-7x5`** suite), a post-quantum digital signature algorithm based on BLAKE3 and SPHINCS. BLINCS is hash-based: it relies only on BLAKE3 and this SPHINCS-family construction, with no elliptic curves or lattices.
 
-Each signet (signing key) is sized for a budget of **2³² signatures**, tuned to keep **99th-percentile (`p99`) signing under 5 seconds** on a Ledger `ST33` Secure Element (~3.6 s uncached, zero counter grinding) while staying fast and compact on desktops. That buys **7,392-byte imprints** (signatures — smaller than `SLH-DSA-128s`), **32-byte signet IDs** (verifying keys), a **1 KiB** top tree (`0.17 ms` startup), bounded length-framed application **contexts** (`0..=255 B`), and fail-closed verification (`Result<(), InvalidImprint>` / `Result<(), VerifyError>`). Running strictly on a single core (`blake3-servil-core`, zero background worker threads), signing takes **~1.25 ms** (`1.42 ms` cold 1-shot, constant algorithmic work) and verifying takes **~34.2 µs** on an Apple M6.
+Each signet (signing key) is sized for a budget of **2³² signatures**, tuned to keep **99th-percentile (`p99`) signing under 5 seconds** on a Ledger `ST33` Secure Element (~3.6 s modeled uncached, zero counter grinding) while staying fast and compact on desktops. Using **U-FORS** (Upper-Layer Constant-Sum Lattice Forest) over uniform height-5 Merkle trees and 6 tweak kinds buys **6,432-byte imprints** (signatures — `1,424 B` smaller than `SLH-DSA-128s`), **32-byte signet IDs** (verifying keys), a **1 KiB** top tree (`0.17 ms` startup), bounded length-framed application **contexts** (`0..=255 B`), and fail-closed verification (`Result<(), InvalidImprint>` / `Result<(), VerifyError>`). Running strictly on a single core (`blake3-servil-core`, zero background worker threads), signing takes **~1.22 ms** (`1.39 ms` cold 1-shot, constant algorithmic work) and verifying takes **~36.2 µs** on an Apple M6. The standalone algorithm specification, Lean 4 formalization, and paper live in [`jasonhadler25/blincs`](https://github.com/jasonhadler25/blincs).
 
 > **Pre-1.0: Experimental & Unsupported.**
 >
@@ -21,7 +21,7 @@ Each signet (signing key) is sized for a budget of **2³² signatures**, tuned t
 | **ML-DSA-44** | 1,312 B | 2,420 B | not measured here | not measured here | No comparable per-key budget | Module lattices + hash | FIPS 204 (2024) |
 | **SLH-DSA-128s** | 32 B | 7,856 B | 75.5–548 ms (warm) | 74–509 µs | 2⁶⁴ | Hash function | FIPS 205 (2024) |
 | **SLH-DSA-128f** | 32 B | 17,088 B | 3.6–26.3 ms (warm) | 220–1,540 µs | 2⁶⁴ | Hash function | FIPS 205 (2024) |
-| **BLINCS-128-7x5 (Signet)** | **32 B** | **7,392 B** | **1.25 ms** (warm); **1.42 ms** cold | **34.2 µs** | **2³²** (degrades gradually past it) | BLAKE3 + this SPHINCS-family construction | No standard; pre-1.0; no human audit |
+| **BLINCS-128-7x5 (Signet)** | **32 B** | **6,432 B** | **1.22 ms** (warm); **1.39 ms** cold | **36.2 µs** | **2³²** (degrades gradually past it) | BLAKE3 + this SPHINCS-family construction | No standard; pre-1.0; no human audit |
 
 **How to read the timings:**
 
@@ -30,14 +30,14 @@ Each signet (signing key) is sized for a budget of **2³² signatures**, tuned t
 - SLH-DSA ranges span the SHA2, BLAKE3, and SHAKE variants of [PQC Suite B](https://github.com/PQC-Suite-B/signatures), which builds on RustCrypto's `slh-dsa`.
 - Full methodology and cycle counts are in [`BENCHMARKS.md`](BENCHMARKS.md).
 
-A `BLINCS-128-7x5` imprint is 9,856 bytes in Base64.
+A `BLINCS-128-7x5` imprint is 8,576 bytes in Base64.
 
 ### When to choose Signet (`BLINCS-128-7x5`) — and when not to
 
 **Signet may fit when:**
 
 - you want hash-based post-quantum signatures without curve or lattice assumptions;
-- you want signatures smaller than `SLH-DSA-128s` (and 2.3× smaller than `128f`), sub-1.5 ms single-core signing, ~34 µs verification, built-in application context separation, and a 1 KiB top tree that signs in under 5 seconds `p99` on constrained signing hardware like Ledger `ST33`;
+- you want signatures `1,424 B` smaller than `SLH-DSA-128s` (and `2.66×` smaller than `128f`), ~1.22 ms single-core signing, ~36 µs verification, built-in application context separation, and a 1 KiB top tree that models under 5 seconds `p99` on constrained signing hardware like Ledger `ST33`;
 - your volume fits 2³² signatures per signet;
 - you control both signer and verifier;
 - you are prototyping or experimenting while Signet / BLINCS is pre-1.0.
@@ -58,7 +58,7 @@ A cryptographic key is a transferable bearer authority, not a person's handwritt
 
 - a `Signet` is the signing key;
 - a `SignetId` is a publisher's self-certifying 32-byte identifier and its complete `BLINCS-128-7x5` verifying key;
-- an `Imprint` is the 7,392-byte signature;
+- an `Imprint` is the 6,432-byte signature;
 - a `Context` is a bounded (`0..=255` byte) protocol label that prevents imprints from one application from verifying in another.
 
 Whoever holds a signet's seed can sign as that signet, so guard the seed accordingly. Receiving a `SignetId` does not authenticate the sender — obtain the expected `SignetId` from a pinned or authenticated channel.
@@ -67,7 +67,7 @@ Whoever holds a signet's seed can sign as that signet, so guard the seed accordi
 
 ```toml
 [dependencies]
-signet = { git = "https://github.com/jasonhadler25/blincs" }
+signet = { git = "https://github.com/jasonhadler25/signet" }
 ```
 
 Formats can change between pre-1.0 commits. Add `rev = "…"` with a commit you have reviewed, and commit your `Cargo.lock`.
@@ -114,7 +114,7 @@ fn main() -> Result<(), VerifyError> {
     // Publish these 32 bytes through a channel your verifiers can authenticate.
     let pinned_id_bytes: [u8; SIGNET_ID_LEN] = *publisher.id().as_bytes();
 
-    // Sign and serialize: 7,392 raw bytes on the wire.
+    // Sign and serialize: 6,432 raw bytes on the wire.
     let message = b"hello, BLINCS";
     let wire: Vec<u8> = publisher.imprint(&rng, RELEASE_CTX, message).as_bytes().to_vec();
 
@@ -185,15 +185,15 @@ Signet stores startup randomness in a single private 32-byte regular file on a l
 
 A BLINCS signet does **not** suddenly break at 4.3 billion imprints. Instead, every additional imprint slowly wears down the modeled security against brute-force forgery.
 
-**Estimated brute-force security for one modeled FORS leaf-cover event under the project's ideal-hash model:**
+**Estimated brute-force security for one modeled U-FORS cover event (exact DP) under the project's ideal-hash model:**
 
 | Signatures made by one signet | Brute-force security | Brute-force cost (ASIC electricity) | Brute-force time (800 EH/s, Bitcoin scale) | What that means in practice |
 |---:|---:|---:|---:|---|
-| Up to **4.3 billion** (2³²) | **128-bit** *(134.5 b cover)* | ~$1.6 × 10²⁰ | ~13 billion years | Full strength (comparable to AES-128) |
-| **8.6 billion** (2×) | **128-bit** *(128.8 b cover)* | ~$1.6 × 10²⁰ | ~13 billion years | Still above 128-bit FORS cover |
-| **34 billion** (8×) | **115-bit** | ~$1.8 × 10¹⁶ | ~1.5 million years | Still far beyond any practical attack |
+| Up to **4.3 billion** (2³²) | **128-bit** *(138.5 b cover)* | ~$1.6 × 10²⁰ | ~13 billion years | Full strength (comparable to AES-128) |
+| **8.6 billion** (2×) | **128-bit** *(132.1 b cover)* | ~$1.6 × 10²⁰ | ~13 billion years | Still well above 128-bit U-FORS cover |
+| **34 billion** (8×) | **116-bit** | ~$3.6 × 10¹⁶ | ~3.0 million years | Still far beyond any practical attack |
 | **69 billion** (16×) | **106-bit** | ~$4.3 × 10¹³ | ~3,600 years | Weakening, though still out of reach today |
-| **137 billion** (32×) | **96-bit** | ~$3.7 × 10¹⁰ | ~3.2 years | Weakening rapidly; stay well clear |
+| **137 billion** (32×) | **94-bit** | ~$9.2 × 10⁹ | ~10 months | Weakening rapidly; stay well clear |
 
 These numbers are the cost of a brute-force attack for that single-key ideal-hash event (not a full multi-user or complete scheme proof; see [`SPEC.md`](SPEC.md#security-target-model-and-limits)). There is no known reason to think that either quantum computers or super-intelligent AIs could generate forgeries any more efficiently than brute force; if they could, it would reduce the security level.
 
@@ -201,7 +201,7 @@ Signet does not count imprints across runs or across copies of a seed. When reti
 
 ### 3. Startup, streaming, and authenticated IDs
 
-**Startup and memory.** `Signet::from_seed` derives the 1 KiB top tree inline from the 32-byte seed in **~0.17 ms** on 1 core. Nothing is cached on disk, so the seed is all you store. A cold load-and-sign takes **~1.41 ms**. Signing allocates a transient local workspace (~475 KiB for cross-tree FORS batching) that is freed when signing returns; verification uses only stack buffers (~2.5 KiB for `verify`, plus the `Sink`'s 26 KiB BLAKE3 `Hasher` for `verify_with`) with zero heap allocation.
+**Startup and memory.** `Signet::from_seed` derives the 1 KiB top tree inline from the 32-byte seed in **~0.17 ms** on 1 core. Nothing is cached on disk, so the seed is all you store. A cold load-and-sign takes **~1.39 ms**. Signing allocates a transient local workspace (~175 KiB for cross-tree U-FORS batching) that is freed when signing returns; verification uses only stack buffers (~4.5 KiB for `verify`, plus the `Sink`'s 26 KiB BLAKE3 `Hasher` for `verify_with`) with zero heap allocation.
 
 **Streaming.** `imprint`/`verify` take message bytes, and `imprint_with`/`verify_with` push bytes into a `Sink` (implementing both `Sink::update` and `std::io::Write`, so `std::io::copy` works in one line). Either way, Signet hashes every byte in a single salted keyed-BLAKE3 pass on the calling thread, choosing the per-imprint salt before the producer runs. On 1 Apple M6 core, 100 MiB hashes at ~6.4 GB/s signing and ~7.0 GB/s verifying (in-memory slice), or ~3.8–4.0 GB/s via `imprint_with`/`verify_with`.
 
@@ -242,12 +242,12 @@ Apple M6 (macOS arm64, Rust 1.100.0, `blake3-servil-core = "=0.11.0"`, strictly 
 
 | Operation (1 core) | Wall time | Throughput |
 |---|---:|---:|
-| Load key (`Signet::from_seed`, 1 KiB top tree) | **0.17 ms** | **5,875 / s** |
-| Sign, 64 B (warm / cold 1-shot; constant algorithmic work) | **1.25 ms** / **1.42 ms** | **800 / s** |
-| Verify, 64 B | **34.2 µs** | **29,200 / s** |
-| Sign / verify, 100 MiB (slice) | 16.28 ms / 15.09 ms | 6,440 / 6,951 MB/s |
-| Sign / verify, 100 MiB (`*_reader`, 16 KiB stack buf) | 25.59 ms / 24.32 ms | 4,098 / 4,311 MB/s |
-| `Randomness::initialize` (lock-free seed dir) | 72.0 µs | — |
+| Load key (`Signet::from_seed`, 1 KiB top tree) | **0.17 ms** | **5,879 / s** |
+| Sign, 64 B (warm / cold 1-shot; constant algorithmic work) | **1.22 ms** / **1.39 ms** | **820 / s** |
+| Verify, 64 B | **36.2 µs** | **27,600 / s** |
+| Sign / verify, 100 MiB (slice) | 16.25 ms / 15.10 ms | 6,455 / 6,946 MB/s |
+| Sign / verify, 100 MiB (`imprint_with` / `verify_with`) | 27.87 ms / 26.38 ms | 3,762 / 3,975 MB/s |
+| `Randomness::initialize` (lock-free atomic file) | 92.9 µs | — |
 
 Signing has no counter-grinding retry loop. Full cycle counts, IPC, and the 1-core SLH-DSA-B reproduction are in [`BENCHMARKS.md`](BENCHMARKS.md).
 
@@ -283,7 +283,7 @@ Signing has no counter-grinding retry loop. Full cycle counts, IPC, and the 1-co
 - Daira-Emma Hopwood, for the case for hash-based signatures in systems that already rely on a secure hash.
 - Ron Rivest, for the "minimax" goal of performing well enough for many use cases.
 
-**Research evaluated for earlier drafts.** Earlier BLINCS drafts evaluated two compressed variants. **The current design uses neither;** it uses standard WOTS+ and FORS.
+**Research evaluated for earlier drafts.** Earlier BLINCS drafts evaluated counter-grinding and Octopus-merging variants. **The current design uses neither;** it uses zero-grinding WOTS+ and U-FORS over uniform height-5 Merkle trees.
 
 - WOTS+C, by Kudinov, Hülsing, Ronen, and Yogev ([ePrint 2022/778](https://eprint.iacr.org/2022/778)).
 - PORS+FP, by Abri and Katz ([ePrint 2025/2069](https://eprint.iacr.org/2025/2069)), building on Aumasson and Endignoux ([ePrint 2017/933](https://eprint.iacr.org/2017/933)).

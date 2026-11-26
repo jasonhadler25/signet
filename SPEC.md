@@ -1,10 +1,10 @@
-# BLINCS specification (`BLINCS-128-7x5`, draft)
+# BLINCS specification (`BLINCS-128-7x5`, draft 0.2.0)
 
-*Status: pre-1.0 design under active development (0.1.0, formats and context strings may still change before 1.0). Written by an AI assistant at the direction of this repository's owner; no independent cryptographic review or security audit has been performed. Builds on BLAKE3 (O'Connor, Aumasson, Neves, Wilcox-O'Hearn) and SPHINCS / SPHINCS+ / FIPS 205 SLH-DSA (Bernstein, Hopwood, Hülsing, Kölbl, Lange, Niederhagen, Papachristodoulou, Rijneveld, Schneider, Schwabe, Wilcox-O'Hearn, and the NIST SLH-DSA team). Thanks to [Project 11](https://research.projecteleven.com/) — especially **Conor Deegan**, **Alessandro Baiocchi**, **Matteo Vena**, and **Matteo Vicari** — for direct review feedback, benchmarks, and constrained-device design inspiration (full credits in [`README.md`](README.md#credits-and-thanks)).*
+*Status: pre-1.0 design under active development (0.2.0 — formats and context strings may still change before 1.0). Written primarily by an AI assistant at the direction of this repository's owner; no independent human cryptographic audit has been performed. The standalone algorithm specification, Lean 4 formalization, and paper live in [`jasonhadler25/blincs`](https://github.com/jasonhadler25/blincs). Builds on BLAKE3 (O'Connor, Aumasson, Neves, Wilcox-O'Hearn) and SPHINCS / SPHINCS+ / FIPS 205 SLH-DSA (Bernstein, Hopwood, Hülsing, Kölbl, Lange, Niederhagen, Papachristodoulou, Rijneveld, Schneider, Schwabe, Wilcox-O'Hearn, and the NIST SLH-DSA team). Thanks to [Project 11](https://research.projecteleven.com/) — especially **Conor Deegan**, **Alessandro Baiocchi**, **Matteo Vena**, and **Matteo Vicari** — for direct review feedback, benchmarks, and constrained-device design inspiration (full credits in [`README.md`](README.md#credits-and-thanks)).*
 
-**BLINCS** is a stateless hash-based signature algorithm based on BLAKE3 and SPHINCS; **Signet** (this repository) is a Rust implementation of the **`BLINCS-128-7x5`** suite. `BLINCS-128-7x5` uses **WOTS+** (nibbles, `w = 16`) and byte-aligned **FORS** (`20` trees of `256` leaves — one digest byte per tree) on a uniform 7-layer hypertree (`7×5`, total height `35`) with **zero counter grinding**, a **suite-separated key schedule**, a **bounded length-framed application context (`0..=255` bytes)**, and **single-pass salted content hashing** (BLINCS-specific nibble/tweak encodings and BLAKE3 instantiation; not FIPS 205 interoperable or validated).
+**BLINCS** is a stateless hash-based signature algorithm based on BLAKE3 and SPHINCS; **Signet** (this repository) is a production Rust implementation of the **`BLINCS-128-7x5`** suite. `BLINCS-128-7x5` uses **WOTS+** (nibbles, `w = 16`) and **U-FORS** (Upper-Layer Constant-Sum Lattice Forest: `15` uniform height-5 trees, `3` equal-length chains of `9` steps per leaf, `64`-codeword extreme-variance sum-`16` antichain) on a uniform 7-layer hypertree (`7×5`, total height `35`) with **zero counter grinding**, **6 tweak kinds**, **uniform height-5 Merkle trees everywhere**, a **suite-separated key schedule**, a **bounded length-framed application context (`0..=255` bytes)**, and **single-pass salted content hashing** (BLINCS-specific encodings and BLAKE3 instantiation; not FIPS 205 interoperable or validated).
 
-An imprint is **7,392 bytes** (`9,856` bytes Base64 — smaller than `SLH-DSA-128s`'s `7,856` bytes), a `SignetId` is **32 bytes**, and a `Signet` derives from a **32-byte seed** (holding a 1 KiB top tree in memory). Because there is zero counter grinding, signing performs a constant number of BLAKE3 compressions (`p99 = mean = max`, ~3.6 s uncached on a 60 MHz Ledger ST33 Secure Element, `1.25 ms` warm / `1.42 ms` cold on 1 Apple M6 core). Its design target is **128-bit classical security** (128-bit root) at up to **$2^{32}$ imprints** per signet (4,294,967,296: ten imprints a second for 13.6 years), with an estimated single-query FORS cover exponent of **134.5 bits** at $q = 2^{32}$, degrading gradually past the budget (`128.8` bits at $2^{33}$, `122.4` bits at $2^{34}$, `114.9` bits at $2^{35}$, `106.2` bits at $2^{36}$).
+An imprint is **6,432 bytes** (`8,576` bytes Base64 — `1,424` bytes smaller than `SLH-DSA-128s`'s `7,856` bytes), a `SignetId` is **32 bytes**, and a `Signet` derives from a **32-byte seed** (holding a 1 KiB top tree in memory). Because there is zero counter grinding, signing performs a constant number of BLAKE3 compressions (`p99 = mean = max`, ~3.58 s uncached model on a 60 MHz Ledger ST33 Secure Element). Its design target is **128-bit classical security** (128-bit root) at up to **$2^{32}$ imprints** per signet (4,294,967,296: ten imprints a second for 13.6 years), with an exact dynamic-programming single-query U-FORS cover exponent of **138.48 bits** at $q = 2^{32}$, degrading gradually past the budget (`132.13` bits at $2^{33}$, `124.73` bits at $2^{34}$, `116.05` bits at $2^{35}$, `105.83` bits at $2^{36}$).
 
 Messages are hashed in a single salted keyed-BLAKE3 pass under a fresh per-imprint salt `e` derived from the signet and per-imprint randomness before reading the message. Pass the original message bytes or stream directly to Signet so the entire input is covered by the salted pass at full BLAKE3 streaming speed without relying on unsalted collision resistance.
 
@@ -25,20 +25,25 @@ Suite identifier: **`BLINCS-128-7x5`**.
 |---|---:|---|
 | `N` | 16 | Byte length of truncated tree, chain, salt, and randomizer values (`h_msg`, `D`, and derived keys are 32 bytes) |
 | `LAYERS` | 7 | Uniform layers of the hypertree (`d`) |
-| `TREE_HEIGHT` | 5 | Height of every hypertree layer `0..7` ($2^5 = 32$ leaves per tree; total `HYPER_BITS = 7 * 5 = 35`) |
+| `TREE_HEIGHT` | 5 | Uniform height of **every** Merkle tree (`7` hypertree layers and `15` U-FORS trees; `32` leaves each; `HYPER_BITS = 35`) |
 | `W` | 16 | WOTS+ Winternitz parameter (`CHAIN_STEPS = 15`, 4-bit nibbles in `0..=15`) |
 | `MSG_CHAINS` | 32 | WOTS+ message chains (`128 / 4 = 32` nibbles) |
 | `CSUM_CHAINS` | 3 | WOTS+ checksum chains (`max checksum = 32 * 15 = 480 < 16^3`) |
 | `CHAINS` | 35 | Total WOTS+ chains per one-time signature (`32 + 3`) |
-| `FORS_HEIGHT` | 8 | Height of each FORS tree ($2^8 = 256$ leaves per tree — one byte per index) |
-| `FORS_TREES` | 20 | Number of independent FORS trees (`k`; `20 * 8 = 160` bits = `D[0..20]`) |
+| `UFORS_TREES` | 15 | Number of independent U-FORS height-5 trees (`k`) |
+| `UFORS_CHAINS` | 3 | Equal-length chains per U-FORS leaf (`16 + 3 * 16 = 64` B exact 1-block BLAKE3 leaf hash) |
+| `UFORS_W` | 10 | U-FORS chain alphabet size (`UFORS_STEPS = 9`, digits in `0..=9`) |
+| `UFORS_SUM` | 16 | Constant codeword digit sum (`a + b + c = 16`, constant `27 - 16 = 11` verify steps per tree) |
+| `UFORS_CODE_BITS` | 6 | Codeword selector width (`2^6 = 64` extreme-variance codewords) |
+| `UFORS_LAYER_BASE` | `0x80` | Disjoint layer byte offset (`0x80 + t` for U-FORS tree `t in 0..15`; hypertree uses `0..7`) |
 | `MAX_CONTEXT_LEN` | 255 | Maximum byte length of the framed application context `ctx` |
 
 Derived lengths:
 
-- `FORS_LEN = FORS_TREES * (1 + FORS_HEIGHT) * N = 2,880` bytes.
+- `UFORS_TREE_LEN = (UFORS_CHAINS + TREE_HEIGHT) * N = 128` bytes.
+- `UFORS_LEN = UFORS_TREES * UFORS_TREE_LEN = 1,920` bytes.
 - `LAYER_LEN = (CHAINS + TREE_HEIGHT) * N = 640` bytes (identical on all 7 layers).
-- `IMPRINT_LEN = 2 * N + FORS_LEN + LAYERS * LAYER_LEN = 7,392` bytes.
+- `IMPRINT_LEN = 2 * N + UFORS_LEN + LAYERS * LAYER_LEN = 6,432` bytes.
 
 ## Key-derivation contexts
 
@@ -46,17 +51,17 @@ Every derived 32-byte key uses a distinct UTF-8 context string. All algorithm ke
 
 | Name | Context string |
 |---|---|
-| `SECRET_VALUES` | `"BLINCS-128-7x5 2026-11-25 secret values"` |
-| `CONTENT_SALT` | `"BLINCS-128-7x5 2026-11-25 content salt"` |
-| `RANDOMIZER` | `"BLINCS-128-7x5 2026-11-25 randomizer"` |
-| `PUBLIC_SEED` | `"BLINCS-128-7x5 2026-11-25 public seed"` |
-| `PUBLIC_HASH` | `"BLINCS-128-7x5 2026-11-25 public hash"` |
-| `CONTENT` | `"BLINCS-128-7x5 2026-11-25 content"` |
-| `GENERATE_SIGNET` | `"Signet BLINCS-128-7x5 2026-11-25 generate signet"` |
-| `MIX` | `"Signet 2026-11-25 randomness: mix"` |
-| `NEXT_SEED` | `"Signet 2026-11-25 randomness: next seed"` |
-| `RUN_KEY` | `"Signet 2026-11-25 randomness: key of this run"` |
-| `KEYGEN_KEY` | `"Signet 2026-11-25 randomness: keygen key"` |
+| `SECRET_VALUES` | `"BLINCS-128-7x5 2026-11-26 secret values"` |
+| `CONTENT_SALT` | `"BLINCS-128-7x5 2026-11-26 content salt"` |
+| `RANDOMIZER` | `"BLINCS-128-7x5 2026-11-26 randomizer"` |
+| `PUBLIC_SEED` | `"BLINCS-128-7x5 2026-11-26 public seed"` |
+| `PUBLIC_HASH` | `"BLINCS-128-7x5 2026-11-26 public hash"` |
+| `CONTENT` | `"BLINCS-128-7x5 2026-11-26 content"` |
+| `GENERATE_SIGNET` | `"Signet BLINCS-128-7x5 2026-11-26 generate signet"` |
+| `MIX` | `"Signet 2026-11-26 randomness: mix"` |
+| `NEXT_SEED` | `"Signet 2026-11-26 randomness: next seed"` |
+| `RUN_KEY` | `"Signet 2026-11-26 randomness: key of this run"` |
+| `KEYGEN_KEY` | `"Signet 2026-11-26 randomness: keygen key"` |
 
 ## Tweaks
 
@@ -72,19 +77,16 @@ tweak(kind, layer, tree, leaf, a, b) =
  || b     (u32, 4 bytes LE)
 ```
 
-Unused fields are zero. The nine kinds are:
+Unused fields are zero. Hypertree layers use `layer in 0..7`; U-FORS trees reuse the exact same chain/leaf/node tweak kinds under disjoint `layer = 0x80 + t` (`128..=142`) with `tree = leaf_addr`. The six kinds are:
 
 | Value | Name | Key | Data appended after tweak | Output bytes used |
 |---:|---|---|---|---|
 | 1 | `CHAIN_SECRET` | `K_sec` | *(empty)* | 16 |
 | 2 | `CHAIN` | `K_pub` | current 16-byte chain value | 16 |
-| 3 | `ONE_TIME_KEY` | `K_pub` | 35 chain ends (`560` bytes) | 16 |
+| 3 | `ONE_TIME_KEY` | `K_pub` | `3` U-FORS (`48` B) or `35` WOTS+ (`560` B) chain ends | 16 |
 | 4 | `NODE` | `K_pub` | `left (16) \|\| right (16)` | 16 |
-| 5 | `FEW_SECRET` | `K_sec` | *(empty)* | 16 |
-| 6 | `FEW_LEAF` | `K_pub` | 16-byte leaf secret | 16 |
-| 7 | `FEW_NODE` | `K_pub` | `left (16) \|\| right (16)` | 16 |
-| 8 | `FEW_ROOT` | `K_pub` | 16 × 20 FORS tree roots (`320` bytes) | 16 |
-| 9 | `MESSAGE` | `K_pub` | `R (16) \|\| root (16) \|\| short (48) \|\| u8(len(ctx)) \|\| ctx` | 32 |
+| 5 | `FEW_ROOT` | `K_pub` | 15 × 16 U-FORS tree roots (`240` bytes) | 16 |
+| 6 | `MESSAGE` | `K_pub` | `R (16) \|\| root (16) \|\| short (48) \|\| u8(len(ctx)) \|\| ctx` | 32 |
 
 Define `ShortHash(K, T, data) = Keyed(K, T || data)[..16]`.
 
@@ -142,25 +144,37 @@ R = Keyed(K_R, short || framed_ctx)[..16]
 D = Keyed(K_pub, tweak(MESSAGE, 0, 0, 0, 0, 0) || R || root || short || framed_ctx)
 ```
 
-From `D` (32 bytes):
+Treat `D` as a 256-bit little-endian bit string (`bit b` is `(D[b / 8] >> (b % 8)) & 1`). Define `read_bits(D, off, w) = (u256_le(D) >> off) & ((1 << w) - 1)`. From `D[0..25]` (200 bits; top 56 bits `200..256` unused):
 
-- **FORS leaf indices** `indices[0..20]`: byte-aligned — for `t in 0..20`, `indices[t] = D[t]` (each in `0..256`, zero bit-unpacking).
-- **Hypertree leaf address** `leaf_addr`: low 35 bits of `u64_le(D[20..28])`, i.e., `u64_le(D[20..28]) & ((1 << 35) - 1)` (the remaining high bits of `D[24..32]` are unused).
+- For each U-FORS tree `t in 0..15`:
+  - `leaf[t] = read_bits(D, 11 * t,     5)` (in `0..32`)
+  - `code[t] = read_bits(D, 11 * t + 5, 6)` (in `0..64`)
+- Hypertree leaf address:
+  - `leaf_addr = read_bits(D, 165, 35)` (in `0..2^35`)
 
-## Few-time signatures (FORS)
+## Few-time signatures (U-FORS)
 
-At hypertree address `leaf_addr` (`0..2^35`), FORS consists of `FORS_TREES = 20` independent binary Merkle trees, each of height `FORS_HEIGHT = 8` (`256` leaves):
+### U-FORS codeword table
 
-- For tree `t in 0..20` and leaf `i in 0..256`:
-  - `secret[t][i] = ShortHash(K_sec, tweak(FEW_SECRET, 0, leaf_addr, t, 0, i), empty)`
-  - `leaf[t][i]   = ShortHash(K_pub, tweak(FEW_LEAF,   0, leaf_addr, t, 0, i), secret[t][i])`
-- Internal node at height `level in 1..=8`, index `p in 0..(256 >> level)`:
-  - `node = ShortHash(K_pub, tweak(FEW_NODE, 0, leaf_addr, t, level, p), left || right)`
-- The 20 tree roots `root[0..20]` are compressed into the 16-byte FORS root:
-  - `fors_root = ShortHash(K_pub, tweak(FEW_ROOT, 0, leaf_addr, 0, 0, 0), root[0] || ... || root[19])`
+Take all `69` triples `(a, b, c) in {0..=9}^3` with `a + b + c = 16`. Remove the `5` triples with smallest `(a^2 + b^2 + c^2, (a, b, c))` — namely `(5,5,6)`, `(5,6,5)`, `(6,5,5)`, `(4,6,6)`, `(6,4,6)` — and sort the remaining `64` triples lexicographically to form `UFORS_CODE[0..64]` (`192` bytes). Because every codeword sums to `16`, `UFORS_CODE` is an antichain: no distinct pair satisfies componentwise `u <= v`.
 
-The FORS section of the imprint (`2,880` bytes) is the concatenation for `t = 0..20` of:
-`secret[t][indices[t]]` (16 bytes) followed by its 8 authentication-path siblings from leaf level `0` up to level `7` (`128` bytes). On verification, at each level `h in 0..8`, if bit `h` of `indices[t]` is `0`, `cur` is the left child and `auth[h]` is the right child; otherwise `auth[h]` is left and `cur` is right, hashed with `tweak(FEW_NODE, 0, leaf_addr, t, h + 1, indices[t] >> (h + 1))`.
+### U-FORS tree and opening
+
+At hypertree address `leaf_addr` (`0..2^35`), U-FORS consists of `15` independent uniform height-5 Merkle trees (`32` leaves each). For tree `t in 0..15`, set `layer_t = 0x80 + t`:
+
+- For leaf `i in 0..32` and chain `c in 0..3`:
+  - Start: `x_0 = ShortHash(K_sec, tweak(CHAIN_SECRET, layer_t, leaf_addr, i, c, 0), empty)`
+  - Step `s in 0..9`: `x_{s+1} = ShortHash(K_pub, tweak(CHAIN, layer_t, leaf_addr, i, c, s), x_s)`
+  - Leaf hash (exact 64-byte single-block BLAKE3 input):
+    `leaf_hash = ShortHash(K_pub, tweak(ONE_TIME_KEY, layer_t, leaf_addr, i, 0, 0), x_9[0] || x_9[1] || x_9[2])`
+- Internal node at `level in 1..=5`, `p in 0..(32 >> level)`:
+  - `node = ShortHash(K_pub, tweak(NODE, layer_t, leaf_addr, 0, level, p), left || right)`
+- Tree opening for `(leaf[t], code[t])` with codeword `(d_0, d_1, d_2) = UFORS_CODE[code[t]]`:
+  - `x_{d_0}[0] || x_{d_1}[1] || x_{d_2}[2]` (`48` bytes) followed by the `5` height-5 authentication siblings (`80` bytes) = `128` bytes per tree (`1,920` bytes total).
+- Root compression:
+  - `ufors_root = ShortHash(K_pub, tweak(FEW_ROOT, 0, leaf_addr, 0, 0, 0), root[0] || ... || root[14])`
+
+On verification, for each tree `t`, complete each chain `c` from `d_c` to `9` (constant `27 - 16 = 11` steps/tree, `165` total), hash the 64-byte leaf, walk the 5-level Merkle path, and compress all `15` tree roots into `ufors_root`.
 
 ## One-time signatures (WOTS+)
 
@@ -181,7 +195,7 @@ Given a 16-byte message `node` to sign at `(layer, tree, leaf)`:
 
 The hypertree has `7` uniform layers (`layer = 0, 1, 2, 3, 4, 5, 6`), each of height `TREE_HEIGHT = 5` (`32` leaves per tree):
 
-- Starting with `addr = leaf_addr` and `node = fors_root`:
+- Starting with `addr = leaf_addr` and `node = ufors_root`:
   - For `layer = 0..7`:
     - `leaf = addr & 0x1f` (`5` low bits)
     - `tree = addr >> 5` (at `layer = 6`, `tree == 0`)
@@ -190,26 +204,26 @@ The hypertree has `7` uniform layers (`layer = 0, 1, 2, 3, 4, 5, 6`), each of he
     - Set `node = tree_root` and `addr = tree`.
 - Verification succeeds iff the reconstructed layer-6 root equals `id[16..32]` in constant time.
 
-Wire layout of an `Imprint` (`7,392` bytes):
+Wire layout of an `Imprint` (`6,432` bytes):
 
 ```text
 0..16        salt e (16 B)
 16..32       randomizer R (16 B)
-32..2912     FORS: 20 trees x (16 B secret + 8 x 16 B auth path) = 2,880 B
-2912..3552   Layer 0: 35 x 16 B WOTS+ + 5 x 16 B auth path = 640 B
-3552..4192   Layer 1: 35 x 16 B WOTS+ + 5 x 16 B auth path = 640 B
-4192..4832   Layer 2: 35 x 16 B WOTS+ + 5 x 16 B auth path = 640 B
-4832..5472   Layer 3: 35 x 16 B WOTS+ + 5 x 16 B auth path = 640 B
-5472..6112   Layer 4: 35 x 16 B WOTS+ + 5 x 16 B auth path = 640 B
-6112..6752   Layer 5: 35 x 16 B WOTS+ + 5 x 16 B auth path = 640 B
-6752..7392   Layer 6: 35 x 16 B WOTS+ + 5 x 16 B auth path = 640 B
+32..1952     U-FORS: 15 trees x (3 x 16 B chains + 5 x 16 B auth path) = 1,920 B
+1952..2592   Layer 0: 35 x 16 B WOTS+ + 5 x 16 B auth path = 640 B
+2592..3232   Layer 1: 35 x 16 B WOTS+ + 5 x 16 B auth path = 640 B
+3232..3872   Layer 2: 35 x 16 B WOTS+ + 5 x 16 B auth path = 640 B
+3872..4512   Layer 3: 35 x 16 B WOTS+ + 5 x 16 B auth path = 640 B
+4512..5152   Layer 4: 35 x 16 B WOTS+ + 5 x 16 B auth path = 640 B
+5152..5792   Layer 5: 35 x 16 B WOTS+ + 5 x 16 B auth path = 640 B
+5792..6432   Layer 6: 35 x 16 B WOTS+ + 5 x 16 B auth path = 640 B
 ```
 
 ## Signer randomness (Signet local host policy)
 
 The BLINCS wire format does not depend on how the signer chooses `draw`; the scheme below is Signet's local host policy for keeping `draw` non-repeating across restarts without file locking (`flock`).
 
-State lives in a single private regular file on a trusted local filesystem (created once with `Randomness::create`, mode `0600` on Unix) holding **exact 32 raw bytes**:
+State lives in a single private regular file on a private local filesystem (created once with `Randomness::create`, mode `0600` on Unix) holding **exact 32 raw bytes**:
 
 1. **State mixing (`mix_pool` and `expand_pool`):**
    Given optional prior 32-byte state `prior` (`None` on `create`, `Some(prior)` on `initialize`), 32 bytes `system` from OS cryptographic randomness (`getrandom(2)` / `getentropy`), 4-byte little-endian process ID `pid`, and opaque `clock` bytes from the monotonic clock:
@@ -232,6 +246,6 @@ State lives in a single private regular file on a trusted local filesystem (crea
 
 ## Security target, model, and limits
 
-- **Design target:** 128-bit classical security at up to $q = 2^{32}$ imprints per signet (single-query FORS leaf-cover exponent under ideal hashes: **134.5 bits** at $2^{32}$, **128.8 bits** at $2^{33}$, **122.4 bits** at $2^{34}$, **114.9 bits** at $2^{35}$, **106.2 bits** at $2^{36}$; verified by `python3 tools/optimize.py --check`). These are single-key ideal-hash cover estimates, not a complete multi-user or quantum proof of BLINCS.
+- **Design target:** 128-bit classical security at up to $q = 2^{32}$ imprints per signet (exact dynamic-programming single-query U-FORS cover exponent under ideal hashes: **138.48 bits** at $2^{32}$, **132.13 bits** at $2^{33}$, **124.73 bits** at $2^{34}$, **116.05 bits** at $2^{35}$, **105.83 bits** at $2^{36}$; verified by `python3 tools/optimize.py --check`). These are single-key ideal-hash cover estimates, not a complete multi-user or quantum proof of BLINCS.
 - **Unenforced budget:** Signet does not count imprints across runs or across copies of a seed. Do not imprint more than $2^{32}$ things with one signet.
-- **Memory retention:** `Signet` retains its 32-byte seed, derived keys, and 1 KiB top tree; signing allocates a transient local `SignWorkspace` (~475 KiB for cross-tree FORS batching; ~110 KiB for `from_seed`) freed on return. Neither Signet nor `blake3-servil-core` wipes secret key memory on drop. Verification uses only local stack buffers (zero heap allocation in Signet's code; standalone `#![no_std]` crate `crates/signet-verify` links with zero allocator).
+- **Memory retention:** `Signet` retains its 32-byte seed, derived keys, and 1 KiB top tree; signing allocates a transient local `SignWorkspace` (~175 KiB for cross-tree U-FORS batching; ~110 KiB for `from_seed`) freed on return. Neither Signet nor `blake3-servil-core` wipes secret key memory on drop. Verification uses only local stack buffers (zero heap allocation in Signet's code; standalone `#![no_std]` crate `crates/signet-verify` links with zero allocator).

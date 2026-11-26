@@ -8,8 +8,8 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC_DIR = os.path.join(ROOT, "src")
 
-SECRET_KINDS = {"ChainSecret", "FewSecret"}
-PUBLIC_KINDS = {"Chain", "OneTimeKey", "Node", "FewLeaf", "FewNode", "FewRoot", "Message"}
+SECRET_KINDS = {"ChainSecret"}
+PUBLIC_KINDS = {"Chain", "OneTimeKey", "Node", "FewRoot", "Message"}
 ALL_KINDS = SECRET_KINDS | PUBLIC_KINDS
 
 # Mapping between Rust TweakKind CamelCase variant names and SPEC.md SCREAMING_SNAKE names.
@@ -18,9 +18,6 @@ KIND_TO_SPEC = {
     "Chain": "CHAIN",
     "OneTimeKey": "ONE_TIME_KEY",
     "Node": "NODE",
-    "FewSecret": "FEW_SECRET",
-    "FewLeaf": "FEW_LEAF",
-    "FewNode": "FEW_NODE",
     "FewRoot": "FEW_ROOT",
     "Message": "MESSAGE",
 }
@@ -116,8 +113,8 @@ def check_static(params_src, spec_text, shipped_sources, verify_src=None):
     rust_tweak_map = {}
     for name, raw_tag in kinds:
         tag = int(raw_tag)
-        if not (1 <= tag <= 9):
-            errors.append(f"TweakKind::{name} tag {tag} outside 1..=9")
+        if not (1 <= tag <= 6):
+            errors.append(f"TweakKind::{name} tag {tag} outside 1..=6")
         if tag in rust_tweak_map:
             errors.append(f"duplicate TweakKind tag {tag} for {name} and {rust_tweak_map[tag]}")
         role = "K_sec" if name in SECRET_KINDS else "K_pub"
@@ -168,26 +165,26 @@ def check_static(params_src, spec_text, shipped_sources, verify_src=None):
 
 
 def self_test(params_src, spec_text, shipped_sources, verify_src):
-    bad_ctx = params_src.replace('"BLINCS-128-7x5 2026-11-25 content"', '"BLINCS-128-7x5 2026-11-25 public hash"', 1)
+    bad_ctx = params_src.replace('"BLINCS-128-7x5 2026-11-26 content"', '"BLINCS-128-7x5 2026-11-26 public hash"', 1)
     ctx_errs = check_static(bad_ctx, spec_text, shipped_sources, verify_src)
     if not any("duplicate context string" in e for e in ctx_errs):
         raise RuntimeError(f"self-test failed: duplicate CTX diagnostic not triggered: {ctx_errs}")
 
-    bad_spec = spec_text.replace('| `CONTENT` | `"BLINCS-128-7x5 2026-11-25 content"` |', '| `CONTENT` | `"BLINCS-128-7x5 2026-11-25 wrong"` |', 1)
+    bad_spec = spec_text.replace('| `CONTENT` | `"BLINCS-128-7x5 2026-11-26 content"` |', '| `CONTENT` | `"BLINCS-128-7x5 2026-11-26 wrong"` |', 1)
     if not check_static(params_src, bad_spec, shipped_sources, verify_src):
         raise RuntimeError("self-test failed: SPEC.md name-to-value mismatch escaped")
 
-    bad_tag = params_src.replace("Message = 9,", "Message = 8,", 1)
+    bad_tag = params_src.replace("Message = 6,", "Message = 5,", 1)
     tag_errs = check_static(bad_tag, spec_text, shipped_sources, verify_src)
     if not any("duplicate TweakKind tag" in e for e in tag_errs):
         raise RuntimeError(f"self-test failed: duplicate TweakKind tag escaped: {tag_errs}")
 
     bad_role = dict(shipped_sources)
-    bad_role["src/few_time.rs"] = bad_role["src/few_time.rs"] + "\nlet _ = tweak(TweakKind::FewSecret, 0, 0, 0, 0, 0);\n"
+    bad_role["src/few_time.rs"] = bad_role["src/few_time.rs"] + "\nlet _ = tweak(TweakKind::ChainSecret, 0, 0, 0, 0, 0);\n"
     if not check_static(params_src, spec_text, bad_role, verify_src):
         raise RuntimeError("self-test failed: secret tweak outside SecretKey escaped")
 
-    bad_verify = verify_src.replace("Message = 9,", "Message = 8,", 1)
+    bad_verify = verify_src.replace("Message = 6,", "Message = 5,", 1)
     if not check_static(params_src, spec_text, shipped_sources, bad_verify):
         raise RuntimeError("self-test failed: signet-verify TweakKind mismatch escaped")
 
@@ -203,8 +200,8 @@ def check_dynamic_reference():
     derived_ctxs = set()
     ver_sec_tweaks = []
     ver_pub_tweaks = []
-    fors_sec_tweaks = []
-    fors_pub_tweaks = []
+    ufors_sec_tweaks = []
+    ufors_pub_tweaks = []
     wots_sec_tweaks = []
     wots_pub_tweaks = []
 
@@ -212,7 +209,7 @@ def check_dynamic_reference():
     k_sec_expected = orig_derive(blincs.CTX_SECRET_VALUES, seed)
     pk_seed = orig_derive(blincs.CTX_PUBLIC_SEED, seed)[:16]
     k_pub_expected = orig_derive(blincs.CTX_PUBLIC_HASH, pk_seed)
-    id_bytes = bytes.fromhex("b58abfb655db7c92808f12c3a8ffd2d04841cf61994321648cf193638876c492")
+    id_bytes = bytes.fromhex("98a5b8314b854e78f72cbadc9f5ed67c15bc2ad253cd98be1d5951595f217512")
     imp_bytes = open(os.path.join(ROOT, "test_vectors", "reference-imprint-1.bin"), "rb").read()
     ref_ctx = b"BLINCS-128-7x5 reference vector v1"
 
@@ -238,29 +235,32 @@ def check_dynamic_reference():
         if not sid.verify(ref_ctx, b"hello, BLINCS", imp_bytes):
             raise RuntimeError("reference verification failed")
 
-        bucket[0], bucket[1] = fors_sec_tweaks, fors_pub_tweaks
-        fors_leaves = []
-        for i in range(16):
-            s = blincs.H(k_sec_expected, blincs.tweak(blincs.KIND_FEW_SECRET, 0, 42, 0, 0, i))
-            fors_leaves.append(blincs.H(k_pub_expected, blincs.tweak(blincs.KIND_FEW_LEAF, 0, 42, 0, 0, i), s))
-        _ = blincs.merkle_tree(k_pub_expected, blincs.KIND_FEW_NODE, 0, 42, 0, fors_leaves)
+        bucket[0], bucket[1] = ufors_sec_tweaks, ufors_pub_tweaks
+        ufors_leaves = [
+            blincs.chain_leaf(k_sec_expected, k_pub_expected, blincs.UFORS_LAYER_BASE, 42, i, blincs.UFORS_CHAINS, blincs.UFORS_STEPS)
+            for i in range(4)
+        ]
+        _ = blincs.merkle_tree(k_pub_expected, blincs.UFORS_LAYER_BASE, 42, ufors_leaves)
 
         bucket[0], bucket[1] = wots_sec_tweaks, wots_pub_tweaks
-        wots_leaves = [blincs.one_time_leaf(k_sec_expected, k_pub_expected, 0, 7, leaf) for leaf in range(4)]
-        _ = blincs.merkle_tree(k_pub_expected, blincs.KIND_NODE, 0, 7, 0, wots_leaves)
+        wots_leaves = [
+            blincs.chain_leaf(k_sec_expected, k_pub_expected, 0, 7, leaf, blincs.CHAINS, blincs.CHAIN_STEPS)
+            for leaf in range(4)
+        ]
+        _ = blincs.merkle_tree(k_pub_expected, 0, 7, wots_leaves)
     finally:
         blake3.derive_key = orig_derive
         blake3.keyed_hash = orig_keyed
 
     if len(ver_sec_tweaks) != 0 or len(ver_pub_tweaks) == 0 or len(ver_pub_tweaks) != len(set(ver_pub_tweaks)):
         raise RuntimeError("verify tweak invariant failed")
-    if len(fors_sec_tweaks) != 16 or len(set(fors_sec_tweaks)) != 16 or len(fors_pub_tweaks) != 31 or len(set(fors_pub_tweaks)) != 31:
-        raise RuntimeError("FORS tweak invariant failed")
+    if len(ufors_sec_tweaks) != 4 * 3 or len(set(ufors_sec_tweaks)) != 4 * 3 or len(ufors_pub_tweaks) != len(set(ufors_pub_tweaks)):
+        raise RuntimeError("U-FORS tweak invariant failed")
     if len(wots_sec_tweaks) != 4 * 35 or len(set(wots_sec_tweaks)) != 4 * 35 or len(wots_pub_tweaks) != len(set(wots_pub_tweaks)):
         raise RuntimeError("WOTS tweak invariant failed")
-    if not set(fors_sec_tweaks).isdisjoint(wots_sec_tweaks) or not set(fors_pub_tweaks).isdisjoint(wots_pub_tweaks):
-        raise RuntimeError("FORS and WOTS tweaks overlapped")
-    return len(ver_pub_tweaks), len(fors_pub_tweaks), len(wots_pub_tweaks), len(derived_ctxs)
+    if not set(ufors_sec_tweaks).isdisjoint(wots_sec_tweaks) or not set(ufors_pub_tweaks).isdisjoint(wots_pub_tweaks):
+        raise RuntimeError("U-FORS and WOTS tweaks overlapped")
+    return len(ver_pub_tweaks), len(ufors_pub_tweaks), len(wots_pub_tweaks), len(derived_ctxs)
 
 
 def main():
@@ -279,10 +279,10 @@ def main():
             print("FAIL:", e, file=sys.stderr)
         return 1
 
-    n_ver, n_fors, n_wots, n_ctx = check_dynamic_reference()
+    n_ver, n_ufors, n_wots, n_ctx = check_dynamic_reference()
     print(
-        f"domain_sep.py PASSED (self-test 5/5 caught; 11 CTX + 9 TweakKind SPEC-table exact match, SecretKey boundary & signet-verify parity; "
-        f"dynamic trace: {n_ver} unique verify K_pub / 0 K_sec, {n_fors} FORS + {n_wots} WOTS+/Merkle disjoint tweaks, {n_ctx} contexts)."
+        f"domain_sep.py PASSED (self-test 5/5 caught; 11 CTX + 6 TweakKind SPEC-table exact match, SecretKey boundary & signet-verify parity; "
+        f"dynamic trace: {n_ver} unique verify K_pub / 0 K_sec, {n_ufors} U-FORS + {n_wots} WOTS+/Merkle disjoint tweaks, {n_ctx} contexts)."
     )
     return 0
 

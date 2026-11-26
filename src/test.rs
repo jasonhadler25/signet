@@ -1,11 +1,11 @@
 include!("../tools/require_nextest.rs");
 
 use crate::content::{content_from_slice, content_with, derive_msg_key};
-use crate::few_time::{build_all_fors, fors_verify, parse_digest};
+use crate::few_time::{UforsSel, build_all_ufors, parse_digest, ufors_verify};
 use crate::one_time::{Pos, SignWorkspace, advance_chains, digits};
 use crate::params::{
-    CHAIN_STEPS, CHAINS, CTX_CONTENT, FORS_LEN, FORS_TREES, HYPER_BITS, IMPRINT_LEN, LAYER_LEN, Layer, LeafAddr, MAX_CONTEXT_LEN, MSG_CHAINS, N, PublicKey,
-    SUITE_NAME, SecretKey, TweakKind, derive_key, ensure_init, tweak,
+    CHAIN_STEPS, CHAINS, CTX_CONTENT, HYPER_BITS, IMPRINT_LEN, LAYER_LEN, Layer, LeafAddr, MAX_CONTEXT_LEN, MSG_CHAINS, N, PublicKey, SUITE_NAME, SecretKey,
+    TweakKind, UFORS_CODE, UFORS_LEN, UFORS_STEPS, UFORS_SUM, UFORS_TREES, derive_key, ensure_init, read_bits, tweak,
 };
 use crate::randomness::{SEED_FILE_LEN, expand_pool, mix_pool, read_exact_seed, read_monotonic_clock, read_os_randomness};
 use crate::{
@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
-const REF_VK_HEX: &str = "b58abfb655db7c92808f12c3a8ffd2d04841cf61994321648cf193638876c492";
+const REF_VK_HEX: &str = "98a5b8314b854e78f72cbadc9f5ed67c15bc2ad253cd98be1d5951595f217512";
 const REF_CTX: Context<'static> = Context::new(b"BLINCS-128-7x5 reference vector v1");
 const TEST_CTX: Context<'static> = Context::new(b"signet unit test v1");
 
@@ -126,20 +126,21 @@ fn reference_vector_and_intermediate_kats_match_python_byte_for_byte() {
     // Intermediate Known Answer Tests (KATs) matching reference/blincs.py.
     let e: [u8; N] = ref_sig.as_bytes()[..N].try_into().unwrap();
     let r: [u8; N] = ref_sig.as_bytes()[N..2 * N].try_into().unwrap();
-    assert_eq!(to_hex(&e), "c59c076073bef65dd74facc7453fdcdc");
-    assert_eq!(to_hex(&r), "8538feb0b1803987e8a2344e0991d9b2");
+    assert_eq!(to_hex(&e), "3ee655b325f3fef998372326a6ad5bd4");
+    assert_eq!(to_hex(&r), "4f6bc05208d26834de62980950f120c4");
     let ck = derive_key(CTX_CONTENT, sk.id().as_bytes());
     let k_msg = derive_msg_key(&ck, &e, REF_CTX);
-    assert_eq!(to_hex(&k_msg), "1c28a56af15ce2bb6792393b0b477388d924a2236ca3aedb061fb93d5e52bd8e");
+    assert_eq!(to_hex(&k_msg), "10dc74ca12332248a57f4a7d634d0e33a66e328daefc974846b4f797357bc9b0");
     let short = content_from_slice(&ck, &e, REF_CTX, msg);
-    assert_eq!(to_hex(&short[N..]), "ad7606a939db70dcc963a91e0fa003d59fc4462e163c16dd2138c4cd0cc66fab");
+    assert_eq!(to_hex(&short[N..]), "97519fba890010cfb56d70e5b362d7a7a08acc9ed03a55b961abe1f67c1812f3");
     let pk = PublicKey::from_seed(sk.id().as_bytes()[..N].try_into().unwrap());
     let root: [u8; N] = sk.id().as_bytes()[N..].try_into().unwrap();
     let d = compute_message_digest(&pk, &r, &root, &short, REF_CTX);
-    assert_eq!(to_hex(&d), "6e13239c0efaa15bda213d2b03ca8b8d726cc1f9e6e0c6c686fdac69f6af9c68");
-    let (fors_idx, leaf_addr) = parse_digest(&d);
-    assert_eq!(fors_idx.as_slice(), &d[..FORS_TREES]);
-    assert_eq!(leaf_addr.as_u64(), 0x6c6c6e0e6);
+    assert_eq!(to_hex(&d), "e68bbde745c55884532af2f0ebeb2fa98e03de57be31ca2cb88ec347edff9495");
+    let (ufors_sel, leaf_addr) = parse_digest(&d);
+    assert_eq!(ufors_sel[0], UforsSel { leaf: 6, code: 31 });
+    assert_eq!(ufors_sel[14], UforsSel { leaf: 21, code: 60 });
+    assert_eq!(leaf_addr.as_u64(), 0x5c166518d);
 
     let rust_sig = sk.imprint_with_draw(&draw, REF_CTX, msg);
     assert_eq!(rust_sig.as_bytes().as_slice(), expected.as_slice());
@@ -280,19 +281,54 @@ fn wots_digits_and_checksum_boundaries() {
 }
 
 #[test]
-fn parse_digest_extracts_all_fors_indices_and_35bit_leaf_addr() {
-    let mut d = [0u8; 32];
-    let expected_idx: [u8; FORS_TREES] = core::array::from_fn(|t| u8::try_from((t * 13 + 29) & 0xff).unwrap());
-    d[..FORS_TREES].copy_from_slice(&expected_idx);
-
+fn parse_digest_extracts_all_ufors_selections_and_35bit_leaf_addr() {
+    let expected_sel: [UforsSel; UFORS_TREES] =
+        core::array::from_fn(|t| UforsSel { leaf: u8::try_from((t * 7 + 3) & 31).unwrap(), code: u8::try_from((t * 11 + 5) & 63).unwrap() });
     let expected_addr = (1u64 << (HYPER_BITS - 1)) | 0x0123_4567;
-    let raw_addr = expected_addr | (0x1fff_ffff_u64 << HYPER_BITS);
-    d[20..28].copy_from_slice(&raw_addr.to_le_bytes());
-    d[28..32].copy_from_slice(&[0xff; 4]);
+    let mut d = [0u8; 32];
+    let set_bits = |buf: &mut [u8; 32], bit_off: usize, width: usize, val: u64| {
+        for i in 0..width {
+            if (val >> i) & 1 != 0 {
+                let b = bit_off + i;
+                buf[b / 8] |= 1u8 << (b % 8);
+            }
+        }
+    };
+    for (t, s) in expected_sel.iter().enumerate() {
+        set_bits(&mut d, 11 * t, 5, u64::from(s.leaf));
+        set_bits(&mut d, 11 * t + 5, 6, u64::from(s.code));
+    }
+    set_bits(&mut d, 165, HYPER_BITS, expected_addr);
+    // Unused top 56 bits (200..256) set to 1 must be ignored by parse_digest and masked by LeafAddr.
+    d[25..32].fill(0xff);
 
-    let (indices, addr) = parse_digest(&d);
-    assert_eq!(indices, expected_idx);
+    let (sel, addr) = parse_digest(&d);
+    assert_eq!(sel, expected_sel);
     assert_eq!(addr.as_u64(), expected_addr);
+    assert_eq!(LeafAddr::from_digest_word(expected_addr | (0x1fff_ffff_u64 << HYPER_BITS)).as_u64(), expected_addr);
+
+    // Exercise read_bits right at the end of the 32-byte digest (byte_off > 24 => avail < 8).
+    let mut tail = [0u8; 32];
+    tail[30] = 0b1010_0101;
+    tail[31] = 0b1101_0011;
+    assert_eq!(read_bits(&tail, 240, 16), 0b1101_0011_1010_0101);
+    assert_eq!(read_bits(&tail, 250, 6), 0b11_0100);
+
+    // Exhaustively verify UFORS_CODE matches its mathematical extreme-variance definition.
+    let mut all = Vec::new();
+    for a in 0..=UFORS_STEPS {
+        for b in 0..=UFORS_STEPS {
+            let s = usize::from(a) + usize::from(b);
+            if s <= UFORS_SUM && UFORS_SUM - s <= usize::from(UFORS_STEPS) {
+                all.push([a, b, u8::try_from(UFORS_SUM - s).unwrap()]);
+            }
+        }
+    }
+    let mut by_norm = all.clone();
+    by_norm.sort_by_key(|&[a, b, c]| (u16::from(a) * u16::from(a) + u16::from(b) * u16::from(b) + u16::from(c) * u16::from(c), [a, b, c]));
+    let dropped = &by_norm[..all.len() - 64];
+    let expected_code: Vec<[u8; 3]> = all.into_iter().filter(|cw| !dropped.contains(cw)).collect();
+    assert_eq!(expected_code.as_slice(), UFORS_CODE.as_slice());
 }
 
 #[test]
@@ -351,8 +387,8 @@ fn every_signature_region_is_checked() {
         vk.verify(REF_CTX, msg, &Imprint::from_bytes(&raw)).is_ok()
     };
 
-    // Mutate one byte in EVERY 16-byte wire field across the entire 7,392-byte imprint (462 fields):
-    // salt (0..16), randomizer (16..32), every FORS secret & sibling, and every WOTS chain & Merkle sibling.
+    // Mutate one byte in EVERY 16-byte wire field across the entire 6,432-byte imprint (402 fields):
+    // salt (0..16), randomizer (16..32), every U-FORS chain & sibling, and every WOTS chain & Merkle sibling.
     for field in 0..(IMPRINT_LEN / N) {
         let off = field * N + (field % N);
         assert!(!flip(off), "accepted flip in 16-byte wire field {field} (offset {off})");
@@ -537,9 +573,9 @@ fn randomness_mix_matches_python_reference() {
     let pool = mix_pool(Some(&prior), &system, pid, clock);
     let (next_seed, run_key, keygen_key) = expand_pool(&pool);
 
-    assert_eq!(to_hex(&next_seed), "e25f6194f016297e9ede065cdda5791ac021a69fbc0912e318ecb321d70f7d24");
-    assert_eq!(to_hex(&run_key), "f3454e55d82b6e1350a46c01a4be23a55f9f6ebb51baadf364ee91fa11c3d84c");
-    assert_eq!(to_hex(&keygen_key), "9f080816264c88adc6207059744e0d64f739a1b984e7db047fea9ffe15e47615");
+    assert_eq!(to_hex(&next_seed), "97b8baab73eac1d7054392950f031281019b65b801470471fe558ab838bb18d8");
+    assert_eq!(to_hex(&run_key), "0c098f138cdb2414e1d302cc2239c6083666a0a0df0a09b5e016f3425ebcb663");
+    assert_eq!(to_hex(&keygen_key), "6c6e05e84a6afff9374640a0f0db963b696a501e88f175967efd5b8c8a74b8e7");
 
     // Prior salt, PID, system randomness, and clock all affect the mixed pool independently.
     assert_ne!(mix_pool(None, &system, pid, clock), pool);
@@ -548,10 +584,10 @@ fn randomness_mix_matches_python_reference() {
     assert_ne!(mix_pool(Some(&prior), &system, pid, b"other-clock"), pool);
 
     let r = Randomness::from_keys_at(run_key, keygen_key, 0);
-    assert_eq!(to_hex(&r.draw()), "5f2db2b96c8a6873291819498bec87e7c5d514877f21f55452125372f93f034f");
+    assert_eq!(to_hex(&r.draw()), "7a6fcaeaa30742062cee1f2be0ac3aafb1ec114b1f14c44a87899e34cfd43d26");
     assert_ne!(r.draw(), r.draw());
     let rk = Randomness::from_keys_at(run_key, keygen_key, 0);
-    assert_eq!(to_hex(&rk.draw_for_keygen()), "1a79f68394d9592a5586ea8ca3259bb52edc4bba803668782c604a9f0060259e");
+    assert_eq!(to_hex(&rk.draw_for_keygen()), "70b5ece1669e05c593c9e0a7a7cb56efbd4f5f0135f12a758f21ec5354a0589b");
 
     // read_exact_seed retries Interrupted, accepts exact 32 bytes, rejects 0/31/33 bytes, propagates errors.
     let mut frag32 = FragmentedReader::new(&[0x55u8; SEED_FILE_LEN], 5, 2);
@@ -740,7 +776,7 @@ fn signet_generate_produces_distinct_valid_signets() {
 }
 
 #[test]
-fn fors_batched_root_is_index_independent_at_extreme_addresses() {
+fn ufors_batched_root_is_selection_independent_at_extreme_addresses() {
     ensure_init();
     let secret = SecretKey::derive(&[0x77u8; SEED_LEN]);
     let public = PublicKey::from_seed(&[0x88u8; N]);
@@ -749,24 +785,26 @@ fn fors_batched_root_is_index_independent_at_extreme_addresses() {
 
     for raw_addr in [0u64, 1, (1u64 << HYPER_BITS) - 1] {
         let addr = LeafAddr::from_digest_word(raw_addr);
-        let idx_zero = [0u8; FORS_TREES];
-        let idx_max = [255u8; FORS_TREES];
-        let idx_mix: [u8; FORS_TREES] = core::array::from_fn(|t| if t % 2 == 0 { 0 } else { 255 });
+        // Includes code 0 = [0, 7, 9] (tests digit 0 AND digit 9!) and code 63 = [9, 7, 0].
+        let sel_zero = [UforsSel { leaf: 0, code: 0 }; UFORS_TREES];
+        let sel_max = [UforsSel { leaf: 31, code: 63 }; UFORS_TREES];
+        let sel_mix: [UforsSel; UFORS_TREES] =
+            core::array::from_fn(|t| UforsSel { leaf: if t % 2 == 0 { 0 } else { 31 }, code: u8::try_from((t * 5) & 63).unwrap() });
 
-        let (mut sig_z, mut sig_m, mut sig_x) = ([0u8; FORS_LEN], [0u8; FORS_LEN], [0u8; FORS_LEN]);
-        let r_z = build_all_fors(&secret, &public, addr, &idx_zero, &mut ws, &mut sig_z);
-        let r_m = build_all_fors(&secret, &public, addr, &idx_max, &mut ws, &mut sig_m);
-        let r_x = build_all_fors(&secret, &public, addr, &idx_mix, &mut ws, &mut sig_x);
+        let (mut sig_z, mut sig_m, mut sig_x) = ([0u8; UFORS_LEN], [0u8; UFORS_LEN], [0u8; UFORS_LEN]);
+        let r_z = build_all_ufors(&secret, &public, addr, &sel_zero, &mut ws, &mut sig_z);
+        let r_m = build_all_ufors(&secret, &public, addr, &sel_max, &mut ws, &mut sig_m);
+        let r_x = build_all_ufors(&secret, &public, addr, &sel_mix, &mut ws, &mut sig_x);
 
-        // Changing FORS indices at the same leaf address must change openings while preserving the FORS root!
+        // Changing U-FORS selections at the same leaf address must change openings while preserving the U-FORS root!
         assert_eq!(r_z, r_m);
         assert_eq!(r_z, r_x);
         assert_ne!(sig_z, sig_m);
         assert_ne!(sig_z, sig_x);
 
-        assert_eq!(fors_verify(&pub_h, addr, &idx_zero, &sig_z), r_z);
-        assert_eq!(fors_verify(&pub_h, addr, &idx_max, &sig_m), r_m);
-        assert_eq!(fors_verify(&pub_h, addr, &idx_mix, &sig_x), r_x);
+        assert_eq!(ufors_verify(&pub_h, addr, &sel_zero, &sig_z), r_z);
+        assert_eq!(ufors_verify(&pub_h, addr, &sel_max, &sig_m), r_m);
+        assert_eq!(ufors_verify(&pub_h, addr, &sel_mix, &sig_x), r_x);
     }
 }
 
@@ -783,7 +821,7 @@ fn debug_redacts_secrets() {
 
     let sig = sk.imprint_with_draw(&[1u8; 32], TEST_CTX, b"dbg");
     let sd = format!("{sig:?}");
-    assert!(sd.contains(SUITE_NAME) && sd.contains("7392 bytes") && sd.contains(&to_hex(&sig.as_bytes()[..N])));
+    assert!(sd.contains(SUITE_NAME) && sd.contains("6432 bytes") && sd.contains(&to_hex(&sig.as_bytes()[..N])));
 }
 
 #[test]

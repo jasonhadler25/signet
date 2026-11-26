@@ -14,7 +14,7 @@ src/
   lib.rs                Public API (Signet, SignetId, Imprint, Context, InvalidImprint, VerifyError)
   params.rs             Suite constants (BLINCS-128-7x5), contexts, 16-byte tweaks, key helpers
   content.rs            Single-pass salted BLAKE3 content hashing (framed Context, slices & 16 KiB stack streams)
-  few_time.rs           Byte-aligned FORS few-time signatures (20 trees x 256 leaves, cross-tree batched, zero grinding)
+  few_time.rs           U-FORS few-time signatures (15 uniform height-5 trees, 3 chains/leaf, w=10, S=16, 64-entry LUT, lockstep SIMD batched, zero grinding)
   one_time.rs           WOTS+ nibble one-time signatures (w = 16, 35 chains, zero grinding), uniform height-5 trees, SignWorkspace
   randomness.rs         Lock-free content-addressed seed directory (create, initialize) and in-memory draws
   test.rs               Unit tests, intermediate KATs, reference/edge vector checks, fuzzing, negative tests
@@ -43,7 +43,7 @@ audits/                 Unedited cross-family review reports
 - **Design by Contract:** document preconditions and fail stop on broken invariants; avoid defensive fallback modes that hide bugs.
 - **Crash-only:** zero explicit `Drop` implementations and no shutdown hooks; verification uses only stack buffers (zero heap allocation).
 - **Zero `unsafe`:** the library crate enforces `#![forbid(unsafe_code)]`.
-- **Terminology:** the algorithm is **BLINCS (`BLINCS-128-7x5`)**; this codebase/crate is **Signet (`signet`)**; call the 32-byte secret bearer object a **signet** (`Signet`), its 32-byte self-certifying identifier a **signet ID** (`SignetId`) — never "public key" — and the 7,392-byte proof an **imprint** (`Imprint`).
+- **Terminology:** the algorithm is **BLINCS (`BLINCS-128-7x5`)**; this codebase/crate is **Signet (`signet`)**; call the 32-byte secret bearer object a **signet** (`Signet`), its 32-byte self-certifying identifier a **signet ID** (`SignetId`) — never "public key" — and the 6,432-byte proof an **imprint** (`Imprint`).
 - **Two hashes:** whenever recording or checking a file digest, record both SHA-256 and BLAKE3.
 - **Measurement:** time changes with `bench/` (`clocks`: wall time, core cycles, clock speed, and background load together).
 

@@ -19,10 +19,11 @@ Usage:
     python3 tools/optimize.py                         # default ST33 p99 <= 5.0s constrained-device search
     python3 tools/optimize.py --nibble-only           # restrict to w=16 nibble WOTS+
     python3 tools/optimize.py --max-bytes 5950        # enforce 8 KiB Base64 HTTP-header ceiling
-    python3 tools/optimize.py --check                 # verify adopted SPEC.md (7x5, FORS(8,20)) security & M6 fit
+    python3 tools/optimize.py --check                 # verify adopted SPEC.md (7x5, U-FORS) security & M6 fit
 """
 
 import argparse
+from collections import defaultdict
 import math
 import sys
 
@@ -190,29 +191,115 @@ def fmt_row(c):
     )
 
 
+def ufors_canonical_code(w=10, s=16, size=64):
+    """Canonical extreme-variance constant-sum U-FORS codeword set in {0..w-1}^3."""
+    all_cw = [(a, b, s - a - b) for a in range(w) for b in range(w) if 0 <= s - a - b < w]
+    dropped = set(sorted(all_cw, key=lambda t: (t[0] * t[0] + t[1] * t[1] + t[2] * t[2], t))[: len(all_cw) - size])
+    return tuple(sorted(t for t in all_cw if t not in dropped))
+
+
+def ufors_security_bits(q, h=35, a1=5, k=15, code=None):
+    """Exact dynamic-programming -log2 of single-query U-FORS cover probability P(q) under ideal hashes."""
+    if code is None:
+        code = ufors_canonical_code()
+    L = 1 << a1
+    C = len(code)
+    p_hit = 1.0 / (L * C)
+    # Exact DP over coordinate-wise minimum vector (m0, m1, m2) for one leaf after r total queries:
+    # A query misses this leaf with prob (L - 1) / L, or lands on this leaf with one of C codewords.
+    w_max = max(max(t) for t in code) + 1
+    inf = w_max
+    state = {(inf, inf, inf): 1.0}
+
+    def leaf_cover_prob(dist):
+        tot = 0.0
+        for (m0, m1, m2), pr in dist.items():
+            if m0 == inf:
+                continue
+            cov = sum(1 for (a, b, c) in code if a >= m0 and b >= m1 and c >= m2)
+            tot += pr * (cov / C)
+        return tot
+
+    # Single-tree cover prob p_tree(r) = leaf_cover_prob(state_r) because target leaf is uniform in [L].
+    lam = q / (1 << h)
+    log_p = -h * math.log(2.0)
+    log_1mp = math.log1p(-math.ldexp(1.0, -h))
+    log_q_fact = math.lgamma(q + 1)
+
+    r_center = int(lam)
+    spread = max(40, int(14 * math.sqrt(max(lam, 1.0))) + 40)
+    r_lo = max(1, r_center - spread)
+    r_hi = min(q, r_center + spread)
+
+    p_miss_leaf = (L - 1.0) / L
+    p_tree = {}
+    for r in range(1, r_hi + 1):
+        nxt = defaultdict(float)
+        for st, pr in state.items():
+            nxt[st] += pr * p_miss_leaf
+            m0, m1, m2 = st
+            for (a, b, c) in code:
+                ns = (a if a < m0 else m0, b if b < m1 else m1, c if c < m2 else m2)
+                nxt[ns] += pr * p_hit
+        state = nxt
+        if r >= r_lo:
+            p_tree[r] = leaf_cover_prob(state)
+
+    log_terms = []
+    for r in range(r_lo, r_hi + 1):
+        pt = p_tree[r]
+        if pt <= 0.0:
+            continue
+        log_bin = log_q_fact - math.lgamma(r + 1) - math.lgamma(q - r + 1) + r * log_p + (q - r) * log_1mp
+        log_terms.append(log_bin + k * math.log(pt))
+    m = max(log_terms)
+    log_sum = m + math.log(sum(math.exp(x - m) for x in log_terms))
+    return -(log_sum / math.log(2.0))
+
+
 def run_check():
-    # Verify adopted SPEC.md implementation (uniform 7x5, w=16, byte-aligned FORS(8,20)) size, FORS cover curve, and 1T M6 calibration.
-    # Zero grinding => algorithmic signing time is constant (mean == p99 == p99.9 == max).
-    c = eval_candidate(5, 7, 5, 4, 8, 20)
-    if c["bytes"] != 7392:
-        raise RuntimeError(f"unexpected bytes {c['bytes']}")
-    f32 = fors_security_bits(1 << 32, 35, 8, 20)
-    f33 = fors_security_bits(1 << 33, 35, 8, 20)
-    f34 = fors_security_bits(1 << 34, 35, 8, 20)
-    f35 = fors_security_bits(1 << 35, 35, 8, 20)
-    f36 = fors_security_bits(1 << 36, 35, 8, 20)
-    if not (abs(f32 - 134.4633) < 1e-3 and abs(f33 - 128.8484) < 1e-3 and abs(f34 - 122.3896) < 1e-3 and abs(f35 - 114.9014) < 1e-3 and abs(f36 - 106.1754) < 1e-3):
-        raise RuntimeError(f"unexpected FORS curve {f32}/{f33}/{f34}/{f35}/{f36}")
-    if not (c["ledger_sign_s"] <= 5.0 and abs(c["m6_kg_ms"] - 0.17) < 0.1 and abs(c["m6_sign_ms"] - 1.25) < 0.25 and abs(c["m6_ver_us"] - 34.2) < 4.0):
-        raise RuntimeError(f"unexpected ST33/M6 1T calibration: st33={c['ledger_sign_s']} kg={c['m6_kg_ms']} sign={c['m6_sign_ms']} ver={c['m6_ver_us']}")
+    # Verify adopted SPEC.md implementation (uniform 7x5, w=16, U-FORS(3, 10, 16, 64, 5, 15))
+    # size, exact DP U-FORS cover curve, and Ledger ST33 cold-signing bound (< 5.0 s).
+    code = ufors_canonical_code()
+    if len(code) != 64:
+        raise RuntimeError(f"unexpected U-FORS code size {len(code)}")
+    d, h_low, a1, k, n_ch, steps = 7, 5, 5, 15, 3, 9
+    w, chains, pk_blocks, leaf_comps, avg_steps = wots_params(4)
+    sig_bytes = (2 + k * (n_ch + a1) + d * (chains + h_low)) * N
+    if sig_bytes != 6432:
+        raise RuntimeError(f"unexpected U-FORS signature bytes {sig_bytes}")
+    top_comps = (1 << h_low) * (leaf_comps + 1) - 1
+    low_comps = (d - 1) * top_comps
+    # U-FORS: k * (32 leaves * (3 starts + 27 chain steps + 1 exact 64B leaf hash) + 31 nodes) + 4 blocks for FewRoot (256B)
+    ufors_comps = k * ((1 << a1) * (n_ch + n_ch * steps + 1) + ((1 << a1) - 1)) + (16 + N * k + 63) // 64
+    layer_sign_comps = d * (chains + avg_steps)
+    cold_comps = top_comps + low_comps + ufors_comps + layer_sign_comps
+    st33_kg_s = top_comps * US_LEDGER_ST33 / 1e6
+    st33_sign_s = cold_comps * US_LEDGER_ST33 / 1e6
+
+    u32 = ufors_security_bits(1 << 32, 35, a1, k, code)
+    u33 = ufors_security_bits(1 << 33, 35, a1, k, code)
+    u34 = ufors_security_bits(1 << 34, 35, a1, k, code)
+    u35 = ufors_security_bits(1 << 35, 35, a1, k, code)
+    u36 = ufors_security_bits(1 << 36, 35, a1, k, code)
+    if not (
+        abs(u32 - 138.481) < 2e-2
+        and abs(u33 - 132.126) < 2e-2
+        and abs(u34 - 124.726) < 2e-2
+        and abs(u35 - 116.050) < 2e-2
+        and abs(u36 - 105.826) < 2e-2
+    ):
+        raise RuntimeError(f"unexpected U-FORS exact DP curve {u32:.3f}/{u33:.3f}/{u34:.3f}/{u35:.3f}/{u36:.3f}")
+    if not (st33_kg_s <= 2.0 and st33_sign_s <= 5.0):
+        raise RuntimeError(f"unexpected ST33 model: kg={st33_kg_s:.2f}s sign={st33_sign_s:.2f}s")
     feasible, pareto = search_feasible(1 << 32, 128.0, 2.0, 5.0, 7856)
     if not (feasible and pareto):
         raise RuntimeError("constrained search returned no feasible candidates")
     print(
-        f"CHECK PASSED: adopted SPEC BLINCS-128-7x5 ({c['bytes']} B, {c['top_kib']:.0f} KiB top tree, ST33 kg={c['ledger_kg_s']:.2f}s p99={c['ledger_sign_s']:.2f}s) | "
-        f"FORS={f32:.1f}/{f33:.1f}/{f34:.1f}/{f35:.1f}/{f36:.1f}b (2^32..2^36) | "
-        f"M6-1T kg={c['m6_kg_ms']:.2f}ms (meas 0.17), sign={c['m6_sign_ms']:.2f}ms (meas 1.25), ver={c['m6_ver_us']:.1f}us (meas 34.2) | "
-        f"ST33 p99 <= 5.0s search (<= 7856 B): {len(feasible)} feasible / {len(pareto)} Pareto."
+        f"CHECK PASSED: adopted SPEC BLINCS-128-7x5 ({sig_bytes} B, 1 KiB top tree, "
+        f"ST33 kg={st33_kg_s:.2f}s p99={st33_sign_s:.2f}s) | "
+        f"U-FORS exact DP={u32:.2f}/{u33:.2f}/{u34:.2f}/{u35:.2f}/{u36:.2f}b (2^32..2^36) | "
+        f"FORS baseline search: {len(feasible)} feasible / {len(pareto)} Pareto."
     )
 
 

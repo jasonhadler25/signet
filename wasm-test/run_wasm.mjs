@@ -36,7 +36,7 @@ function loadAndRun(id, sig, ctx, msg, chunkSize) {
   return verify_both(ctx.length, msg.length, chunkSize);
 }
 
-const id = hexBytes("b58abfb655db7c92808f12c3a8ffd2d04841cf61994321648cf193638876c492");
+const id = hexBytes("98a5b8314b854e78f72cbadc9f5ed67c15bc2ad253cd98be1d5951595f217512");
 const refSig = new Uint8Array(fs.readFileSync(path.join(ROOT, "test_vectors", "reference-imprint-1.bin")));
 const refCtx = new TextEncoder().encode("BLINCS-128-7x5 reference vector v1");
 const refMsg = new TextEncoder().encode("hello, BLINCS");

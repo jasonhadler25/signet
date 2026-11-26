@@ -79,13 +79,32 @@ export const derive = (ctx: string, m: Uint8Array): Uint8Array =>
   b3(toWords(b3(IV, DK_CTX, enc.encode(ctx)), 0, 32, 8), DK_MAT, m);
 
 // ---------------- BLINCS-128-7x5 ----------------
-const N = 16, LAYERS = 7, TREE_HEIGHT = 5, CHAINS = 35, FORS_TREES = 20, FORS_HEIGHT = 8, SIG_LEN = 7392, MAX_CTX = 255;
-const BP = "BLINCS-128-7x5 2026-11-25 ";
-const SP = "Signet 2026-11-25 randomness: ";
+const N = 16, LAYERS = 7, TREE_HEIGHT = 5, CHAINS = 35, SIG_LEN = 6432, MAX_CTX = 255;
+const UFORS_TREES = 15, UFORS_CHAINS = 3, UFORS_STEPS = 9, UFORS_SUM = 16, UFORS_CODE_BITS = 6, UFORS_LAYER_BASE = 0x80;
+const UFORS_TREE_LEN = (UFORS_CHAINS + TREE_HEIGHT) * N;
+const BP = "BLINCS-128-7x5 2026-11-26 ";
+const SP = "Signet 2026-11-26 randomness: ";
 const CTX_PUBLIC_HASH = BP + "public hash", CTX_CONTENT = BP + "content",
   CTX_MIX = SP + "mix", CTX_NEXT_SEED = SP + "next seed",
   CTX_RUN_KEY = SP + "key of this run", CTX_KEYGEN_KEY = SP + "keygen key";
-const CHAIN = 2, ONE_TIME_KEY = 3, NODE = 4, FEW_LEAF = 6, FEW_NODE = 7, FEW_ROOT = 8, MESSAGE = 9;
+const CHAIN = 2, ONE_TIME_KEY = 3, NODE = 4, FEW_ROOT = 5, MESSAGE = 6;
+
+const UFORS_CODE: readonly [number, number, number][] = (() => {
+  const all: [number, number, number][] = [];
+  for (let a = 0; a <= UFORS_STEPS; a++) {
+    for (let b = 0; b <= UFORS_STEPS; b++) {
+      const c = UFORS_SUM - a - b;
+      if (c >= 0 && c <= UFORS_STEPS) all.push([a, b, c]);
+    }
+  }
+  const byNorm = [...all].sort((x, y) => {
+    const nx = x[0] * x[0] + x[1] * x[1] + x[2] * x[2];
+    const ny = y[0] * y[0] + y[1] * y[1] + y[2] * y[2];
+    return nx - ny || x[0] - y[0] || x[1] - y[1] || x[2] - y[2];
+  });
+  const dropped = new Set(byNorm.slice(0, all.length - (1 << UFORS_CODE_BITS)).map((t) => t.join(",")));
+  return all.filter((t) => !dropped.has(t.join(",")));
+})();
 
 function cat(...xs: Uint8Array[]): Uint8Array {
   const r = new Uint8Array(xs.reduce((s, x) => s + x.length, 0));
@@ -105,12 +124,36 @@ function u64le(x: bigint): Uint8Array {
   if (x < 0n || x >= (1n << 64n)) throw new Error("u64 out of range");
   const r = new Uint8Array(8); for (let i = 0; i < 8; i++) r[i] = Number((x >> BigInt(8 * i)) & 0xffn); return r;
 }
+function readBits(d: Uint8Array, bitOff: number, width: number): number {
+  let acc = 0n;
+  for (let i = 31; i >= 0; i--) acc = (acc << 8n) | BigInt(d[i]);
+  return Number((acc >> BigInt(bitOff)) & ((1n << BigInt(width)) - 1n));
+}
 function digits(node: Uint8Array): number[] {
   const d: number[] = [];
   for (let i = 0; i < 16; i++) { d.push(node[i] & 0x0f, node[i] >> 4); }
   let cs = 0; for (let j = 0; j < 32; j++) cs += 15 - d[j];
   d.push(cs & 0x0f, (cs >> 4) & 0x0f, (cs >> 8) & 0x0f);
   return d;
+}
+function verifyTreeLeaf(
+  kPub: Uint8Array, layer: number, tree: number, leaf: number,
+  ds: readonly number[], maxSteps: number, sig: Uint8Array, off: number,
+): Uint8Array {
+  const ends: Uint8Array[] = [];
+  for (let c = 0; c < ds.length; c++) {
+    let v: Uint8Array = sig.slice(off + c * N, off + (c + 1) * N);
+    for (let s = ds[c]; s < maxSteps; s++) v = shortHash(kPub, tweak(CHAIN, layer, tree, leaf, c, s), v);
+    ends.push(v);
+  }
+  let v = shortHash(kPub, tweak(ONE_TIME_KEY, layer, tree, leaf, 0, 0), cat(...ends));
+  for (let lv = 1; lv <= TREE_HEIGHT; lv++) {
+    const a0 = off + (ds.length + lv - 1) * N;
+    const auth = sig.subarray(a0, a0 + N);
+    const tw = tweak(NODE, layer, tree, 0, lv, leaf >> lv);
+    v = shortHash(kPub, tw, ((leaf >> (lv - 1)) & 1) === 0 ? cat(v, auth) : cat(auth, v));
+  }
+  return v;
 }
 
 export function verify(vk: Uint8Array, ctx: Uint8Array, message: Uint8Array, sig: Uint8Array): boolean {
@@ -124,43 +167,23 @@ export function verify(vk: Uint8Array, ctx: Uint8Array, message: Uint8Array, sig
   const kMsg = keyed(kContent, cat(e, framedCtx));
   const short = cat(e, keyed(kMsg, message));
   const D = keyed(kPub, cat(tweak(MESSAGE, 0, 0, 0, 0, 0), R, root, short, framedCtx));
-  let la = 0n; for (let i = 27; i >= 20; i--) la = (la << 8n) | BigInt(D[i]);
-  const leafAddr = Number(la & ((1n << 35n) - 1n));
+  const leafAddr = readBits(D, UFORS_TREES * (TREE_HEIGHT + UFORS_CODE_BITS), LAYERS * TREE_HEIGHT);
 
-  // FORS (20 trees x 256 leaves; one byte per tree)
+  // U-FORS (15 uniform height-5 trees, 3 chains/leaf, w=10, S=16)
   const roots: Uint8Array[] = [];
-  for (let t = 0; t < FORS_TREES; t++) {
-    const idx = D[t];
-    const off = 32 + t * (1 + FORS_HEIGHT) * N;
-    let v = shortHash(kPub, tweak(FEW_LEAF, 0, leafAddr, t, 0, idx), sig.subarray(off, off + N));
-    for (let h = 0; h < FORS_HEIGHT; h++) {
-      const auth = sig.subarray(off + N + h * N, off + 2 * N + h * N);
-      const tw = tweak(FEW_NODE, 0, leafAddr, t, h + 1, idx >> (h + 1));
-      v = shortHash(kPub, tw, ((idx >> h) & 1) === 0 ? cat(v, auth) : cat(auth, v));
-    }
-    roots.push(v);
+  for (let t = 0; t < UFORS_TREES; t++) {
+    const leaf = readBits(D, 11 * t, TREE_HEIGHT);
+    const code = readBits(D, 11 * t + TREE_HEIGHT, UFORS_CODE_BITS);
+    roots.push(verifyTreeLeaf(kPub, UFORS_LAYER_BASE + t, leafAddr, leaf, UFORS_CODE[code], UFORS_STEPS, sig, 32 + t * UFORS_TREE_LEN));
   }
   let node = shortHash(kPub, tweak(FEW_ROOT, 0, leafAddr, 0, 0, 0), cat(...roots));
 
   // Hypertree (7 uniform height-5 layers)
-  let addr = leafAddr, off = 32 + FORS_TREES * (1 + FORS_HEIGHT) * N;
+  let addr = leafAddr, off = 32 + UFORS_TREES * UFORS_TREE_LEN;
   for (let layer = 0; layer < LAYERS; layer++) {
     const leaf = addr % (1 << TREE_HEIGHT), tree = Math.floor(addr / (1 << TREE_HEIGHT));
-    const d = digits(node);
-    const ends: Uint8Array[] = [];
-    for (let c = 0; c < CHAINS; c++) {
-      let v: Uint8Array = sig.slice(off + c * N, off + (c + 1) * N);
-      for (let s = d[c]; s < 15; s++) v = shortHash(kPub, tweak(CHAIN, layer, tree, leaf, c, s), v);
-      ends.push(v);
-    }
-    let v = shortHash(kPub, tweak(ONE_TIME_KEY, layer, tree, leaf, 0, 0), cat(...ends));
-    for (let lv = 1; lv <= TREE_HEIGHT; lv++) {
-      const a0 = off + (CHAINS + lv - 1) * N;
-      const auth = sig.subarray(a0, a0 + N);
-      const tw = tweak(NODE, layer, tree, 0, lv, leaf >> lv);
-      v = shortHash(kPub, tw, ((leaf >> (lv - 1)) & 1) === 0 ? cat(v, auth) : cat(auth, v));
-    }
-    node = v; addr = tree; off += (CHAINS + TREE_HEIGHT) * N;
+    node = verifyTreeLeaf(kPub, layer, tree, leaf, digits(node), 15, sig, off);
+    addr = tree; off += (CHAINS + TREE_HEIGHT) * N;
   }
   let diff = 0; for (let i = 0; i < 16; i++) diff |= node[i] ^ root[i];
   return diff === 0;
