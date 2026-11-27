@@ -36,9 +36,9 @@ function loadAndRun(id, sig, ctx, msg, chunkSize) {
   return verify_both(ctx.length, msg.length, chunkSize);
 }
 
-const id = hexBytes("eb8e97a4ff2446ed3791cfd9515e1e23982ff22b5103bc0117c3ab69db42bac4");
+const id = hexBytes("7ee7fe20dac820b17625cad3a38a8af696a69a74992f01a7c9ed3680699d2c5c");
 const refSig = new Uint8Array(fs.readFileSync(path.join(ROOT, "test_vectors", "reference-imprint-1.bin")));
-const refCtx = new TextEncoder().encode("BLINCS-128-A2 reference vector v1");
+const refCtx = new TextEncoder().encode("BLINCS-48-X reference vector v1");
 const refMsg = new TextEncoder().encode("hello, BLINCS");
 
 if (loadAndRun(id, refSig, refCtx, refMsg, 7) !== 0) {
@@ -59,7 +59,7 @@ if (loadAndRun(id, refSig, new Uint8Array(0), refMsg, 7) !== 1) throw new Error(
 if (loadAndRun(id, refSig, new Uint8Array(256), refMsg, 7) !== 2) throw new Error("WASM failed to return ContextTooLong");
 
 // All 4 edge vectors (including 16,385 B streaming across 1024-B BLAKE3 chunk boundaries + 255-B context).
-const edge = JSON.parse(fs.readFileSync(path.join(ROOT, "test_vectors", "edge-vectors.json"), "utf8"));
+const edge = JSON.parse(fs.readFileSync(path.join(ROOT, "test_vectors", "edge-vectors.json"), "utf8")).vectors;
 const edgeMsgs = {
   empty: new Uint8Array(0),
   "one-byte-zero": new Uint8Array([0]),

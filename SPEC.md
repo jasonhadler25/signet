@@ -1,6 +1,6 @@
-# BLINCS Specification (`BLINCS-128-A2`, draft)
+# BLINCS Specification (`BLINCS-48-X`, draft)
 
-> **Pre-1.0 — Experimental & Unsupported.** This specification is under active development (draft `0.4.0`); wire formats, parameters, and context strings may still change incompatibly before 1.0. Written primarily by an AI assistant at the direction of this repository's owner; **no independent human cryptographic review or security audit has been performed**. Do not rely on BLINCS to protect production assets.
+> **Pre-1.0 — Experimental & Unsupported.** This specification is under active development (draft `0.5.0`); wire formats, parameters, and context strings may still change incompatibly before 1.0. Written primarily by an AI assistant at the direction of this repository's owner; **no independent human cryptographic review or security audit has been performed**. Do not rely on BLINCS to protect production assets.
 
 *Builds on BLAKE3 (O'Connor, Aumasson, Neves, Wilcox-O'Hearn) and SPHINCS / SPHINCS+ / FIPS 205 SLH-DSA (Bernstein, Hopwood, Hülsing, Kölbl, Lange, Niederhagen, Papachristodoulou, Rijneveld, Schneider, Schwabe, Wilcox-O'Hearn, and the NIST SLH-DSA team). Thanks to [Project 11](https://research.projecteleven.com/) — especially **Conor Deegan**, **Alessandro Baiocchi**, **Matteo Vena**, and **Matteo Vicari** — for direct review feedback, benchmarks, and constrained-device design insights.*
 
@@ -8,16 +8,16 @@
 
 ## 1. Overview
 
-**BLINCS** is a stateless hash-based signature algorithm based on BLAKE3 and SPHINCS. This specification defines the **`BLINCS-128-A2`** suite, which compresses a 128-bit stateless BLAKE3 signature down to **`3,292` bytes** (`4,392` bytes Base64) with zero static lookup tables and exact 32-lane SIMD alignment:
+**BLINCS** is a stateless hash-based signature algorithm based on BLAKE3 and SPHINCS. This specification defines the **`BLINCS-48-X`** suite, which achieves **sub-4 KiB (`3,990` bytes, `5,320` bytes Base64)** 128-bit pure stateless BLAKE3 signatures at a **$2^{48}$ per-key imprint budget** (281.5 trillion imprints/signet; certified all-orbits `U-PORS` upper-envelope security remains `>= 96` bits through `21.11 Exabytes` of wire imprints), with zero static lookup tables and exact 32-lane SIMD alignment:
 
-- **One-time signature (`S-WOTS+Z`):** Single OTS type across all 4 hypertree layers — `n = 24` equal-length hash chains of `39` steps (`w = 40`), mapped onto the middle constant-sum Sperner slice (`sum = 468`, exact constant `468` verification steps/layer) with a deterministic `u16` counter enforcing `z = 8` leading zero bits (`2^{-370}` counter overflow probability). Zero checksum chains, zero static lookup tables (`O(S)` boxcar deconvolution unranking).
-- **Few-time signature (`U-PORS` — Upper-Layer Constant-Sum Lattice Octopus):** A single height-`10` binary Merkle tree (`1,024` leaves), where each leaf is a 3-chain hash-chain key (`n = 3` equal-length chains of `23` steps, `w = 24`, fitting in **one single 64-byte BLAKE3 compression**), encoded by the full upper constant-sum slice `a + b + c = 42` (`C = 376` codewords, exact constant `27` verification steps/leaf, zero static lookup tables via closed-form hexagon unranking). Opening `k = 10` distinct leaves with Octopus path merging and a verifier-enforced sibling cap `sibs <= 44` (`u32` counter, exact `p_cap = 7.6637e-4`, mean `1,304.8` trials) compresses the entire few-time section to **`1,188` bytes**.
-- **Hypertree (`12 + 7 + 7 + 7 = 33`):** `4`-layer binary Merkle hypertree (`h = 33`): a `128 KiB` cached top height-`12` tree (`4,096` leaves) above `3` uniform height-`7` lower trees (`128` leaves each).
-- **Exact 32-lane SIMD alignment & constant chain verification work:** Top tree `4,096 = 128 × 32`, every lower tree `128 = 4 × 32` (`3,072 = 96 × 32` chains), `U-PORS` tree `1,024 = 32 × 32` (`3,072 = 96 × 32` chains). All `9,216` lower-hypertree chains and `3,072` `U-PORS` chains merge into a single `12,288`-chain lockstep SIMD wave on signing. Short-message (`|M| <= 64`, `|ctx| <= 31`) verification with prederived verifier keys executes `2,231 + m + b` BLAKE3 compressions (`m <= 44` consumed Octopus siblings, `b >= 1` `FEW_CODE` blocks — i.e., `2,276` compressions at `m = 44, b = 1`, with exact constant chain work: `468` steps/hypertree layer and `27` steps/opened `U-PORS` leaf).
+- **One-time signature (`WOTS+C`):** Single OTS type across all 6 hypertree layers — `n = 21` equal-length hash chains of `59` steps (`w = 60`), decoded directly as 21 packed 6-bit fields plus `z = 2` LSB-first zero bits from `H_l[0..16]` (`2 + 21 × 6 = 128` bits exact, zero division, zero Sperner DP, zero `u128` arithmetic, zero static tables, `< 1 KiB` stack on Cortex-M33), with a deterministic 3-byte (`u24` LE) counter enforcing `d_i < 60` for all `i` and constant upper-half sum `sum(d_i) = 679` (mean `2^{128} / |L_679(21, 60)| = 4,086.92` trials/layer, `2^{-5,923}` counter overflow probability; exact constant `560` verification steps/layer — saving `-360` verification compressions over the midpoint `619` at zero wire or security cost). Zero checksum chains.
+- **Few-time signature (`U-PORS` — Upper-Layer Constant-Sum Lattice Octopus):** A single height-`11` binary Merkle tree (`2,048` leaves), where each leaf is a 3-chain hash-chain key (`n = 3` equal-length chains of `23` steps, `w = 24`, fitting in **one single 64-byte BLAKE3 compression**), encoded by the full upper constant-sum slice `a + b + c = 42` (`C = 376` codewords, exact constant `27` verification steps/leaf, zero static lookup tables via closed-form hexagon unranking). Opening `k = 9` distinct leaves with Octopus path merging and a verifier-enforced sibling cap `sibs <= 45` (`u32` counter, exact `p_cap = 1.052923e-4`, mean `9,497.4` trials) compresses the entire few-time section to **`1,156` bytes**.
+- **Hypertree (`13 + 7 + 7 + 7 + 7 + 7 = 48`):** `6`-layer binary Merkle hypertree (`h = 48`): a height-`13` top tree (`8,192` leaves; optional cache `256 KiB` full heap, `16 KiB` partial cut `c = 10` of `1,024` subtree roots, or `0 B` stateless — all byte-for-byte identical on the wire) above `5` completely uniform height-`7` lower trees (`128` leaves each).
+- **Exact 32-lane SIMD alignment & constant chain verification work:** Top tree `8,192 = 256 × 32`, every lower tree `128 = 4 × 32` (`5 × 128 × 21 = 13,440 = 420 × 32` chains), `U-PORS` tree `2,048 = 64 × 32` (`6,144 = 192 × 32` chains). All `13,440` lower-hypertree chains and `6,144` `U-PORS` chains merge into a single `19,584`-chain (`612 × 32`) lockstep SIMD super-wave on signing. Short-message (`|M| <= 64`, `|ctx| <= 31`) verification with prederived verifier keys executes `3,715 + m + b` BLAKE3 compressions (`m <= 45` consumed Octopus siblings, `b >= 1` `FEW_CODE` blocks — i.e., `3,761` compressions at `m = 45, b = 1`, with exact constant chain work: `560` steps/hypertree layer and `27` steps/opened `U-PORS` leaf).
 - **Single-pass salted content hashing:** Every imprint binds a caller-chosen bounded application context (`0..=255` bytes) and hashes an arbitrary-length message in one streaming pass under a fresh per-imprint salt drawn before reading the message.
-- **Terminology:** This specification uses **`Signet`** (private signing capability), **`SignetId`** (32-byte verifying identifier), and **`Imprint`** (`3,292`-byte signature). These correspond directly to conventional `(SK, VK, \sigma)` notation; the companion paper (`paper/blincs.pdf`) states all theorems in standard cryptographic notation alongside this mapping.
+- **Terminology:** This specification uses **`Signet`** (private signing capability), **`SignetId`** (32-byte verifying identifier), and **`Imprint`** (`3,990`-byte signature). These correspond directly to conventional `(SK, VK, \sigma)` notation; the companion paper (`paper/blincs.pdf`) states all theorems in standard cryptographic notation alongside this mapping.
 
-An `Imprint` is **`3,292` bytes** (`4,392` bytes Base64), a `SignetId` is **`32` bytes**, and a `Signet` derives from a **`32`-byte seed**. The design target is **128-bit classical single-user security** at up to **$2^{32}$ imprints** per signet (4,294,967,296), with certified capped-history `U-PORS` raw-query security of **`132.13` bits** (`99%` LCB, accounting for Octopus sibling clustering via `blincs/tools/upors_cert.rs`, vs. `129.63` bits exact zero-MC uncapped) at $q = 2^{32}$ and `125.48` bits at $2\times$ overuse ($q = 2^{33}$). Do not imprint more than $2^{32}$ things with one signet.
+An `Imprint` is **`3,990` bytes** (`5,320` bytes Base64), a `SignetId` is **`32` bytes**, and a `Signet` derives from a **`32`-byte seed**. The design target is **128-bit classical single-user security** at up to **$2^{48}$ imprints** per signet (281,474,976,710,656), with deterministic, zero-Monte-Carlo, exact-`BigInt` all-orbits capped-history `U-PORS` upper-envelope security of **`>= 131.7076` bits** (`P <= 2.2493e-40`, accounting for Octopus sibling clustering across all `1,614,132` `Aut(T_11)`-orbits via `tools/upors_cert.rs`, vs. `>= 127.9743` bits uncapped upper-envelope) at $q = 2^{48}$ and `>= 125.3590` bits at $2\times$ overuse ($q = 2^{49}$). Do not imprint more than $2^{48}$ things with one signet.
 
 ### Notation
 
@@ -36,51 +36,53 @@ BLINCS uses **only** the two standard 32-byte modes of **BLAKE3** (no extendable
 
 ## 3. Suite Identity and Parameters
 
-Suite identifier: **`BLINCS-128-A2`**.
+Suite identifier: **`BLINCS-48-X`**.
 
 | Symbol | Value | Meaning |
 |---|---:|---|
 | `N` | 16 | Byte length of truncated tree, chain, salt, and randomizer values (`h_msg`, `D_seed`, and derived keys are 32 bytes) |
-| `LAYERS` | 4 | Hypertree layers (`d`): layers `0, 1, 2` have height `7`; top layer `3` has height `12` |
-| `LOW_HEIGHT` | 7 | Height of each of the 3 lower hypertree layers (`2^7 = 128` leaves/tree) |
-| `TOP_HEIGHT` | 12 | Height of the cached top hypertree layer (`2^{12} = 4,096` leaves, `128 KiB` heap) |
-| `HYPER_BITS` | 33 | Total hypertree height (`3 * 7 + 12 = 33`) |
-| `WOTS_N` | 24 | `S-WOTS+Z` chains per hypertree leaf |
-| `WOTS_W` | 40 | `S-WOTS+Z` chain cardinality (`WOTS_STEPS = 39`, digits in `0..=39`) |
-| `WOTS_SUM` | 468 | Middle Sperner slice sum (`24 * 39 / 2 = 468`; exact constant `468` verify steps/layer) |
-| `WOTS_Z` | 8 | Leading zero bits required on `OneTimeMsg` (`H[0] == 0`; deterministic `u16` counter `ctr_l`) |
-| `UPORS_HEIGHT` | 10 | Height of the single `U-PORS` binary Merkle tree (`2^{10} = 1,024` leaves) |
+| `LAYERS` | 6 | Hypertree layers (`d`): layers `0, 1, 2, 3, 4` have height `7`; top layer `5` has height `13` |
+| `LOW_HEIGHT` | 7 | Height of each of the 5 lower hypertree layers (`2^7 = 128` leaves/tree) |
+| `TOP_HEIGHT` | 13 | Height of the top hypertree layer (`2^{13} = 8,192` leaves; optional `256 KiB` full or `16 KiB` `c=10` partial cache) |
+| `HYPER_BITS` | 48 | Total hypertree height (`5 * 7 + 13 = 48`) |
+| `WOTS_N` | 21 | `WOTS+C` chains per hypertree leaf (`WOTS_PK_IN_LEN = 352` B = 6 BLAKE3 blocks) |
+| `WOTS_W` | 60 | `WOTS+C` chain cardinality (`WOTS_STEPS = 59`, 6-bit digits in `0..=59`) |
+| `WOTS_SUM` | 679 | Constant upper-half digit sum (`2^{128} / \|L_679(21, 60)\| = 4,086.9` mean trials; exact constant `21 * 59 - 679 = 560` verify steps/layer) |
+| `WOTS_Z` | 2 | LSB-first zero bits required on `OneTimeMsg` (`(H[0] & 0x03) == 0`; `2 + 21 * 6 = 128` bits exact) |
+| `WOTS_CTR_LEN` | 3 | Byte length of `u24` LE `WOTS+C` wire counter (`ctr_l in 0..2^24`, zero-extended to `u32` LE in `OneTimeMsg`) |
+| `UPORS_HEIGHT` | 11 | Height of the single `U-PORS` binary Merkle tree (`2^{11} = 2,048` leaves) |
 | `UPORS_N` | 3 | Equal-length hash chains per `U-PORS` leaf (`16 + 3 * 16 = 64` B = 1 BLAKE3 block) |
 | `UPORS_W` | 24 | `U-PORS` chain cardinality (`UPORS_STEPS = 23`, digits in `0..=23`) |
 | `UPORS_SUM` | 42 | Constant sum `a + b + c = 42` for every `U-PORS` codeword (`69 - 42 = 27` verify steps/leaf) |
-| `UPORS_C` | 376 | Cardinality of full upper slice `L_42(3, 24)` (`0 B` ROM closed-form hexagon unranking) |
-| `UPORS_K` | 10 | Number of distinct `U-PORS` leaves opened per imprint |
-| `UPORS_M_MAX` | 44 | Verifier-enforced maximum Octopus authentication siblings (`u32` counter `ctr_ft`) |
-| `UPORS_LAYER` | 128 | Tweak layer byte `0x80` separating `U-PORS` (`128`) from hypertree layers (`0..4`) |
+| `UPORS_C` | 376 | Cardinality of full upper slice `L_42(3, 24)` (`0 B` static tables via closed-form hexagon unranking) |
+| `UPORS_K` | 9 | Number of distinct `U-PORS` leaves opened per imprint |
+| `UPORS_M_MAX` | 45 | Verifier-enforced maximum Octopus authentication siblings (`u32` counter `ctr_ft`) |
+| `UPORS_SELECT_MAX_DRAWS` | 18 | Consecutive 11-bit leaf draws in `FEW_SELECT` (`18 * 11 + 48 = 246 <= 256` bits) |
+| `UPORS_LAYER` | 128 | Tweak layer byte `0x80` separating `U-PORS` (`128`) from hypertree layers (`0..6`) |
 | `MAX_CONTEXT_LEN` | 255 | Maximum byte length of the framed application context `ctx` |
 
 Derived lengths:
 
-- `UPORS_LEN = 4 + (UPORS_K * UPORS_N + UPORS_M_MAX) * N = 4 + (30 + 44) * 16 = 1,188` bytes.
-- `LOW_LAYER_LEN = 2 + (WOTS_N + LOW_HEIGHT) * N = 2 + 31 * 16 = 498` bytes (layers `0, 1, 2`).
-- `TOP_LAYER_LEN = 2 + (WOTS_N + TOP_HEIGHT) * N = 2 + 36 * 16 = 578` bytes (layer `3`).
-- `IMPRINT_LEN = 2 * N + UPORS_LEN + 3 * LOW_LAYER_LEN + TOP_LAYER_LEN = 3,292` bytes.
+- `UPORS_LEN = 4 + (UPORS_K * UPORS_N + UPORS_M_MAX) * N = 4 + (27 + 45) * 16 = 1,156` bytes.
+- `LOW_LAYER_LEN = 3 + (WOTS_N + LOW_HEIGHT) * N = 3 + 28 * 16 = 451` bytes (layers `0..5`).
+- `TOP_LAYER_LEN = 3 + (WOTS_N + TOP_HEIGHT) * N = 3 + 34 * 16 = 547` bytes (layer `5`).
+- `IMPRINT_LEN = 2 * N + UPORS_LEN + 5 * LOW_LAYER_LEN + TOP_LAYER_LEN = 3,990` bytes.
 
 ---
 
 ## 4. Key-Derivation Contexts
 
-Every derived 32-byte key uses a distinct UTF-8 context string binding the suite name `BLINCS-128-A2`, ensuring separate suites never share derived keys:
+Every derived 32-byte key uses a distinct UTF-8 context string binding the suite name `BLINCS-48-X`, domain-separating KDF inputs across suites:
 
 | Name | Context string |
 |---|---|
-| `SECRET_VALUES` | `"BLINCS-128-A2 2026-11-26 secret values"` |
-| `CONTENT_SALT` | `"BLINCS-128-A2 2026-11-26 content salt"` |
-| `RANDOMIZER` | `"BLINCS-128-A2 2026-11-26 randomizer"` |
-| `PUBLIC_SEED` | `"BLINCS-128-A2 2026-11-26 public seed"` |
-| `PUBLIC_HASH` | `"BLINCS-128-A2 2026-11-26 public hash"` |
-| `CONTENT` | `"BLINCS-128-A2 2026-11-26 content"` |
-| `GENERATE_SIGNET` | `"Signet BLINCS-128-A2 2026-11-26 generate signet"` |
+| `SECRET_VALUES` | `"BLINCS-48-X 2026-11-26 secret values"` |
+| `CONTENT_SALT` | `"BLINCS-48-X 2026-11-26 content salt"` |
+| `RANDOMIZER` | `"BLINCS-48-X 2026-11-26 randomizer"` |
+| `PUBLIC_SEED` | `"BLINCS-48-X 2026-11-26 public seed"` |
+| `PUBLIC_HASH` | `"BLINCS-48-X 2026-11-26 public hash"` |
+| `CONTENT` | `"BLINCS-48-X 2026-11-26 content"` |
+| `GENERATE_SIGNET` | `"Signet BLINCS-48-X 2026-11-26 generate signet"` |
 | `MIX` | `"Signet 2026-11-26 randomness: mix"` |
 | `NEXT_SEED` | `"Signet 2026-11-26 randomness: next seed"` |
 | `RUN_KEY` | `"Signet 2026-11-26 randomness: key of this run"` |
@@ -102,22 +104,22 @@ tweak(kind, layer, tree, leaf, a, b) =
  || b     (u32, 4 bytes LE)
 ```
 
-Unused fields MUST be zero. Hypertree layers use `layer in 0..4`; the single `U-PORS` tree uses `layer = 0x80` (`128`). Eight tweak kinds partition every hash call unambiguously:
+Unused fields MUST be zero. Hypertree layers use `layer in 0..6`; the single `U-PORS` tree uses `layer = 0x80` (`128`), whose `tree` field carries the full 48-bit `leaf_addr in 0..2^48`. Eight tweak kinds partition every hash call unambiguously:
 
 | Value | Name | Key | Tweak fields `(layer, tree, leaf, a, b)` | Data appended after tweak | Output used |
 |---:|---|---|---|---|---|
 | 1 | `CHAIN_SECRET` | `K_sec` | `(layer, tree, 0, 0, leaf * n_chains + c)` | *(empty)* | 16 B |
 | 2 | `CHAIN` | `K_pub` | `(layer, tree, leaf, c, step)` | current 16-byte chain value | 16 B |
-| 3 | `ONE_TIME_KEY` | `K_pub` | `(layer, tree, leaf, 0, 0)` | `24` chain ends (`384` B, HT) or `3` chain ends (`48` B, `U-PORS`) | 16 B |
+| 3 | `ONE_TIME_KEY` | `K_pub` | `(layer, tree, leaf, 0, 0)` | `21` chain ends (`336` B, HT) or `3` chain ends (`48` B, `U-PORS`) | 16 B |
 | 4 | `NODE` | `K_pub` | `(layer, tree, 0, level, parent_idx)` | `left (16) \|\| right (16)` | 16 B |
 | 5 | `ONE_TIME_MSG` | `K_pub` | `(layer, tree, leaf, 0, 0)` | `child_root (16) \|\| u32_le(ctr_l) (4)` | 32 B |
 | 6 | `MESSAGE` | `K_pub` | `(0, 0, 0, 0, 0)` | `R (16) \|\| root (16) \|\| short (48) \|\| framed_ctx` | 32 B |
 | 7 | `FEW_SELECT` | `K_pub` | `(0x80, 0, 0, 0, 0)` | `D_seed (32) \|\| u32_le(ctr_ft) (4)` | 32 B |
-| 8 | `FEW_CODE` | `K_pub` | `(0x80, 0, 0, block_idx, 0)` | `D_seed (32) \|\| u32_le(ctr_ft) (4)` | 32 B |
+| 8 | `FEW_CODE` | `K_pub` | `(0x80, 0, 0, block_idx, 0)` | `H_sel (32)` | 32 B |
 
 Define `ShortHash(K, T, data) = Keyed(K, T || data)[..16]`.
 
-Notice that every hot-path call — `CHAIN_SECRET` (`16 B`), `CHAIN` (`32 B`), `ONE_TIME_MSG` (`36 B`), `NODE` (`48 B`), `FEW_SELECT` (`52 B`), `FEW_CODE` (`52 B`), and `U-PORS` `ONE_TIME_KEY` (`64 B`) — fits inside **one single 64-byte BLAKE3 compression block**, and all three counter-indexed loops (`CHAIN_SECRET` at word `3`, `ONE_TIME_MSG` at word `8`, `FEW_SELECT` at word `12`) place the incrementing `u32` counter on a 4-byte word boundary for register-only SIMD counter-range hashing.
+Every hot-path call — `CHAIN_SECRET` (`16 B`), `CHAIN` (`32 B`), `ONE_TIME_MSG` (`36 B`), `NODE` (`48 B`), `FEW_CODE` (`48 B`), `FEW_SELECT` (`52 B`), and `U-PORS` `ONE_TIME_KEY` (`64 B`) — fits inside **one single 64-byte BLAKE3 compression block**, and all three counter-indexed loops (`CHAIN_SECRET` at word `3`, `ONE_TIME_MSG` at word `8`, `FEW_SELECT` at word `12`) place the incrementing `u32` counter on a 4-byte word boundary for register-only SIMD counter-range hashing.
 
 ---
 
@@ -131,7 +133,7 @@ K_salt  = Derive(CONTENT_SALT,  seed)
 K_R     = Derive(RANDOMIZER,    seed)
 pk_seed = Derive(PUBLIC_SEED,   seed)[..16]
 K_pub   = Derive(PUBLIC_HASH,   pk_seed)
-root    = top hypertree root at layer = 3, tree = 0 (height 12, 4,096 leaves)
+root    = top hypertree root at layer = 5, tree = 0 (height 13, 8,192 leaves)
 ```
 
 The 32-byte `SignetId` is `id = pk_seed || root`. A verifier derives from `id`:
@@ -142,7 +144,9 @@ root      = id[16..32]
 K_content = Derive(CONTENT,     id)
 ```
 
-Signers SHOULD cache the `128 KiB` top height-12 Merkle heap (`8,192 × 16 B` nodes) in memory (or Flash on embedded devices) inside `Signet` so signing never rebuilds layer `3`.
+Top-tree caching is purely internal to the signer and produces byte-for-byte identical imprints at every cache level:
+- Desktop/server signers SHOULD cache the full height-13 top Merkle heap (`2 * 8,192 × 16 B = 256 KiB`) in memory inside `Signet`.
+- Memory-constrained embedded signers (e.g., Cortex-M33 with Flash) MAY cache a partial cut at depth `c = 10` (`2^{10} = 1,024` subtree roots = `16 KiB` — recomputing only `2^{13-10} = 8` top leaves per imprint, `< 1.1%` overhead), or store `0 B` and recompute layer 5 when signing.
 
 ---
 
@@ -168,7 +172,7 @@ h_msg = Keyed(K_msg, M)                           # 32-byte keyed BLAKE3 hash of
 short = e || h_msg                                # 48 bytes
 ```
 
-Because `e` is derived before reading `M`, signers stream arbitrarily large messages through `Keyed(K_msg, M)` in a single pass. Verifiers read `e` from the first 16 bytes of the imprint and stream `M` in a single pass as well.
+Because `e` is derived before reading `M`, signers stream arbitrarily large messages through `Keyed(K_msg, M)` in a single pass. Verifiers read `e` from the first 16 bytes of the imprint and stream `M` in a single pass as well. **Commitment requirement:** signers MUST NOT disclose `e` (or `K_msg`) to a message submitter before `(ctx, M)` is committed, so `M` cannot be chosen adaptively as a function of `e`.
 
 ---
 
@@ -193,38 +197,38 @@ For a candidate `ctr_ft: u32`:
 H_sel = Keyed(K_pub, tweak(FEW_SELECT, 0x80, 0, 0, 0, 0) || D_seed || u32_le(ctr_ft))
 ```
 
-1. Read up to `22` consecutive `10`-bit chunks `x_i = read_bits(H_sel, 10 * i, 10)` (`i in 0..22`, bits `0..220`), keeping the first **`10` distinct** leaf indices in `0..1024`. If fewer than `10` distinct indices appear in those `22` chunks, `ctr_ft` is **invalid**.
-2. Sort the `10` distinct leaf indices into strictly ascending order `leaves[0] < leaves[1] < ... < leaves[9]`.
-3. Compute the exact Octopus sibling count `sibs = count_octopus_sibs(leaves)` in a binary tree of height `10` (§10.2). If `sibs > 44`, `ctr_ft` is **invalid**.
-4. Extract the `33`-bit hypertree leaf address `leaf_addr = read_bits(H_sel, 220, 33)` (bits `220..253`; bits `253..256` are unused).
+1. Read up to `18` consecutive `11`-bit chunks `x_i = read_bits(H_sel, 11 * i, 11)` (`i in 0..18`, bits `0..198`), keeping the first **`9` distinct** leaf indices in `0..2048`. If fewer than `9` distinct indices appear in those `18` chunks (probability $\approx 2^{-73}$), `ctr_ft` is **invalid**.
+2. Sort the `9` distinct leaf indices into strictly ascending order `leaves[0] < leaves[1] < ... < leaves[8]`.
+3. Compute the exact Octopus sibling count `sibs = count_octopus_sibs(leaves)` in a binary tree of height `11` (§10.2). If `sibs > 45`, `ctr_ft` is **invalid**.
+4. Extract the `48`-bit hypertree leaf address `leaf_addr = read_bits(H_sel, 198, 48)` (bits `198..246`; bits `246..256` are unused).
 
-A deterministic signer chooses the **smallest** `ctr_ft in 0..=2^32 - 1` that is valid (exact cap mass `|F| / C(1024, 10) = 7.6637e-4`, mean `~1,305` trials, `p99 ≈ 6,009` trials; `u32` exhaustion probability $< 2^{-4.7 \times 10^6}$). If `ctr_ft` exhausts `u32` (`2^32` trials without a valid selection), the signer MUST fail closed (abort/error without wrapping). A verifier checks only the single `ctr_ft` encoded in the imprint and MUST reject if it is invalid.
+A deterministic signer chooses the **smallest** `ctr_ft in 0..=2^32 - 1` that is valid (exact cap mass `|F| / C(2048, 9) = 180,700,154,447,569,471,488 / C(2048, 9) = 1.052923e-4`, mean `9,497.4` trials, `p99 ≈ 43,737` trials; `u32` exhaustion probability $< 2^{-6.5 \times 10^5}$). If `ctr_ft` exhausts `u32` (`2^32` trials without a valid selection), the signer MUST fail closed (abort/error without wrapping). A verifier checks only the single `ctr_ft` encoded in the imprint and MUST reject if it is invalid.
 
 ### 8.2 Unbiased `U-PORS` Codeword Extraction (`FEW_CODE`)
 
-Given a valid `ctr_ft`, draw `10` unbiased indices `c_0, ..., c_9 in 0..376` using `block_idx in 0..=65535` (`u16`):
+Given the accepted `FEW_SELECT` digest `H_sel` (32 bytes), draw `9` unbiased indices `c_0, ..., c_8 in 0..376` using `block_idx in 0..=65535` (`u16`):
 
 ```text
 block_idx = 0, got = 0
-while got < 10:
+while got < 9:
     if block_idx > 65535: fail closed (reject / abort)
-    B = Keyed(K_pub, tweak(FEW_CODE, 0x80, 0, 0, block_idx, 0) || D_seed || u32_le(ctr_ft))
+    B = Keyed(K_pub, tweak(FEW_CODE, 0x80, 0, 0, block_idx, 0) || H_sel)
     for j in 0..28:                       # 28 * 9 = 252 <= 256 bits
         v = read_bits(B, 9 * j, 9)        # uniform in 0..512
         if v < 376:
             codeword[got] = hex_unrank(v)
             got += 1
-            if got == 10: break
+            if got == 9: break
     block_idx += 1
 ```
 
-Each `9`-bit value is accepted with probability `376 / 512 = 73.44%` with **zero modulo bias**; in the ideal-output model `Pr[Bin(28j, 376/512) < 10]` is `~5.9e-6` after `j = 1` block (`99.9994%` finish in 1 block) and `~2^{-61}` after `j = 2` blocks (`< 2^{-10^6}` for `u16` exhaustion). Both signer and verifier MUST fail closed (abort / reject) if `block_idx` would exceed `65535` (`u16::MAX`), never wrapping `block_idx` or substituting default codewords.
+Chaining `FEW_CODE` directly from the 32-byte `FEW_SELECT` digest `H_sel` (`48 B` total input, still one single BLAKE3 block) binds the codeword stream to the selection output so adversaries cannot evaluate `FEW_CODE` for a fixed candidate `(D_seed, ctr_ft)` before evaluating `FEW_SELECT`. Each `9`-bit value is accepted with probability `376 / 512 = 73.44%` with **zero modulo bias**; in the ideal-output model `Pr[Bin(28j, 376/512) < 9]` is `~9.29e-7` (`2^{-20.0}`) after `j = 1` block (`99.99991%` finish in 1 block) and `~2^{-65}` after `j = 2` blocks (`< 2^{-10^6}` for `u16` exhaustion). Both signer and verifier MUST fail closed (abort / reject) if `block_idx` would exceed `65535` (`u16::MAX`), never wrapping `block_idx` or substituting default codewords.
 
 ---
 
 ## 9. Unified Chain-and-Merkle Primitive
 
-Both `U-PORS` (`layer = 0x80`, `height = 10`, `n_chains = 3`, `steps = 23`) and every hypertree layer (`layer in 0..4`, `height in {7, 12}`, `n_chains = 24`, `steps = 39`) use the **exact same** hash-chain and binary Merkle primitive:
+Both `U-PORS` (`layer = 0x80`, `height = 11`, `n_chains = 3`, `steps = 23`) and every hypertree layer (`layer in 0..6`, `height in {7, 13}`, `n_chains = 21`, `steps = 59`) use the **exact same** hash-chain and binary Merkle primitive:
 
 - **Chain `c in 0..n_chains` at `(layer, tree, leaf)`:**
   - Start value: `x_0 = ShortHash(K_sec, tweak(CHAIN_SECRET, layer, tree, 0, 0, leaf * n_chains + c), empty)`.
@@ -260,74 +264,65 @@ for a in 0..=23:
 
 ### 10.2 Single-Tree Octopus Signing, Padding, and Verification
 
-At hypertree address `leaf_addr` (`0..2^33`), `U-PORS` builds a single height-`10` binary Merkle tree (`1,024` leaves) via §9 with `layer = 0x80`, `tree = leaf_addr`, `n_chains = 3`, and `steps = 23`:
+At hypertree address `leaf_addr` (`0..2^48`), `U-PORS` builds a single height-`11` binary Merkle tree (`2,048` leaves) via §9 with `layer = 0x80`, `tree = leaf_addr`, `n_chains = 3`, and `steps = 23`:
 
-- **Chain values (`480` B):** For `t in 0..10`, sign `leaves[t]` with its `3` chain values `(x_{d_0}, x_{d_1}, x_{d_2})` where `(d_0, d_1, d_2) = codeword[t]`.
-- **Octopus authentication siblings (`704` B, canonical zero-padded):**
-  Starting with the strictly ascending active index list `cur = leaves[0..10]` at leaf level `0`, for `level = 1..=10`:
+- **Chain values (`432` B):** For `t in 0..9`, sign `leaves[t]` with its `3` chain values `(x_{d_0}, x_{d_1}, x_{d_2})` where `(d_0, d_1, d_2) = codeword[t]`.
+- **Octopus authentication siblings (`720` B, canonical zero-padded):**
+  Starting with the strictly ascending active index list `cur = leaves[0..9]` at leaf level `0`, for `level = 1..=11`:
   - Scan `cur` left to right:
     - If `i + 1 < len(cur)` and `(cur[i] ^ 1) == cur[i + 1]`: both children are active; merge them into parent `cur[i] >> 1` with **no** sibling emitted (`i += 2`).
     - Otherwise: emit the sibling node at `(level - 1, cur[i] ^ 1)` into the Octopus list, push parent `cur[i] >> 1` (`i += 1`).
-  - Let `sibs` be the total number of siblings emitted (`sibs <= 44`). Append `(44 - sibs) * 16` zero bytes so the Octopus field is always exactly `44 * 16 = 704` bytes.
-- **Verification:** Reconstruct all `10` leaf hashes via §9, climb the `10` Octopus levels consuming siblings in the exact same left-to-right scan order (placing `cur_val` left if `(x & 1) == 0` else right, hashed with `tweak(NODE, 0x80, leaf_addr, 0, level, x >> 1)`), **verify in constant time that all `(44 - sibs) * 16` trailing padding bytes are zero** (reject if any padding byte is non-zero), and output the level-10 root as `upors_root`.
+  - Let `sibs` be the total number of siblings emitted (`sibs <= 45`). Append `(45 - sibs) * 16` zero bytes so the Octopus field is always exactly `45 * 16 = 720` bytes.
+- **Verification:** Reconstruct all `9` leaf hashes via §9, climb the `11` Octopus levels consuming siblings in the exact same left-to-right scan order (placing `cur_val` left if `(x & 1) == 0` else right, hashed with `tweak(NODE, 0x80, leaf_addr, 0, level, x >> 1)`), **verify in constant time that all `(45 - sibs) * 16` trailing padding bytes are zero** (reject if any padding byte is non-zero), and output the level-11 root as `upors_root`.
 
-The `U-PORS` section is `4 + 480 + 704 = 1,188` bytes.
+The `U-PORS` section is `4 + 432 + 720 = 1,156` bytes.
 
 ---
 
-## 11. Hypertree (`S-WOTS+Z`) and Imprint Wire Format
+## 11. Hypertree (`WOTS+C`) and Imprint Wire Format
 
-### 11.1 `S-WOTS+Z` Message Grinding and Sperner Unranking
+### 11.1 `WOTS+C` Message Grinding and Direct 6-Bit Decoding
 
-Given a 16-byte child root `node` to sign at hypertree position `(layer, tree, leaf)` (`layer in 0..4`):
+Given a 16-byte child root `node` to sign at hypertree position `(layer, tree, leaf)` (`layer in 0..6`):
 
-1. **Deterministic `z = 8` counter grinding (`ONE_TIME_MSG`):** Find the smallest `ctr_l in 0..=65535` (`u16`) such that
+1. **Direct 6-bit decoding (`decode_wots_c`):** Given the 16-byte truncated digest `H_l = ShortHash(...)`, let `lo = u128_le(H_l)`. `H_l` is **valid** if and only if all three conditions hold:
+   - `(lo & 3) == 0` (`WOTS_Z = 2` LSB-first zero bits),
+   - for every `i in 0..21`, the 6-bit field `digits[i] = (lo >> (2 + 6 * i)) & 63` satisfies `digits[i] < 60`, and
+   - `digits[0] + digits[1] + ... + digits[20] == 679` (`WOTS_SUM = 679`).
+   Notice `2 + 21 * 6 = 128` bits — every single bit of `H_l[0..16]` is bound with zero division, zero `u128` arithmetic, zero coding lookup tables, and zero stack buffers. Because `sum(digits) == 679` is constant, valid digit vectors form a strict antichain in `{0..=59}^{21}`, so forging by forward derivation from the same openings (absent other collision or chain-preimage events) requires matching the exact 128-bit prefix `H'_l[0..16] == H_l[0..16]` (`2^{-128}` per fresh raw query in the ROM).
+2. **Deterministic `u24` counter grinding (`ONE_TIME_MSG`):** Find the smallest `ctr_l in 0..=16,777,215` (`0..2^24`) such that
    ```text
    H_l = Keyed(K_pub, tweak(ONE_TIME_MSG, layer, tree, leaf, 0, 0) || node || u32_le(ctr_l))
    ```
-   satisfies **`H_l[0] == 0`** (if all `65,536` values fail, the signer MUST fail closed without wrapping; exhaustion probability $(255/256)^{65536} \approx 2^{-370}$). Verifier computes `H_l` for the encoded `ctr_l` and MUST reject if `H_l[0] != 0`.
-2. **120-bit rank:** `rank = u128_le(H_l[1..16] || 0x00)` (an integer in `0..2^120`).
-3. **Middle-slice Sperner unranking (`n = 24, w = 40, S = 468`):**
-   Let $N(k, s)$ denote the number of tuples $(d_0,\dots,d_{k-1}) \in \{0,\dots,39\}^k$ with $\sum_j d_j = s$, defined by $N(0, 0) = 1$, $N(0, s > 0) = 0$, and $N(k, s) = \sum_{d=0}^{\min(39, s)} N(k-1, s-d)$.
-   Exact cardinality:
-   $$N(24, 468) = 1{,}973{,}221{,}677{,}906{,}098{,}493{,}567{,}206{,}234{,}001{,}571{,}000 > 2^{120}.$$
-   Map `rank` injectively to the `rank`-th lexicographic tuple `digits[0..24]` in $\mathcal{L}_{468}(24, 40)$:
-   ```text
-   rem = 468
-   for i in 0..24:
-       k_rem = 23 - i
-       for d in 0..=min(39, rem):
-           cnt = N(k_rem, rem - d)
-           if rank < cnt:
-               digits[i] = d
-               rem -= d
-               break
-           rank -= cnt
-   ```
-   Because every tuple sums to `468`, $\mathcal{L}_{468}(24, 40)$ is a strict antichain in $\{0,\dots,39\}^{24}$, and verification performs an **exact constant `24 * 39 - 468 = 468` chain steps per layer**.
+   is valid under `decode_wots_c`. The number of valid 128-bit prefixes is exact:
+   $$|\mathcal{L}_{679}(21, 60)| = 83{,}261{,}328{,}062{,}314{,}682{,}436{,}358{,}950{,}675{,}433{,}803,$$
+   giving acceptance probability $p_{\text{wots}} = |\mathcal{L}_{679}(21, 60)| / 2^{128} \approx 1 / 4{,}086.920$ per trial (mean `4,086.92` trials/layer; if all `2^{24}` values fail, the signer MUST fail closed without wrapping; exhaustion probability $(1 - p_{\text{wots}})^{2^{24}} \approx 2^{-5,923}$). On the wire, `ctr_l` is encoded as its 3 little-endian bytes `u32_le(ctr_l)[0..3]`. Verifier decodes `ctr_l = u32_le(b0, b1, b2, 0)`, computes `H_l`, runs `decode_wots_c(H_l)`, and MUST reject if invalid.
+   Verification performs an **exact constant `21 * 59 - 679 = 560` chain steps per layer** (saving `60` compressions per layer — `360` total — over the midpoint `S = 619`).
 
-### 11.2 Hypertree Walk and Wire Format (`3,292` Bytes)
+### 11.2 Hypertree Walk and Wire Format (`3,990` Bytes)
 
 Starting with `addr = leaf_addr` and `node = upors_root`:
 
-- For `layer in 0..4`:
-  - `h_l = 12` if `layer == 3` else `7`.
-  - `leaf = addr & ((1 << h_l) - 1)`; `tree = addr >> h_l` (at `layer == 3`, `tree == 0`).
-  - Grind `ctr_l` and compute `digits = sperner_unrank(rank)` for `node`.
-  - Sign `node` via §9 with `(layer, tree, leaf, n_chains = 24, steps = 39)` and append its `h_l`-node Merkle authentication path (`112 B` for layers `0..3`, `192 B` for layer `3`).
+- For `layer in 0..6`:
+  - `h_l = 13` if `layer == 5` else `7`.
+  - `leaf = addr & ((1 << h_l) - 1)`; `tree = addr >> h_l` (at `layer == 5`, `tree == 0`).
+  - Grind `ctr_l` and decode `digits = decode_wots_c(H_l)` for `node`.
+  - Sign `node` via §9 with `(layer, tree, leaf, n_chains = 21, steps = 59)` and append its `h_l`-node Merkle authentication path (`112 B` for layers `0..5`, `208 B` for layer `5`).
   - Set `node = tree_root` and `addr = tree`.
-- Verification succeeds iff all `ctr_ft`, canonical Octopus padding, and `ctr_0..3` checks pass AND the reconstructed layer-3 root equals `id[16..32]` in constant time.
+- Verification succeeds iff all `ctr_ft`, canonical Octopus padding, and `ctr_0..5` checks pass AND the reconstructed layer-5 root equals `id[16..32]` in constant time.
 
-Wire layout of a `BLINCS-128-A2` `Imprint` (`3,292` bytes):
+Wire layout of a `BLINCS-48-X` `Imprint` (`3,990` bytes):
 
 ```text
 0..16        salt e (16 B)
 16..32       randomizer R (16 B)
-32..1220     U-PORS (1,188 B): ctr_ft (4 B) || 10 x 3 x 16 B chains (480 B) || 44 x 16 B Octopus sibs + zero pad (704 B)
-1220..1718   Layer 0 (498 B): ctr_0 (2 B) || 24 x 16 B S-WOTS+Z (384 B) || 7 x 16 B auth path (112 B)
-1718..2216   Layer 1 (498 B): ctr_1 (2 B) || 24 x 16 B S-WOTS+Z (384 B) || 7 x 16 B auth path (112 B)
-2216..2714   Layer 2 (498 B): ctr_2 (2 B) || 24 x 16 B S-WOTS+Z (384 B) || 7 x 16 B auth path (112 B)
-2714..3292   Layer 3 (578 B): ctr_3 (2 B) || 24 x 16 B S-WOTS+Z (384 B) || 12 x 16 B auth path (192 B)
+32..1188     U-PORS (1,156 B): ctr_ft (4 B) || 9 x 3 x 16 B chains (432 B) || 45 x 16 B Octopus sibs + zero pad (720 B)
+1188..1639   Layer 0 (451 B): ctr_0 (3 B) || 21 x 16 B WOTS+C (336 B) || 7 x 16 B auth path (112 B)
+1639..2090   Layer 1 (451 B): ctr_1 (3 B) || 21 x 16 B WOTS+C (336 B) || 7 x 16 B auth path (112 B)
+2090..2541   Layer 2 (451 B): ctr_2 (3 B) || 21 x 16 B WOTS+C (336 B) || 7 x 16 B auth path (112 B)
+2541..2992   Layer 3 (451 B): ctr_3 (3 B) || 21 x 16 B WOTS+C (336 B) || 7 x 16 B auth path (112 B)
+2992..3443   Layer 4 (451 B): ctr_4 (3 B) || 21 x 16 B WOTS+C (336 B) || 7 x 16 B auth path (112 B)
+3443..3990   Layer 5 (547 B): ctr_5 (3 B) || 21 x 16 B WOTS+C (336 B) || 13 x 16 B auth path (208 B)
 ```
 
 ---
@@ -337,8 +332,8 @@ Wire layout of a `BLINCS-128-A2` `Imprint` (`3,292` bytes):
 Every production or library implementation of BLINCS — especially implementations using optimized assembly, SIMD/vector hashing, custom compilers, or cross-compiled targets — is **strongly recommended** to execute a **quick, fail-closed startup self-test** once per process before accepting or generating imprints (following Ferguson–Schneier–Kohno, `pycryptopp`, and `blake3-servil-core::initialize()`):
 
 1. **Initialize the underlying BLAKE3 implementation's own self-test** (for example `blake3_servil_core::initialize()`).
-2. **Positive verification KAT (~39 µs):** Verify `test_vectors/reference-imprint-1.bin` (`ctx = b"BLINCS-128-A2 reference vector v1"`, `M = b"hello, BLINCS"`), exercising `Derive`, `Keyed`, context framing, `FEW_SELECT`, `FEW_CODE`, `hex_unrank`, Octopus verification, canonical padding checks, `ONE_TIME_MSG`, Sperner unranking, all 4 hypertree layers, and constant-time root comparison.
-3. **Negative verification KATs (~78 µs):** Flip one bit in the imprint and confirm rejection; pass a different context (`b""`) and confirm rejection.
+2. **Positive verification KAT (~62 µs):** Verify `test_vectors/reference-imprint-1.bin` (`ctx = b"BLINCS-48-X reference vector v1"`, `M = b"hello, BLINCS"`), exercising `Derive`, `Keyed`, context framing, `FEW_SELECT`, `FEW_CODE`, `hex_unrank`, Octopus verification, canonical padding checks, `ONE_TIME_MSG`, `WOTS+C` 6-bit decoding, all 6 hypertree layers, and constant-time root comparison.
+3. **Negative verification KATs (~125 µs):** Flip one bit in the imprint and confirm rejection; pass a different context (`b""`) and confirm rejection.
 4. **Fail closed:** Refuse to proceed on any mismatch.
 
 See [`reference/src/lib.rs`](reference/src/lib.rs) for a concrete implementation of `self_test()`.

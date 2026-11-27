@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Planted-fault positive controls for Signet (BLINCS-128-A2).
+"""Planted-fault positive controls for Signet (BLINCS-48-X).
 
 Runs all mutations inside a disposable temporary copy (sharing target/ for speed),
 so the main repository checkout is never modified even if interrupted.
@@ -15,14 +15,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 CONTROLS = [
     (
-        "S-WOTS+Z Sperner unranker selects exact constant-sum digits in sperner_unrank()",
+        "WOTS+C constant-sum check enforced in decode_wots_c()",
         "src/coding.rs",
-        "        *slot = u8::try_from(chosen).unwrap();\n        rem_s -= chosen;",
-        "        *slot = 0;\n        rem_s -= chosen;",
+        "    if sum == u32::try_from(WOTS_SUM).unwrap() { Some(digits) } else { None }",
+        "    let _ = sum;\n    Some(digits)",
         "hex_and_sperner_unranking_and_fast_select_parser_are_exact",
     ),
     (
-        "U-PORS 33-bit leaf_addr masking in LeafAddr::from_word()",
+        "U-PORS 48-bit leaf_addr masking in LeafAddr::from_word()",
         "src/params.rs",
         "        Self(word & ((1u64 << HYPER_BITS) - 1))",
         "        Self(word)",
@@ -36,11 +36,11 @@ CONTROLS = [
         "every_signature_region_and_canonical_padding_are_checked",
     ),
     (
-        "S-WOTS+Z leading zero-byte check enforced in verify_wots_msg()",
-        "src/one_time.rs",
-        "    if h[0] != 0 {\n        return None;\n    }",
-        "    let _ = h[0];",
-        "every_signature_region_and_canonical_padding_are_checked",
+        "WOTS+C 2-zero-bit check enforced in decode_wots_c()",
+        "src/coding.rs",
+        "    if (digest[0] & 3) != 0 {\n        return None;\n    }",
+        "    let _ = digest[0] & 3;",
+        "hex_and_sperner_unranking_and_fast_select_parser_are_exact",
     ),
     (
         "Hypertree final top-root equality check (verify_short)",

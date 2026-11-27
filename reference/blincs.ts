@@ -78,31 +78,32 @@ const enc = new TextEncoder();
 export const derive = (ctx: string, m: Uint8Array): Uint8Array =>
   b3(toWords(b3(IV, DK_CTX, enc.encode(ctx)), 0, 32, 8), DK_MAT, m);
 
-// ---------------- BLINCS-128-A2 ----------------
-const N = 16, LAYERS = 4, LOW_HEIGHT = 7, TOP_HEIGHT = 12, HYPER_BITS = 33, SIG_LEN = 3292, MAX_CTX = 255;
-const WOTS_N = 24, WOTS_W = 40, WOTS_STEPS = 39, WOTS_SUM = 468, WOTS_CTR_LEN = 2;
-const UPORS_HEIGHT = 10, UPORS_N = 3, UPORS_STEPS = 23, UPORS_SUM = 42, UPORS_C = 376;
-const UPORS_K = 10, UPORS_M_MAX = 44, UPORS_CTR_LEN = 4, UPORS_LAYER = 0x80, UPORS_SELECT_MAX_DRAWS = 22;
-const BP = "BLINCS-128-A2 2026-11-26 ";
+// ---------------- BLINCS-48-X ----------------
+const N = 16, LAYERS = 6, LOW_HEIGHT = 7, TOP_HEIGHT = 13, HYPER_BITS = 48, SIG_LEN = 3990, MAX_CTX = 255;
+const WOTS_N = 21, WOTS_W = 60, WOTS_STEPS = 59, WOTS_SUM = 679, WOTS_Z = 2, WOTS_CTR_LEN = 3;
+const UPORS_HEIGHT = 11, UPORS_N = 3, UPORS_STEPS = 23, UPORS_SUM = 42, UPORS_C = 376;
+const UPORS_K = 9, UPORS_M_MAX = 45, UPORS_CTR_LEN = 4, UPORS_LAYER = 0x80, UPORS_SELECT_MAX_DRAWS = 18;
+const BP = "BLINCS-48-X 2026-11-26 ";
 const SP = "Signet 2026-11-26 randomness: ";
 const CTX_PUBLIC_HASH = BP + "public hash", CTX_CONTENT = BP + "content",
   CTX_MIX = SP + "mix", CTX_NEXT_SEED = SP + "next seed",
   CTX_RUN_KEY = SP + "key of this run", CTX_KEYGEN_KEY = SP + "keygen key";
 const CHAIN = 2, ONE_TIME_KEY = 3, NODE = 4, ONE_TIME_MSG = 5, MESSAGE = 6, FEW_SELECT = 7, FEW_CODE = 8;
 
-const SPERNER_DP: bigint[][] = (() => {
-  const dp: bigint[][] = Array.from({ length: WOTS_N + 1 }, () => Array<bigint>(WOTS_SUM + 1).fill(0n));
-  dp[0][0] = 1n;
-  for (let k = 1; k <= WOTS_N; k++) {
-    let acc = 0n;
-    for (let s = 0; s <= WOTS_SUM; s++) {
-      acc += dp[k - 1][s];
-      if (s >= WOTS_W) acc -= dp[k - 1][s - WOTS_W];
-      dp[k][s] = acc;
-    }
+function decodeWotsC(hMsg: Uint8Array): number[] | null {
+  let lo = 0n;
+  for (let i = 15; i >= 0; i--) lo = (lo << 8n) | BigInt(hMsg[i]);
+  if ((lo & 3n) !== 0n) return null;
+  const out: number[] = [];
+  let sum = 0;
+  for (let i = 0; i < WOTS_N; i++) {
+    const d = Number((lo >> BigInt(WOTS_Z + 6 * i)) & 63n);
+    if (d >= WOTS_W) return null;
+    out.push(d);
+    sum += d;
   }
-  return dp;
-})();
+  return sum === WOTS_SUM ? out : null;
+}
 
 function cat(...xs: Uint8Array[]): Uint8Array {
   const r = new Uint8Array(xs.reduce((s, x) => s + x.length, 0));
@@ -146,20 +147,6 @@ function hexUnrank(idx: number): [number, number, number] {
   }
   throw new Error("hexUnrank out of range");
 }
-function spernerUnrank(rank: bigint): number[] {
-  let r = rank, rem = WOTS_SUM;
-  const out: number[] = [];
-  for (let i = 0; i < WOTS_N; i++) {
-    const row = SPERNER_DP[WOTS_N - 1 - i];
-    const dHi = Math.min(rem, WOTS_STEPS);
-    for (let d = 0; d <= dHi; d++) {
-      const cnt = row[rem - d];
-      if (r < cnt) { out.push(d); rem -= d; break; }
-      r -= cnt;
-    }
-  }
-  return out;
-}
 function countOctopusSibs(sortedLeaves: number[]): number {
   let cur = [...sortedLeaves], sibs = 0;
   for (let lv = 0; lv < UPORS_HEIGHT; lv++) {
@@ -187,11 +174,11 @@ function parseSelectDigest(d: Uint8Array): { leafAddr: number; leaves: number[];
   const leafAddr = readBits(d, UPORS_SELECT_MAX_DRAWS * UPORS_HEIGHT, HYPER_BITS);
   return { leafAddr, leaves, sibs };
 }
-function extractUporsCodewords(kPub: Uint8Array, dSeed: Uint8Array, ctrFt: number): [number, number, number][] {
+function extractUporsCodewords(kPub: Uint8Array, hSel: Uint8Array): [number, number, number][] {
   const out: [number, number, number][] = [];
-  const tail = cat(dSeed, u32le(ctrFt));
   for (let blockIdx = 0; out.length < UPORS_K; blockIdx++) {
-    const blk = keyed(kPub, cat(tweak(FEW_CODE, UPORS_LAYER, 0, 0, blockIdx, 0), tail));
+    if (blockIdx > 0xffff) throw new Error("FEW_CODE block_idx overflow");
+    const blk = keyed(kPub, cat(tweak(FEW_CODE, UPORS_LAYER, 0, 0, blockIdx, 0), hSel));
     for (let j = 0; j < 28 && out.length < UPORS_K; j++) {
       const v = readBits(blk, j * 9, 9);
       if (v < UPORS_C) out.push(hexUnrank(v));
@@ -212,13 +199,13 @@ export function verify(vk: Uint8Array, ctx: Uint8Array, message: Uint8Array, sig
   const short = cat(e, keyed(kMsg, message));
   const dSeed = keyed(kPub, cat(tweak(MESSAGE, 0, 0, 0, 0, 0), R, root, short, framedCtx));
 
-  // U-PORS verification (height-10 tree + Octopus multi-proof)
+  // U-PORS verification (height-11 tree + Octopus multi-proof)
   let off = 32;
   const ctrFt = readU32le(sig, off); off += UPORS_CTR_LEN;
   const dSel = keyed(kPub, cat(tweak(FEW_SELECT, UPORS_LAYER, 0, 0, 0, 0), dSeed, u32le(ctrFt)));
   const sel = parseSelectDigest(dSel);
   if (!sel) return false;
-  const codewords = extractUporsCodewords(kPub, dSeed, ctrFt);
+  const codewords = extractUporsCodewords(kPub, dSel);
 
   let curVal: Uint8Array[] = [];
   for (let t = 0; t < UPORS_K; t++) {
@@ -259,17 +246,15 @@ export function verify(vk: Uint8Array, ctx: Uint8Array, message: Uint8Array, sig
   if (padOr !== 0) return false;
   let node = curVal[0];
 
-  // Hypertree verification (12+7+7+7 S-WOTS+Z)
+  // Hypertree verification (13+7+7+7+7+7 WOTS+C)
   let addr = sel.leafAddr;
   for (let layer = 0; layer < LAYERS; layer++) {
-    const hL = layer === 3 ? TOP_HEIGHT : LOW_HEIGHT;
+    const hL = layer === LAYERS - 1 ? TOP_HEIGHT : LOW_HEIGHT;
     const leaf = addr % (1 << hL), tree = Math.floor(addr / (1 << hL));
-    const ctrL = sig[off] | (sig[off + 1] << 8); off += WOTS_CTR_LEN;
+    const ctrL = sig[off] | (sig[off + 1] << 8) | (sig[off + 2] << 16); off += WOTS_CTR_LEN;
     const hMsg = keyed(kPub, cat(tweak(ONE_TIME_MSG, layer, tree, leaf, 0, 0), node, u32le(ctrL)));
-    if (hMsg[0] !== 0) return false;
-    let rank = 0n;
-    for (let i = 15; i >= 1; i--) rank = (rank << 8n) | BigInt(hMsg[i]);
-    const ds = spernerUnrank(rank);
+    const ds = decodeWotsC(hMsg);
+    if (!ds) return false;
     const ends: Uint8Array[] = [];
     for (let c = 0; c < WOTS_N; c++) {
       let v: Uint8Array = sig.slice(off, off + N); off += N;

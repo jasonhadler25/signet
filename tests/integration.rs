@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 const INT_CTX: Context<'static> = Context::new(b"signet integration test v1");
-const REF_CTX: Context<'static> = Context::new(b"BLINCS-128-A2 reference vector v1");
+const REF_CTX: Context<'static> = Context::new(b"BLINCS-48-X reference vector v1");
 
 fn temp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("signet-int-{}-{tag}", std::process::id()));

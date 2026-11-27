@@ -1,18 +1,18 @@
-//! Signet — a Rust implementation of the **BLINCS** (`BLINCS-128-A2`) stateless hash-based
+//! Signet — a Rust implementation of the **BLINCS** (`BLINCS-48-X`) stateless hash-based
 //! post-quantum signature algorithm, based on BLAKE3 and SPHINCS.
 //!
 //! **Pre-1.0 experimental software (unsupported):** formats, context strings, and APIs may change
 //! incompatibly before 1.0, and no independent human cryptographic audit has been performed.
 //!
-//! Designed for post-quantum use with a 128-bit classical security target at up to 2³² imprints
-//! per signet (do not imprint more than 2³² things with one signet; see `SPEC.md` for bounds).
+//! Designed for post-quantum use with a 128-bit classical security target at up to 2⁴⁸ imprints
+//! per signet (do not imprint more than 2⁴⁸ things with one signet; see `SPEC.md` for bounds).
 //! Runs strictly on the calling thread (`blake3-servil-core`; no background worker threads) with
-//! a `12+7+7+7` `S-WOTS+Z` hypertree (`128 KiB` cached top tree) and zero-table single-tree
-//! `U-PORS` Octopus few-time signatures (`3,292`-byte imprints).
+//! a `13+7+7+7+7+7` `WOTS+C` hypertree (`256 KiB` cached top tree) and zero-table single-tree
+//! `U-PORS` Octopus few-time signatures (`3,990`-byte imprints).
 //! Supported platforms: Linux (`x86_64`, `aarch64`) and macOS (`x86_64`, `aarch64`).
 //! Because a cryptographic key is a transferable bearer authority rather than a person's handwritten
 //! signature, this API calls the secret a [`Signet`], its 32-byte self-certifying identifier a
-//! [`SignetId`] (which names which signet you mean and verifies its imprints), and the 3,292-byte
+//! [`SignetId`] (which names which signet you mean and verifies its imprints), and the 3,990-byte
 //! proof an [`Imprint`]. Pass a domain-separating [`Context`] and the original message bytes or
 //! stream directly: BLINCS hashes the input in a single salted keyed-BLAKE3 pass under a fresh
 //! per-imprint salt.
@@ -227,18 +227,18 @@ pub(crate) fn compute_message_digest(public_key: &PublicKey, randomizer: &[u8; N
     public_key.keyed(&buf[..96 + ctx_len])
 }
 
-/// A 3,292-byte `BLINCS-128-A2` imprint (proof produced by pressing a [`Signet`] onto a context and message).
+/// A 3,990-byte `BLINCS-48-X` imprint (proof produced by pressing a [`Signet`] onto a context and message).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Imprint([u8; IMPRINT_LEN]);
 
 impl Imprint {
-    /// Wrap a raw 3,292-byte imprint array.
+    /// Wrap a raw 3,990-byte imprint array.
     #[must_use]
     pub fn from_bytes(bytes: &[u8; IMPRINT_LEN]) -> Self {
         Self(*bytes)
     }
 
-    /// Borrow the raw 3,292 imprint bytes.
+    /// Borrow the raw 3,990 imprint bytes.
     pub fn as_bytes(&self) -> &[u8; IMPRINT_LEN] {
         &self.0
     }
@@ -277,7 +277,7 @@ impl fmt::Debug for Imprint {
     }
 }
 
-/// A publisher's self-certifying 32-byte identifier and its complete `BLINCS-128-A2` verifying key (`public_seed || top_root`).
+/// A publisher's self-certifying 32-byte identifier and its complete `BLINCS-48-X` verifying key (`public_seed || top_root`).
 ///
 /// Receiving a `SignetId` does not authenticate the sender: obtain the expected `SignetId` from a
 /// pinned or authenticated channel and call `expected_publisher.verify(ctx, message, &imprint)?`.
@@ -358,7 +358,7 @@ impl SignetId {
         let upors_slice = imprint.upors();
         let ctr_ft = u32::from_le_bytes(upors_slice[..UPORS_CTR_LEN].try_into().unwrap());
         let sel = verify_upors_selection(&public, &d_seed, ctr_ft).ok_or(InvalidImprint)?;
-        let codewords = extract_upors_codewords(&self.public_key, &d_seed, ctr_ft);
+        let codewords = extract_upors_codewords(&self.public_key, &sel.h_sel).ok_or(InvalidImprint)?;
         let mut node = upors_verify(&public, &sel, &codewords, upors_slice).ok_or(InvalidImprint)?;
         let coords = sel.leaf_addr.split_layers();
         for layer in Layer::ALL {
@@ -369,7 +369,7 @@ impl SignetId {
     }
 }
 
-/// A `BLINCS-128-A2` signet (bearer authority derived from a 32-byte seed, caching the `128 KiB` height-12 top hypertree in memory).
+/// A `BLINCS-48-X` signet (bearer authority derived from a 32-byte seed, caching the `256 KiB` height-13 top hypertree in memory).
 pub struct Signet {
     seed: [u8; SEED_LEN],
     secret_key: SecretKey,
@@ -401,7 +401,7 @@ impl Signet {
         Ok(Self::from_seed(&seed))
     }
 
-    /// Derive a signet from a persisted 32-byte `seed`, building and caching the `128 KiB`
+    /// Derive a signet from a persisted 32-byte `seed`, building and caching the `256 KiB`
     /// height-12 top hypertree on the calling thread.
     ///
     /// Performs no entropy check on `seed`. For creating new signets, use [`Signet::generate`].
@@ -464,7 +464,7 @@ impl Signet {
     /// Imprint an in-memory `message` under `ctx`, drawing fresh per-imprint randomness from `randomness`.
     ///
     /// Self-verifies the finished imprint against `short` before returning. Do not imprint more
-    /// than 2³² things with one signet.
+    /// than 2⁴⁸ things with one signet.
     #[must_use]
     pub fn imprint(&self, randomness: &Randomness, ctx: Context<'_>, message: &[u8]) -> Imprint {
         let draw = randomness.draw();
@@ -477,7 +477,7 @@ impl Signet {
     /// Signet chooses the fresh salt and initializes keyed BLAKE3 before invoking `produce`; if
     /// `produce` returns `Err(e)`, imprinting aborts and returns `Err(e)`. For any `std::io::Read`
     /// source, call `std::io::copy(&mut reader, sink)` inside `produce`. Self-verifies the
-    /// finished imprint against `short` before returning. Do not imprint more than 2³² things with
+    /// finished imprint against `short` before returning. Do not imprint more than 2⁴⁸ things with
     /// one signet.
     pub fn imprint_with<E>(&self, randomness: &Randomness, ctx: Context<'_>, produce: impl FnOnce(&mut Sink) -> Result<(), E>) -> Result<Imprint, E> {
         let draw = randomness.draw();

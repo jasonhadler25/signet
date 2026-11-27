@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BLINCS-128-A2 — educational / vector-conformance reference implementation from SPEC.md.
+"""BLINCS-48-X — educational / vector-conformance reference implementation from SPEC.md.
 
 NOT FOR PRODUCTION USE: pure Python, reads whole messages into RAM, and the CLI accepts test seeds
 on argv (never pass real signing seeds on command lines). Self-contained except reference/blake3.py.
@@ -10,34 +10,34 @@ import sys
 
 import blake3
 
-SUITE_NAME = "BLINCS-128-A2"
+SUITE_NAME = "BLINCS-48-X"
 MAX_CONTEXT_LEN = 255
 
 N = 16
-LAYERS = 4
-LOW_HEIGHT, TOP_HEIGHT = 7, 12
+LAYERS = 6
+LOW_HEIGHT, TOP_HEIGHT = 7, 13
 LOW_LEAVES, TOP_LEAVES = 1 << LOW_HEIGHT, 1 << TOP_HEIGHT
-HYPER_BITS = 3 * LOW_HEIGHT + TOP_HEIGHT  # 33
+HYPER_BITS = 5 * LOW_HEIGHT + TOP_HEIGHT  # 48
 
-WOTS_N, WOTS_W, WOTS_STEPS, WOTS_SUM, WOTS_CTR_LEN = 24, 40, 39, 468, 2
-UPORS_HEIGHT, UPORS_LEAVES = 10, 1024
+WOTS_N, WOTS_W, WOTS_STEPS, WOTS_SUM, WOTS_Z, WOTS_CTR_LEN = 21, 60, 59, 679, 2, 3
+UPORS_HEIGHT, UPORS_LEAVES = 11, 2048
 UPORS_N, UPORS_W, UPORS_STEPS, UPORS_SUM, UPORS_C = 3, 24, 23, 42, 376
-UPORS_K, UPORS_M_MAX, UPORS_CTR_LEN = 10, 44, 4
-UPORS_LAYER, UPORS_SELECT_MAX_DRAWS = 0x80, 22
+UPORS_K, UPORS_M_MAX, UPORS_CTR_LEN = 9, 45, 4
+UPORS_LAYER, UPORS_SELECT_MAX_DRAWS = 0x80, 18
 
-UPORS_LEN = UPORS_CTR_LEN + (UPORS_K * UPORS_N + UPORS_M_MAX) * N  # 1188
-LOW_LAYER_LEN = WOTS_CTR_LEN + (WOTS_N + LOW_HEIGHT) * N  # 498
-TOP_LAYER_LEN = WOTS_CTR_LEN + (WOTS_N + TOP_HEIGHT) * N  # 578
-IMPRINT_LEN = 2 * N + UPORS_LEN + 3 * LOW_LAYER_LEN + TOP_LAYER_LEN  # 3292
+UPORS_LEN = UPORS_CTR_LEN + (UPORS_K * UPORS_N + UPORS_M_MAX) * N  # 1156
+LOW_LAYER_LEN = WOTS_CTR_LEN + (WOTS_N + LOW_HEIGHT) * N  # 451
+TOP_LAYER_LEN = WOTS_CTR_LEN + (WOTS_N + TOP_HEIGHT) * N  # 547
+IMPRINT_LEN = 2 * N + UPORS_LEN + 5 * LOW_LAYER_LEN + TOP_LAYER_LEN  # 3990
 
 # Key-derivation contexts (SPEC.md, "Key-derivation contexts").
-CTX_SECRET_VALUES = "BLINCS-128-A2 2026-11-26 secret values"
-CTX_CONTENT_SALT = "BLINCS-128-A2 2026-11-26 content salt"
-CTX_RANDOMIZER = "BLINCS-128-A2 2026-11-26 randomizer"
-CTX_PUBLIC_SEED = "BLINCS-128-A2 2026-11-26 public seed"
-CTX_PUBLIC_HASH = "BLINCS-128-A2 2026-11-26 public hash"
-CTX_CONTENT = "BLINCS-128-A2 2026-11-26 content"
-CTX_GENERATE_SIGNET = "Signet BLINCS-128-A2 2026-11-26 generate signet"
+CTX_SECRET_VALUES = "BLINCS-48-X 2026-11-26 secret values"
+CTX_CONTENT_SALT = "BLINCS-48-X 2026-11-26 content salt"
+CTX_RANDOMIZER = "BLINCS-48-X 2026-11-26 randomizer"
+CTX_PUBLIC_SEED = "BLINCS-48-X 2026-11-26 public seed"
+CTX_PUBLIC_HASH = "BLINCS-48-X 2026-11-26 public hash"
+CTX_CONTENT = "BLINCS-48-X 2026-11-26 content"
+CTX_GENERATE_SIGNET = "Signet BLINCS-48-X 2026-11-26 generate signet"
 CTX_MIX = "Signet 2026-11-26 randomness: mix"
 CTX_NEXT_SEED = "Signet 2026-11-26 randomness: next seed"
 CTX_RUN_KEY = "Signet 2026-11-26 randomness: key of this run"
@@ -48,22 +48,20 @@ KIND_CHAIN_SECRET, KIND_CHAIN, KIND_ONE_TIME_KEY, KIND_NODE = 1, 2, 3, 4
 KIND_ONE_TIME_MSG, KIND_MESSAGE, KIND_FEW_SELECT, KIND_FEW_CODE = 5, 6, 7, 8
 
 
-def _build_sperner_dp():
-    dp = [[0] * (WOTS_SUM + 1) for _ in range(WOTS_N + 1)]
-    dp[0][0] = 1
-    for k in range(1, WOTS_N + 1):
-        acc = 0
-        prev = dp[k - 1]
-        cur = dp[k]
-        for s in range(WOTS_SUM + 1):
-            acc += prev[s]
-            if s >= WOTS_W:
-                acc -= prev[s - WOTS_W]
-            cur[s] = acc
-    return dp
-
-
-_SPERNER_DP = _build_sperner_dp()
+def decode_wots_c(digest):
+    """Decode WOTS+C(n=21, w=60, z=2, S=679) directly from digest[:16] (zero tables)."""
+    lo = int.from_bytes(digest[:16], "little")
+    if (lo & 3) != 0:
+        return None
+    digits = []
+    total = 0
+    for i in range(WOTS_N):
+        d = (lo >> (WOTS_Z + 6 * i)) & 63
+        if d >= WOTS_W:
+            return None
+        digits.append(d)
+        total += d
+    return digits if total == WOTS_SUM else None
 
 
 def _to_bytes(name, value):
@@ -132,25 +130,6 @@ def hex_unrank(idx):
     raise RuntimeError("hex_unrank exhausted")
 
 
-def sperner_unrank(rank):
-    """Map 120-bit rank injectively into L_468(24, 40)."""
-    if not (0 <= rank < _SPERNER_DP[WOTS_N][WOTS_SUM]):
-        raise ValueError("Sperner rank out of range")
-    out = []
-    rem = WOTS_SUM
-    for i in range(WOTS_N):
-        k_rem = WOTS_N - 1 - i
-        row = _SPERNER_DP[k_rem]
-        for d in range(min(rem, WOTS_STEPS) + 1):
-            cnt = row[rem - d]
-            if rank < cnt:
-                out.append(d)
-                rem -= d
-                break
-            rank -= cnt
-    return out
-
-
 def count_octopus_sibs(sorted_leaves):
     cur = list(sorted_leaves)
     sibs = 0
@@ -190,12 +169,13 @@ def parse_select_digest(digest):
     return leaf_addr, leaves, sibs
 
 
-def extract_upors_codewords(public, d_seed, ctr_ft):
+def extract_upors_codewords(public, h_sel):
     out = []
     block_idx = 0
-    tail = d_seed + ctr_ft.to_bytes(4, "little")
     while len(out) < UPORS_K:
-        blk = blake3.keyed_hash(public, tweak(KIND_FEW_CODE, UPORS_LAYER, 0, 0, block_idx, 0) + tail)
+        if block_idx > 0xFFFF:
+            raise RuntimeError("FEW_CODE block_idx overflow")
+        blk = blake3.keyed_hash(public, tweak(KIND_FEW_CODE, UPORS_LAYER, 0, 0, block_idx, 0) + h_sel)
         for j in range(28):
             v = read_bits(blk, j * 9, 9)
             if v < UPORS_C:
@@ -302,7 +282,7 @@ class SignetId:
         short = content_framed(self.content_key, salt, framed_ctx, message)
         d_seed = blake3.keyed_hash(self.public, tweak(KIND_MESSAGE) + randomizer + self.root + short + framed_ctx)
 
-        # U-PORS verification (height-10 single tree + Octopus multi-proof)
+        # U-PORS verification (height-11 single tree + Octopus multi-proof)
         ctr_ft = int.from_bytes(imprint[at : at + UPORS_CTR_LEN], "little")
         at += UPORS_CTR_LEN
         d_sel = blake3.keyed_hash(self.public, tweak(KIND_FEW_SELECT, UPORS_LAYER) + d_seed + ctr_ft.to_bytes(4, "little"))
@@ -310,7 +290,7 @@ class SignetId:
         if parsed is None:
             return False
         leaf_addr, leaves, expected_sibs = parsed
-        codewords = extract_upors_codewords(self.public, d_seed, ctr_ft)
+        codewords = extract_upors_codewords(self.public, d_sel)
 
         cur_val = []
         for leaf, cw in zip(leaves, codewords):
@@ -350,10 +330,10 @@ class SignetId:
             return False
         node = cur_val[0]
 
-        # Hypertree verification (12+7+7+7 S-WOTS+Z)
+        # Hypertree verification (13+7+7+7+7+7 WOTS+C)
         addr = leaf_addr
         for layer in range(LAYERS):
-            h_l = TOP_HEIGHT if layer == 3 else LOW_HEIGHT
+            h_l = TOP_HEIGHT if layer == LAYERS - 1 else LOW_HEIGHT
             leaf = addr & ((1 << h_l) - 1)
             tree = addr >> h_l
             ctr_l = int.from_bytes(imprint[at : at + WOTS_CTR_LEN], "little")
@@ -362,10 +342,9 @@ class SignetId:
                 self.public,
                 tweak(KIND_ONE_TIME_MSG, layer, tree, leaf) + node + ctr_l.to_bytes(4, "little"),
             )
-            if h_msg[0] != 0:
+            ds = decode_wots_c(h_msg)
+            if ds is None:
                 return False
-            rank = int.from_bytes(h_msg[1:16], "little")
-            ds = sperner_unrank(rank)
             ends = []
             for c, d in enumerate(ds):
                 val = imprint[at : at + N]
@@ -388,8 +367,8 @@ class Signet:
         public_seed = blake3.derive_key(CTX_PUBLIC_SEED, seed)[:N]
         self.public = blake3.derive_key(CTX_PUBLIC_HASH, public_seed)
 
-        top_leaves = [chain_leaf(self.secret, self.public, 3, 0, leaf, WOTS_N, WOTS_STEPS) for leaf in range(TOP_LEAVES)]
-        self.top_levels = merkle_tree(self.public, 3, 0, top_leaves)
+        top_leaves = [chain_leaf(self.secret, self.public, LAYERS - 1, 0, leaf, WOTS_N, WOTS_STEPS) for leaf in range(TOP_LEAVES)]
+        self.top_levels = merkle_tree(self.public, LAYERS - 1, 0, top_leaves)
         self.id = SignetId(public_seed + self.top_levels[-1][0])
 
     def imprint(self, ctx, message, draw_bytes):
@@ -410,7 +389,7 @@ class Signet:
                 leaf_addr, leaves, _ = parsed
                 break
             ctr_ft += 1
-        codewords = extract_upors_codewords(public, d_seed, ctr_ft)
+        codewords = extract_upors_codewords(public, d_sel)
 
         out = bytearray(salt + randomizer + ctr_ft.to_bytes(4, "little"))
 
@@ -441,24 +420,24 @@ class Signet:
         out += bytes((UPORS_M_MAX - len(octo_sibs)) * N)
         node = upors_levels[-1][0]
 
-        # Hypertree 12+7+7+7 S-WOTS+Z
+        # Hypertree 13+7+7+7+7+7 WOTS+C
         addr = leaf_addr
         for layer in range(LAYERS):
-            h_l = TOP_HEIGHT if layer == 3 else LOW_HEIGHT
+            h_l = TOP_HEIGHT if layer == LAYERS - 1 else LOW_HEIGHT
             leaf = addr & ((1 << h_l) - 1)
             tree = addr >> h_l
             ctr_l = 0
             while True:
                 h_msg = blake3.keyed_hash(public, tweak(KIND_ONE_TIME_MSG, layer, tree, leaf) + node + ctr_l.to_bytes(4, "little"))
-                if h_msg[0] == 0:
-                    rank = int.from_bytes(h_msg[1:16], "little")
+                ds = decode_wots_c(h_msg)
+                if ds is not None:
                     break
                 ctr_l += 1
-            out += ctr_l.to_bytes(2, "little")
-            for c, d in enumerate(sperner_unrank(rank)):
+            out += ctr_l.to_bytes(WOTS_CTR_LEN, "little")
+            for c, d in enumerate(ds):
                 s = H(self.secret, tweak(KIND_CHAIN_SECRET, layer, tree, 0, 0, leaf * WOTS_N + c))
                 out += chain(public, layer, tree, leaf, c, s, 0, d)
-            if layer == 3:
+            if layer == LAYERS - 1:
                 levels = self.top_levels
             else:
                 layer_leaves = [chain_leaf(self.secret, public, layer, tree, i, WOTS_N, WOTS_STEPS) for i in range(LOW_LEAVES)]

@@ -1,9 +1,11 @@
 include!("../tools/require_nextest.rs");
 
-use crate::coding::{hex_unrank, rank_from_15_bytes, sperner_unrank};
+use crate::coding::{decode_wots_c, hex_unrank};
 use crate::content::{content_from_slice, content_with, derive_msg_key};
-use crate::few_time::{count_octopus_sibs, extract_upors_codewords, parse_select_digest, verify_upors_selection};
-use crate::one_time::verify_wots_msg;
+use crate::few_time::{
+    count_octopus_sibs, extract_upors_codewords, parse_select_digest, parse_select_fast, select_ancestor_lower_bound, verify_upors_selection,
+};
+use crate::one_time::{neon_pad_width, verify_wots_msg};
 use crate::params::{
     CTX_CONTENT, HYPER_BITS, IMPRINT_LEN, Layer, LeafAddr, MAX_CONTEXT_LEN, N, PublicKey, SUITE_NAME, TOP_LAYER_LEN, TweakKind, UPORS_C, UPORS_CTR_LEN,
     UPORS_HEIGHT, UPORS_K, UPORS_LEN, UPORS_M_MAX, UPORS_N, UPORS_SELECT_MAX_DRAWS, UPORS_STEPS, UPORS_SUM, WOTS_N, WOTS_STEPS, WOTS_SUM, derive_key,
@@ -22,8 +24,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
-const REF_VK_HEX: &str = "eb8e97a4ff2446ed3791cfd9515e1e23982ff22b5103bc0117c3ab69db42bac4";
-const REF_CTX: Context<'static> = Context::new(b"BLINCS-128-A2 reference vector v1");
+const REF_VK_HEX: &str = "7ee7fe20dac820b17625cad3a38a8af696a69a74992f01a7c9ed3680699d2c5c";
+const REF_CTX: Context<'static> = Context::new(b"BLINCS-48-X reference vector v1");
 const TEST_CTX: Context<'static> = Context::new(b"signet unit test v1");
 
 fn from_hex(s: &str) -> Vec<u8> {
@@ -113,7 +115,7 @@ impl Read for FailAfterReader {
 
 #[test]
 fn reference_vector_and_intermediate_kats_match_python_byte_for_byte() {
-    assert_eq!(SUITE_NAME, "BLINCS-128-A2");
+    assert_eq!(SUITE_NAME, "BLINCS-48-X");
     let seed: [u8; SEED_LEN] = core::array::from_fn(|i| u8::try_from(i).unwrap());
     let draw = [7u8; 32];
     let msg = b"hello, BLINCS";
@@ -129,24 +131,24 @@ fn reference_vector_and_intermediate_kats_match_python_byte_for_byte() {
     // Intermediate Known Answer Tests (KATs) matching blincs/SPEC.md & reference/blincs.py.
     let e: [u8; N] = ref_sig.as_bytes()[..N].try_into().unwrap();
     let r: [u8; N] = ref_sig.as_bytes()[N..2 * N].try_into().unwrap();
-    assert_eq!(to_hex(&e), "73eabb4a158088cb5560a0ac53a56f94");
-    assert_eq!(to_hex(&r), "99b91679fcf65f9a5c6921f33e560c35");
+    assert_eq!(to_hex(&e), "9a70dfb49286d13de2a56ed4374946eb");
+    assert_eq!(to_hex(&r), "32b08c4c9d15504265fa2984b9b7cf25");
     let ck = derive_key(CTX_CONTENT, sk.id().as_bytes());
     let k_msg = derive_msg_key(&ck, &e, REF_CTX);
-    assert_eq!(to_hex(&k_msg), "e81dcdc2fbf14d588961d18dbf8d8c13d0b88d9620c91fa4b1d9d3e5bc803867");
+    assert_eq!(to_hex(&k_msg), "28b5bf0bad61349ba7f2cc3ba730cd3b1fd1a8a58fff9acc8115f154fe044847");
     let short = content_from_slice(&ck, &e, REF_CTX, msg);
-    assert_eq!(to_hex(&short[N..]), "e02cefa736d2adf65658b8271bc8edb4216696b1291a83d66b2a4afadf78ab38");
+    assert_eq!(to_hex(&short[N..]), "7d978bc5d7a7df9bd2ff34dd4288dbf51963eb8da05365a9cc53ea2d05e2e09a");
     let pk = PublicKey::from_seed(sk.id().as_bytes()[..N].try_into().unwrap());
     let root: [u8; N] = sk.id().as_bytes()[N..].try_into().unwrap();
     let d_seed = compute_message_digest(&pk, &r, &root, &short, REF_CTX);
-    assert_eq!(to_hex(&d_seed), "b5044d6e9253abc1cdb13893663db4531e015000ca5a666f5521c11a18f8b69f");
+    assert_eq!(to_hex(&d_seed), "2151d28e0fd8b76f3d514feb22bc966bb26fab87dee126eb3917d320072f30f9");
 
     let ctr_ft = u32::from_le_bytes(ref_sig.as_bytes()[2 * N..2 * N + UPORS_CTR_LEN].try_into().unwrap());
-    assert_eq!(ctr_ft, 2049);
+    assert_eq!(ctr_ft, 5530);
     let sel = verify_upors_selection(&pk.hasher(false), &d_seed, ctr_ft).unwrap();
-    assert_eq!(sel.leaf_addr.as_u64(), 0x166278a1d);
-    assert_eq!(sel.sibs, 44);
-    let cws = extract_upors_codewords(&pk, &d_seed, ctr_ft);
+    assert_eq!(sel.leaf_addr.as_u64(), 0xbbce_641c_7560);
+    assert_eq!(sel.sibs, 45);
+    let cws = extract_upors_codewords(&pk, &sel.h_sel).unwrap();
     for cw in &cws {
         assert_eq!(cw.iter().map(|&x| usize::from(x)).sum::<usize>(), UPORS_SUM);
     }
@@ -272,34 +274,130 @@ fn hex_and_sperner_unranking_and_fast_select_parser_are_exact() {
     assert_eq!(seen.len(), UPORS_C);
     assert!(catch_unwind(|| hex_unrank(u16::try_from(UPORS_C).unwrap())).is_err());
 
-    // 2. Sperner unrank bounds, exact sum 468, strict lexicographic monotonicity, and 15-byte rank extraction.
-    let ranks = [0u128, 1, 42, (1u128 << 64) - 1, 1u128 << 100, (1u128 << 120) - 2, (1u128 << 120) - 1];
-    let mut prev_s: Option<[u8; WOTS_N]> = None;
-    for r in ranks {
-        let d = sperner_unrank(r);
-        assert!(d.iter().all(|&x| x <= WOTS_STEPS));
-        assert_eq!(d.iter().map(|&x| usize::from(x)).sum::<usize>(), WOTS_SUM);
-        if let Some(p) = prev_s {
-            assert!(p < d, "sperner_unrank must be strictly increasing");
-            assert!((0..WOTS_N).any(|c| p[c] < d[c]) && (0..WOTS_N).any(|c| d[c] < p[c]));
+    // 2. WOTS+C direct 6-bit decoding: exact bounds (d_i < 60), z = 2 zero bits, constant sum 679,
+    //    every single one of the 21 6-bit lanes tested at boundary 59 vs 60, plus 100,000-digest differential parity vs naive spec!
+    let pack_wots_c = |z: u128, ds: &[u8; WOTS_N]| -> [u8; 32] {
+        let mut lo = z & 3;
+        for (i, &d) in ds.iter().enumerate() {
+            lo |= u128::from(d) << (2 + 6 * i);
         }
-        prev_s = Some(d);
+        let mut h = [0u8; 32];
+        h[..16].copy_from_slice(&lo.to_le_bytes());
+        h
+    };
+    let naive_decode_wots_c = |h: &[u8; 32]| -> Option<[u8; WOTS_N]> {
+        let lo = u128::from_le_bytes(h[..16].try_into().unwrap());
+        if (lo & 3) != 0 {
+            return None;
+        }
+        let mut digits = [0u8; WOTS_N];
+        let mut sum = 0usize;
+        for (i, slot) in digits.iter_mut().enumerate() {
+            let d = u8::try_from((lo >> (2 + 6 * i)) & 63).unwrap();
+            if d > WOTS_STEPS {
+                return None;
+            }
+            *slot = d;
+            sum += usize::from(d);
+        }
+        if sum == WOTS_SUM { Some(digits) } else { None }
+    };
+    let mut base_vec = [32u8; WOTS_N];
+    for x in &mut base_vec[11..20] {
+        *x = 33;
     }
-    assert_eq!(rank_from_15_bytes(&[0xffu8; 15]), (1u128 << 120) - 1);
-    assert_eq!(rank_from_15_bytes(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 1);
+    base_vec[20] = 30;
+    assert_eq!(base_vec.iter().map(|&x| usize::from(x)).sum::<usize>(), WOTS_SUM);
+    assert_eq!(decode_wots_c(&pack_wots_c(0, &base_vec)), Some(base_vec));
+    for z in 1u128..=3 {
+        assert_eq!(decode_wots_c(&pack_wots_c(z, &base_vec)), None);
+    }
+    let mut wrong_sum = base_vec;
+    wrong_sum[0] += 1;
+    assert_eq!(decode_wots_c(&pack_wots_c(0, &wrong_sum)), None);
+    wrong_sum[0] -= 2;
+    assert_eq!(decode_wots_c(&pack_wots_c(0, &wrong_sum)), None);
+    // Test EVERY SINGLE 6-bit lane i in 0..21 at exact boundary 59 (valid) and 60, 61, 62, 63 (invalid),
+    // AND every bit 0..=5 of every lane (killing every SWAR shift/mask mutation!).
+    for lane in 0..WOTS_N {
+        let o1 = (lane + 1) % WOTS_N;
+        let o2 = (lane + 2) % WOTS_N;
+        let mut v59 = base_vec;
+        let diff = 59 - v59[lane];
+        v59[lane] = 59;
+        v59[o1] -= diff / 2;
+        v59[o2] -= diff - diff / 2;
+        assert_eq!(v59.iter().map(|&x| usize::from(x)).sum::<usize>(), WOTS_SUM);
+        assert_eq!(decode_wots_c(&pack_wots_c(0, &v59)), Some(v59));
+        for bad_d in 60u8..=63 {
+            let mut vbad = v59;
+            vbad[lane] = bad_d;
+            vbad[o1] -= bad_d - 59;
+            assert_eq!(vbad.iter().map(|&x| usize::from(x)).sum::<usize>(), WOTS_SUM);
+            assert_eq!(decode_wots_c(&pack_wots_c(0, &vbad)), None, "accepted bad digit {bad_d} in lane {lane}");
+        }
+        // Also test values 56, 52, 44, 28 (each missing exactly 1 of bits 2, 3, 4, 5) to kill every SWAR shift mutation!
+        for ok_d in [56u8, 52, 44, 28] {
+            let mut vok = base_vec;
+            let delta = i32::from(ok_d) - i32::from(vok[lane]);
+            vok[lane] = ok_d;
+            vok[o1] = u8::try_from(i32::from(vok[o1]) - delta / 2).unwrap();
+            vok[o2] = u8::try_from(i32::from(vok[o2]) - (delta - delta / 2)).unwrap();
+            assert_eq!(vok.iter().map(|&x| usize::from(x)).sum::<usize>(), WOTS_SUM);
+            assert_eq!(decode_wots_c(&pack_wots_c(0, &vok)), Some(vok));
+        }
+    }
+    // 100,000 random digests: decode_wots_c == naive_decode_wots_c!
+    let mut wstate = 0xfeed_face_cafe_babe_u64;
+    let mut w_hits = 0usize;
+    for _ in 0..100_000usize {
+        let mut d = [0u8; 32];
+        for chunk in d.as_chunks_mut::<8>().0 {
+            wstate = wstate.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = wstate;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            chunk.copy_from_slice(&(z ^ (z >> 31)).to_le_bytes());
+        }
+        let fast = decode_wots_c(&d);
+        let slow = naive_decode_wots_c(&d);
+        assert_eq!(fast, slow, "decode_wots_c diverged from naive reference");
+        if fast.is_some() {
+            w_hits += 1;
+        }
+    }
+    assert!(w_hits >= 10, "expected >= 10 WOTS+C hits in 100,000 digests, got {w_hits}");
 
-    // 3. LeafAddr 33-bit masking & read_bits tail check.
-    let expected_addr = (1u64 << (HYPER_BITS - 1)) | 0x0123_4567;
-    assert_eq!(LeafAddr::from_word(expected_addr | (0x7fff_ffff_u64 << HYPER_BITS)).as_u64(), expected_addr);
+    // 3. LeafAddr 48-bit masking & read_bits tail check.
+    let expected_addr = (1u64 << (HYPER_BITS - 1)) | 0x0123_4567_89ab;
+    assert_eq!(LeafAddr::from_word(expected_addr | (0xffff_u64 << HYPER_BITS)).as_u64(), expected_addr);
     let splits = LeafAddr::from_word(expected_addr).split_layers();
-    assert_eq!(splits[3].0, 0);
+    assert_eq!(splits[5].0, 0);
     let mut tail = [0u8; 32];
     tail[30] = 0b1010_0101;
     tail[31] = 0b1101_0011;
     assert_eq!(read_bits(&tail, 240, 16), 0b1101_0011_1010_0101);
     assert_eq!(read_bits(&tail, 250, 6), 0b11_0100);
 
-    // 4. Differential parity: fast u128+u64 early-out `parse_select_digest` vs naive reference loop over 20,000 digests.
+    // 4. Differential parity: fast bit-fold `select_ancestor_lower_bound` + `parse_select_fast` vs naive reference over 100,000 digests.
+    let naive_lb = |d: &[u8; 32]| -> u32 {
+        let mut s = [0u16; UPORS_K];
+        for (i, slot) in s.iter_mut().enumerate() {
+            *slot = u16::try_from(read_bits(d, i * UPORS_HEIGHT, UPORS_HEIGHT)).unwrap();
+        }
+        let count_distinct = |shift: u32| -> u32 {
+            let mut vals: [u16; UPORS_K] = core::array::from_fn(|i| s[i] >> shift);
+            vals.sort_unstable();
+            let mut uniq = 1u32;
+            for i in 1..UPORS_K {
+                if vals[i] != vals[i - 1] {
+                    uniq += 1;
+                }
+            }
+            uniq
+        };
+        5 * count_distinct(5) + count_distinct(6) + count_distinct(7) + count_distinct(8) + count_distinct(9) + count_distinct(10)
+    };
     let naive_parse = |d: &[u8; 32]| -> Option<(LeafAddr, [u16; UPORS_K], usize)> {
         let mut leaves = [0u16; UPORS_K];
         let mut found = 0usize;
@@ -326,7 +424,7 @@ fn hex_and_sperner_unranking_and_fast_select_parser_are_exact() {
     };
     let mut state = 0x1234_5678_9abc_def0_u64;
     let mut accepted = 0usize;
-    for _ in 0..20_000usize {
+    for _ in 0..100_000usize {
         let mut d = [0u8; 32];
         for chunk in d.as_chunks_mut::<8>().0 {
             state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -335,19 +433,19 @@ fn hex_and_sperner_unranking_and_fast_select_parser_are_exact() {
             z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
             chunk.copy_from_slice(&(z ^ (z >> 31)).to_le_bytes());
         }
-        let fast = parse_select_digest(&d);
+        let lb = select_ancestor_lower_bound(&d);
+        assert_eq!(lb, naive_lb(&d), "select_ancestor_lower_bound diverged from exact formula");
+        let fast = parse_select_fast(&d);
         let slow = naive_parse(&d);
-        assert_eq!(fast, slow, "fast early-out parse_select_digest diverged from naive reference");
+        assert_eq!(fast, slow, "fast bit-fold parse_select_fast diverged from naive reference");
+        assert_eq!(parse_select_digest(&d), slow);
         if fast.is_some() {
             accepted += 1;
         }
     }
-    assert!(accepted >= 5, "expected at least 5 accepted selections in 20,000 random digests");
+    assert!(accepted >= 5, "expected at least 5 accepted selections in 100,000 random digests");
 
-    // Exact boundary tests for `parse_select_digest`:
-    //   - all-zero digest (< 10 distinct leaves) -> None
-    assert_eq!(parse_select_digest(&[0u8; 32]), None);
-    //   - crafted exact sibs == 44 (accepted) vs sibs == 45 (rejected)
+    // Verify exact `lb == 52` valid selection (`> 52` boundary) and NEON PAD11 width table.
     let pack_leaves = |vals: &[u16; UPORS_K]| -> [u8; 32] {
         let mut d = [0u8; 32];
         for (i, &v) in vals.iter().enumerate() {
@@ -360,24 +458,44 @@ fn hex_and_sperner_unranking_and_fast_select_parser_are_exact() {
         }
         d
     };
-    let leaves_44: [u16; UPORS_K] = [221, 514, 527, 552, 575, 654, 743, 992, 993, 994];
-    let leaves_45: [u16; UPORS_K] = [94, 189, 190, 540, 541, 715, 719, 866, 875, 935];
-    assert_eq!(count_octopus_sibs(&leaves_44), UPORS_M_MAX);
-    assert_eq!(count_octopus_sibs(&leaves_45), UPORS_M_MAX + 1);
-    assert!(parse_select_digest(&pack_leaves(&leaves_44)).is_some());
-    assert!(parse_select_digest(&pack_leaves(&leaves_45)).is_none());
+    let leaves_lb52: [u16; UPORS_K] = [128, 129, 160, 161, 480, 832, 864, 1984, 2016];
+    let d_lb52 = pack_leaves(&leaves_lb52);
+    assert_eq!(select_ancestor_lower_bound(&d_lb52), 52);
+    assert!(parse_select_fast(&d_lb52).is_some());
+    for a in 0..=WOTS_N {
+        let expected = match a {
+            16.. => 22,
+            8..11 => 11,
+            _ => a,
+        };
+        assert_eq!(neon_pad_width(a), expected);
+    }
+
+    // Exact boundary tests for `parse_select_digest` & `parse_select_fast`:
+    //   - all-zero digest (< 9 distinct leaves) -> None
+    assert_eq!(parse_select_fast(&[0u8; 32]), None);
+    assert_eq!(parse_select_digest(&[0u8; 32]), None);
+    //   - crafted exact sibs == 45 (accepted) vs sibs == 46 (rejected)
+    let leaves_45: [u16; UPORS_K] = [395, 402, 414, 927, 1217, 1218, 1510, 1518, 1529];
+    let leaves_46: [u16; UPORS_K] = [201, 222, 429, 431, 442, 446, 514, 1938, 1961];
+    assert_eq!(count_octopus_sibs(&leaves_45), UPORS_M_MAX);
+    assert_eq!(count_octopus_sibs(&leaves_46), UPORS_M_MAX + 1);
+    assert!(parse_select_fast(&pack_leaves(&leaves_45)).is_some());
+    assert!(parse_select_fast(&pack_leaves(&leaves_46)).is_none());
+    assert!(parse_select_digest(&pack_leaves(&leaves_45)).is_some());
+    assert!(parse_select_digest(&pack_leaves(&leaves_46)).is_none());
 
     // Exact `v == 376` (`UPORS_C`) rejection boundary in `extract_upors_codewords`:
-    // Find a deterministic `ctr` whose first 10 valid 9-bit draws encounter `v == 376` and verify it is skipped.
+    // Find a deterministic `h_sel` whose first 9 valid 9-bit draws encounter `v == 376` and verify it is skipped.
     ensure_init();
     let pk = PublicKey::from_seed(&[0x5au8; N]);
-    let d_seed = [0xa5u8; 32];
+    let mut h_sel = [0xa5u8; 32];
     let mut hit_376 = false;
     for ctr in 0u32..2000 {
-        let mut msg = [0u8; 52];
+        h_sel[..4].copy_from_slice(&ctr.to_le_bytes());
+        let mut msg = [0u8; 48];
         msg[..16].copy_from_slice(&tweak(TweakKind::FewCode, crate::params::UPORS_LAYER_U8, 0, 0, 0, 0));
-        msg[16..48].copy_from_slice(&d_seed);
-        msg[48..52].copy_from_slice(&ctr.to_le_bytes());
+        msg[16..48].copy_from_slice(&h_sel);
         let blk = pk.keyed(&msg);
         let mut valid_before_376 = 0usize;
         let mut saw_376 = false;
@@ -392,7 +510,7 @@ fn hex_and_sperner_unranking_and_fast_select_parser_are_exact() {
             }
         }
         if saw_376 && valid_before_376 < UPORS_K {
-            let cws = extract_upors_codewords(&pk, &d_seed, ctr);
+            let cws = extract_upors_codewords(&pk, &h_sel).unwrap();
             assert!(cws.iter().all(|cw| cw.iter().map(|&x| usize::from(x)).sum::<usize>() == UPORS_SUM));
             hit_376 = true;
             break;
@@ -417,15 +535,15 @@ fn every_signature_region_and_canonical_padding_are_checked() {
         vk.verify(REF_CTX, msg, &Imprint::from_bytes(&raw)).is_ok()
     };
 
-    // Mutate one byte in EVERY 16-byte block PLUS every counter byte and last byte across all 3,292 B!
-    for off in (0..IMPRINT_LEN).step_by(N).chain([32usize, 35, 1220, 1221, 1718, 1719, 2216, 2217, 2714, 2715, IMPRINT_LEN - 1]) {
+    // Mutate one byte in EVERY 16-byte block PLUS every counter byte and last byte across all 3,990 B!
+    for off in (0..IMPRINT_LEN).step_by(N).chain([32usize, 35, 1188, 1190, 1639, 1641, 2090, 2092, 2541, 2543, 2992, 2994, 3443, 3445, IMPRINT_LEN - 1]) {
         assert!(!flip(off), "accepted flip at offset {off}");
     }
     assert_eq!(Layer::TOP.sig_offset() + TOP_LAYER_LEN, IMPRINT_LEN);
 
-    // Explicit canonical trailing zero-padding test using edge vector `one-byte-zero` (sibs = 41/44 -> 48 B trailing zeros).
+    // Explicit canonical trailing zero-padding test using edge vector `empty` (sibs = 43/45 -> 32 B trailing zeros).
     let edge_json = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/test_vectors/edge-vectors.json")).unwrap();
-    let block = edge_json.split("\"name\": \"one-byte-zero\"").nth(1).unwrap();
+    let block = edge_json.split("\"name\": \"empty\"").nth(1).unwrap();
     let pat = "\"imprint_hex\": \"";
     let s = block.find(pat).unwrap() + pat.len();
     let e = block[s..].find('"').unwrap();
@@ -435,24 +553,24 @@ fn every_signature_region_and_canonical_padding_are_checked() {
     let ce = block[cs..].find('"').unwrap();
     let pad_ctx_bytes = from_hex(&block[cs..cs + ce]);
     let pad_ctx = Context::try_new(&pad_ctx_bytes).unwrap();
-    vk.verify(pad_ctx, b"\x00", &Imprint::try_from(pad_sig.as_slice()).unwrap()).unwrap();
-    // Flip a byte inside the trailing 3 zero-padded sibling slots (offsets 2*N + UPORS_LEN - 48 .. 2*N + UPORS_LEN): MUST REJECT!
-    for tail_off in [2 * N + UPORS_LEN - 48, 2 * N + UPORS_LEN - 16, 2 * N + UPORS_LEN - 1] {
+    vk.verify(pad_ctx, b"", &Imprint::try_from(pad_sig.as_slice()).unwrap()).unwrap();
+    // Flip a byte inside the trailing 2 zero-padded sibling slots (offsets 2*N + UPORS_LEN - 32 .. 2*N + UPORS_LEN): MUST REJECT!
+    for tail_off in [2 * N + UPORS_LEN - 32, 2 * N + UPORS_LEN - 16, 2 * N + UPORS_LEN - 1] {
         assert_eq!(pad_sig[tail_off], 0);
         let mut mutated = pad_sig.clone();
         mutated[tail_off] = 1;
         assert_eq!(
-            vk.verify(pad_ctx, b"\x00", &Imprint::try_from(mutated.as_slice()).unwrap()),
+            vk.verify(pad_ctx, b"", &Imprint::try_from(mutated.as_slice()).unwrap()),
             Err(InvalidImprint),
             "canonical zero-padding check missed byte {tail_off}"
         );
     }
 
-    // Explicit verify_wots_msg leading-zero check (`h[0] != 0` rejected).
+    // Explicit verify_wots_msg 12-zero-bit check (`lo.trailing_zeros() < 12` rejected).
     let pk = PublicKey::from_seed(&[0x55u8; N]);
     let pub_h = pk.hasher(false);
     let mut rejected_ctr = 0usize;
-    for ctr in 0u16..32 {
+    for ctr in 0u32..32 {
         if verify_wots_msg(&pub_h, Layer::L0, 0, 0, &[0x11u8; N], ctr).is_none() {
             rejected_ctr += 1;
         }
@@ -833,7 +951,7 @@ fn debug_redacts_secrets() {
 
     let sig = sk.imprint_with_draw(&[1u8; 32], TEST_CTX, b"dbg");
     let sd = format!("{sig:?}");
-    assert!(sd.contains(SUITE_NAME) && sd.contains("3292 bytes") && sd.contains(&to_hex(&sig.as_bytes()[..N])));
+    assert!(sd.contains(SUITE_NAME) && sd.contains("3990 bytes") && sd.contains(&to_hex(&sig.as_bytes()[..N])));
 }
 
 #[test]
@@ -905,10 +1023,12 @@ fn checked_constructors_reject_out_of_range_values() {
     assert_eq!(&max_t[2..8], &[0xff; 6]);
     assert!(catch_unwind(|| tweak(TweakKind::Node, 0, 1u64 << 48, 0, 0, 0)).is_err());
 
-    assert_eq!(Layer::L0.trees(), 1u64 << 26);
-    assert_eq!(Layer::L1.trees(), 1u64 << 19);
-    assert_eq!(Layer::L2.trees(), 1u64 << 12);
-    assert_eq!(Layer::L3.trees(), 1);
+    assert_eq!(Layer::L0.trees(), 1u64 << 41);
+    assert_eq!(Layer::L1.trees(), 1u64 << 34);
+    assert_eq!(Layer::L2.trees(), 1u64 << 27);
+    assert_eq!(Layer::L3.trees(), 1u64 << 20);
+    assert_eq!(Layer::L4.trees(), 1u64 << 13);
+    assert_eq!(Layer::L5.trees(), 1);
 }
 
 #[test]

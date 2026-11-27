@@ -1,8 +1,8 @@
 use blake3_servil_core::throughput::TreeHasher;
 use blake3_servil_core::{Mode, convenience, initialize};
 
-/// Permanent suite identifier for this BLINCS parameter set (`12+7+7+7` `S-WOTS+Z` + `U-PORS`, 2³² budget).
-pub const SUITE_NAME: &str = "BLINCS-128-A2";
+/// Permanent suite identifier for this BLINCS parameter set (`13+7+7+7+7+7` `S-WOTS+Z` + `U-PORS`, 2⁴⁸ budget).
+pub const SUITE_NAME: &str = "BLINCS-48-X";
 /// Byte length of a [`crate::Signet`] secret seed (`32` bytes).
 pub const SEED_LEN: usize = 32;
 /// Byte length of a [`crate::SignetId`] wire encoding (`32` bytes: `public_seed || top_root`).
@@ -12,63 +12,66 @@ pub const MAX_CONTEXT_LEN: usize = 255;
 
 pub(crate) const N: usize = 16;
 
-// Hypertree: 12 + 7 + 7 + 7 = 33 bits across 4 layers (d = 4).
-pub(crate) const LAYERS: usize = 4;
+// Hypertree: 13 + 7 + 7 + 7 + 7 + 7 = 48 bits across 6 layers (d = 6).
+pub(crate) const LAYERS: usize = 6;
+pub(crate) const LOW_LAYERS: usize = LAYERS - 1;
 pub(crate) const LOW_HEIGHT: usize = 7;
 pub(crate) const LOW_LEAVES: usize = 1 << LOW_HEIGHT;
-pub(crate) const TOP_HEIGHT: usize = 12;
+pub(crate) const TOP_HEIGHT: usize = 13;
 pub(crate) const TOP_LEAVES: usize = 1 << TOP_HEIGHT;
-pub(crate) const HYPER_BITS: usize = 3 * LOW_HEIGHT + TOP_HEIGHT;
+pub(crate) const HYPER_BITS: usize = LOW_LAYERS * LOW_HEIGHT + TOP_HEIGHT;
 
-// S-WOTS+Z(n = 24, w = 40, S = 468, z = 8, deterministic u16 counter).
-pub(crate) const WOTS_N: usize = 24;
-pub(crate) const WOTS_W: usize = 40;
-pub(crate) const WOTS_STEPS: u8 = 39;
-pub(crate) const WOTS_SUM: usize = 468;
-pub(crate) const WOTS_CTR_LEN: usize = 2;
+// WOTS+C(n = 21, w = 60, z = 2, S = 679, deterministic u24 LE counter).
+pub(crate) const WOTS_N: usize = 21;
+pub(crate) const WOTS_W: usize = 60;
+pub(crate) const WOTS_STEPS: u8 = 59;
+pub(crate) const WOTS_SUM: usize = 679;
+pub(crate) const WOTS_CTR_LEN: usize = 3;
+pub(crate) const WOTS_CTR_LIMIT: u32 = 1 << 24;
 pub(crate) const WOTS_PK_IN_LEN: usize = 16 + WOTS_N * N;
 
-// U-PORS(n = 3, w = 24, S = 42, C = 376, A = 10, k = 10, m_max = 44, u32 counter).
-pub(crate) const UPORS_HEIGHT: usize = 10;
+// U-PORS(n = 3, w = 24, S = 42, C = 376, A = 11, k = 9, m_max = 45, u32 counter).
+pub(crate) const UPORS_HEIGHT: usize = 11;
 pub(crate) const UPORS_LEAVES: usize = 1 << UPORS_HEIGHT;
 pub(crate) const UPORS_N: usize = 3;
 pub(crate) const UPORS_W: usize = 24;
 pub(crate) const UPORS_STEPS: u8 = 23;
 pub(crate) const UPORS_SUM: usize = 42;
 pub(crate) const UPORS_C: usize = 376;
-pub(crate) const UPORS_K: usize = 10;
-pub(crate) const UPORS_M_MAX: usize = 44;
+pub(crate) const UPORS_K: usize = 9;
+pub(crate) const UPORS_M_MAX: usize = 45;
 pub(crate) const UPORS_CTR_LEN: usize = 4;
 pub(crate) const UPORS_LAYER_U8: u8 = 0x80;
-pub(crate) const UPORS_SELECT_MAX_DRAWS: usize = 22;
+pub(crate) const UPORS_SELECT_MAX_DRAWS: usize = 18;
 
 pub(crate) const SHORT_LEN: usize = N + 32;
 pub(crate) const UPORS_LEN: usize = UPORS_CTR_LEN + (UPORS_K * UPORS_N + UPORS_M_MAX) * N;
 pub(crate) const LOW_LAYER_LEN: usize = WOTS_CTR_LEN + (WOTS_N + LOW_HEIGHT) * N;
 pub(crate) const TOP_LAYER_LEN: usize = WOTS_CTR_LEN + (WOTS_N + TOP_HEIGHT) * N;
-/// Byte length of a `BLINCS-128-A2` [`crate::Imprint`] (`3,292` bytes).
-pub const IMPRINT_LEN: usize = 2 * N + UPORS_LEN + 3 * LOW_LAYER_LEN + TOP_LAYER_LEN;
+/// Byte length of a `BLINCS-48-X` [`crate::Imprint`] (`3,990` bytes).
+pub const IMPRINT_LEN: usize = 2 * N + UPORS_LEN + LOW_LAYERS * LOW_LAYER_LEN + TOP_LAYER_LEN;
 
 const _: () = {
-    assert!(HYPER_BITS == 33 && HYPER_BITS < 48);
-    assert!(LOW_LEAVES == 128 && TOP_LEAVES == 4096 && UPORS_LEAVES == 1024);
-    assert!(WOTS_W == (WOTS_STEPS as usize) + 1 && WOTS_SUM * 2 == WOTS_N * (WOTS_STEPS as usize) && WOTS_PK_IN_LEN == 400);
+    assert!(HYPER_BITS == 48);
+    assert!(LOW_LEAVES == 128 && TOP_LEAVES == 8192 && UPORS_LEAVES == 2048);
+    assert!(WOTS_W == (WOTS_STEPS as usize) + 1 && WOTS_PK_IN_LEN == 352);
+    assert!(WOTS_N * (WOTS_STEPS as usize) - WOTS_SUM == 560);
     assert!(UPORS_W == (UPORS_STEPS as usize) + 1 && 16 + UPORS_N * N == 64);
-    assert!(UPORS_SELECT_MAX_DRAWS * UPORS_HEIGHT + HYPER_BITS == 253);
+    assert!(UPORS_SELECT_MAX_DRAWS * UPORS_HEIGHT + HYPER_BITS == 246);
     assert!(LAYERS <= (UPORS_LAYER_U8 as usize));
-    assert!(UPORS_LEN == 1188 && LOW_LAYER_LEN == 498 && TOP_LAYER_LEN == 578);
-    assert!(IMPRINT_LEN == 3292);
+    assert!(UPORS_LEN == 1156 && LOW_LAYER_LEN == 451 && TOP_LAYER_LEN == 547);
+    assert!(IMPRINT_LEN == 3990);
 };
 
 // Key-derivation contexts (SPEC.md, "Key-derivation contexts").
-// Algorithm contexts bind SUITE_NAME ("BLINCS-128-A2") so suites never share derived keys.
-pub(crate) const CTX_SECRET_VALUES: &str = "BLINCS-128-A2 2026-11-26 secret values";
-pub(crate) const CTX_CONTENT_SALT: &str = "BLINCS-128-A2 2026-11-26 content salt";
-pub(crate) const CTX_RANDOMIZER: &str = "BLINCS-128-A2 2026-11-26 randomizer";
-pub(crate) const CTX_PUBLIC_SEED: &str = "BLINCS-128-A2 2026-11-26 public seed";
-pub(crate) const CTX_PUBLIC_HASH: &str = "BLINCS-128-A2 2026-11-26 public hash";
-pub(crate) const CTX_CONTENT: &str = "BLINCS-128-A2 2026-11-26 content";
-pub(crate) const CTX_GENERATE_SIGNET: &str = "Signet BLINCS-128-A2 2026-11-26 generate signet";
+// Algorithm contexts bind SUITE_NAME ("BLINCS-48-X") so suites never share derived keys.
+pub(crate) const CTX_SECRET_VALUES: &str = "BLINCS-48-X 2026-11-26 secret values";
+pub(crate) const CTX_CONTENT_SALT: &str = "BLINCS-48-X 2026-11-26 content salt";
+pub(crate) const CTX_RANDOMIZER: &str = "BLINCS-48-X 2026-11-26 randomizer";
+pub(crate) const CTX_PUBLIC_SEED: &str = "BLINCS-48-X 2026-11-26 public seed";
+pub(crate) const CTX_PUBLIC_HASH: &str = "BLINCS-48-X 2026-11-26 public hash";
+pub(crate) const CTX_CONTENT: &str = "BLINCS-48-X 2026-11-26 content";
+pub(crate) const CTX_GENERATE_SIGNET: &str = "Signet BLINCS-48-X 2026-11-26 generate signet";
 pub(crate) const CTX_MIX: &str = "Signet 2026-11-26 randomness: mix";
 pub(crate) const CTX_NEXT_SEED: &str = "Signet 2026-11-26 randomness: next seed";
 pub(crate) const CTX_RUN_KEY: &str = "Signet 2026-11-26 randomness: key of this run";
@@ -161,7 +164,7 @@ impl PublicKey {
     }
 }
 
-/// Hypertree layer index (`0..=3`, with layer 3 being the cached height-12 top tree).
+/// Hypertree layer index (`0..=5`, with layer 5 being the cached height-13 top tree).
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Layer {
@@ -169,12 +172,14 @@ pub(crate) enum Layer {
     L1 = 1,
     L2 = 2,
     L3 = 3,
+    L4 = 4,
+    L5 = 5,
 }
 
 impl Layer {
-    pub(crate) const ALL: [Self; LAYERS] = [Self::L0, Self::L1, Self::L2, Self::L3];
-    pub(crate) const LOWER: [Self; LAYERS - 1] = [Self::L0, Self::L1, Self::L2];
-    pub(crate) const TOP: Self = Self::L3;
+    pub(crate) const ALL: [Self; LAYERS] = [Self::L0, Self::L1, Self::L2, Self::L3, Self::L4, Self::L5];
+    pub(crate) const LOWER: [Self; LOW_LAYERS] = [Self::L0, Self::L1, Self::L2, Self::L3, Self::L4];
+    pub(crate) const TOP: Self = Self::L5;
 
     #[inline]
     pub(crate) const fn index(self) -> usize {
@@ -189,7 +194,7 @@ impl Layer {
     #[inline]
     pub(crate) const fn height(self) -> usize {
         match self {
-            Self::L3 => TOP_HEIGHT,
+            Self::L5 => TOP_HEIGHT,
             _ => LOW_HEIGHT,
         }
     }
@@ -197,7 +202,7 @@ impl Layer {
     #[inline]
     pub(crate) const fn layer_len(self) -> usize {
         match self {
-            Self::L3 => TOP_LAYER_LEN,
+            Self::L5 => TOP_LAYER_LEN,
             _ => LOW_LAYER_LEN,
         }
     }
@@ -211,15 +216,17 @@ impl Layer {
     #[inline]
     pub(crate) const fn trees(self) -> u64 {
         match self {
-            Self::L0 => 1u64 << 26,
-            Self::L1 => 1u64 << 19,
-            Self::L2 => 1u64 << 12,
-            Self::L3 => 1,
+            Self::L0 => 1u64 << 41,
+            Self::L1 => 1u64 << 34,
+            Self::L2 => 1u64 << 27,
+            Self::L3 => 1u64 << 20,
+            Self::L4 => 1u64 << 13,
+            Self::L5 => 1,
         }
     }
 }
 
-/// 33-bit hypertree leaf address (`0 .. 2^33`), guaranteed to fit inside a 48-bit tweak `tree` field.
+/// 48-bit hypertree leaf address (`0 .. 2^48`), fitting exactly inside a 48-bit tweak `tree` field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LeafAddr(u64);
 
@@ -234,7 +241,7 @@ impl LeafAddr {
         self.0
     }
 
-    /// Split `leaf_addr` into `(tree, leaf)` for each of the 4 hypertree layers (`7, 7, 7, 12` bits).
+    /// Split `leaf_addr` into `(tree, leaf)` for each of the 6 hypertree layers (`7, 7, 7, 7, 7, 13` bits).
     #[inline]
     pub(crate) fn split_layers(self) -> [(u64, u16); LAYERS] {
         let a = self.0;
@@ -244,8 +251,12 @@ impl LeafAddr {
         let t1 = t0 >> LOW_HEIGHT;
         let l2 = u16::try_from(t1 & 0x7f).unwrap();
         let t2 = t1 >> LOW_HEIGHT;
-        let l3 = u16::try_from(t2 & 0xfff).unwrap();
-        [(t0, l0), (t1, l1), (t2, l2), (0, l3)]
+        let l3 = u16::try_from(t2 & 0x7f).unwrap();
+        let t3 = t2 >> LOW_HEIGHT;
+        let l4 = u16::try_from(t3 & 0x7f).unwrap();
+        let t4 = t3 >> LOW_HEIGHT;
+        let l5 = u16::try_from(t4 & 0x1fff).unwrap();
+        [(t0, l0), (t1, l1), (t2, l2), (t3, l3), (t4, l4), (0, l5)]
     }
 }
 

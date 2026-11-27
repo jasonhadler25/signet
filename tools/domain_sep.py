@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static and dynamic domain-separation & tweak-uniqueness check for Signet (BLINCS-128-A2)."""
+"""Static and dynamic domain-separation & tweak-uniqueness check for Signet (BLINCS-48-X)."""
 
 import os
 import re
@@ -167,12 +167,12 @@ def check_static(params_src, spec_text, shipped_sources, verify_src=None):
 
 
 def self_test(params_src, spec_text, shipped_sources, verify_src):
-    bad_ctx = params_src.replace('"BLINCS-128-A2 2026-11-26 content"', '"BLINCS-128-A2 2026-11-26 public hash"', 1)
+    bad_ctx = params_src.replace('"BLINCS-48-X 2026-11-26 content"', '"BLINCS-48-X 2026-11-26 public hash"', 1)
     ctx_errs = check_static(bad_ctx, spec_text, shipped_sources, verify_src)
     if not any("duplicate context string" in e for e in ctx_errs):
         raise RuntimeError(f"self-test failed: duplicate CTX diagnostic not triggered: {ctx_errs}")
 
-    bad_spec = spec_text.replace('| `CONTENT` | `"BLINCS-128-A2 2026-11-26 content"` |', '| `CONTENT` | `"BLINCS-128-A2 2026-11-26 wrong"` |', 1)
+    bad_spec = spec_text.replace('| `CONTENT` | `"BLINCS-48-X 2026-11-26 content"` |', '| `CONTENT` | `"BLINCS-48-X 2026-11-26 wrong"` |', 1)
     if not check_static(params_src, bad_spec, shipped_sources, verify_src):
         raise RuntimeError("self-test failed: SPEC.md name-to-value mismatch escaped")
 
@@ -211,9 +211,9 @@ def check_dynamic_reference():
     k_sec_expected = orig_derive(blincs.CTX_SECRET_VALUES, seed)
     pk_seed = orig_derive(blincs.CTX_PUBLIC_SEED, seed)[:16]
     k_pub_expected = orig_derive(blincs.CTX_PUBLIC_HASH, pk_seed)
-    id_bytes = bytes.fromhex("eb8e97a4ff2446ed3791cfd9515e1e23982ff22b5103bc0117c3ab69db42bac4")
+    id_bytes = bytes.fromhex("7ee7fe20dac820b17625cad3a38a8af696a69a74992f01a7c9ed3680699d2c5c")
     imp_bytes = open(os.path.join(ROOT, "test_vectors", "reference-imprint-1.bin"), "rb").read()
-    ref_ctx = b"BLINCS-128-A2 reference vector v1"
+    ref_ctx = b"BLINCS-48-X reference vector v1"
 
     bucket = [ver_sec_tweaks, ver_pub_tweaks]
 
@@ -259,9 +259,9 @@ def check_dynamic_reference():
     if len(upors_sec_tweaks) != 4 * blincs.UPORS_N or len(set(upors_sec_tweaks)) != 4 * blincs.UPORS_N or len(upors_pub_tweaks) != len(set(upors_pub_tweaks)):
         raise RuntimeError("U-PORS tweak invariant failed")
     if len(wots_sec_tweaks) != 4 * blincs.WOTS_N or len(set(wots_sec_tweaks)) != 4 * blincs.WOTS_N or len(wots_pub_tweaks) != len(set(wots_pub_tweaks)):
-        raise RuntimeError("S-WOTS+Z tweak invariant failed")
+        raise RuntimeError("WOTS+C tweak invariant failed")
     if not set(upors_sec_tweaks).isdisjoint(wots_sec_tweaks) or not set(upors_pub_tweaks).isdisjoint(wots_pub_tweaks):
-        raise RuntimeError("U-PORS and S-WOTS+Z tweaks overlapped")
+        raise RuntimeError("U-PORS and WOTS+C tweaks overlapped")
     return len(ver_pub_tweaks), len(upors_pub_tweaks), len(wots_pub_tweaks), len(derived_ctxs)
 
 
@@ -284,7 +284,7 @@ def main():
     n_ver, n_upors, n_wots, n_ctx = check_dynamic_reference()
     print(
         f"domain_sep.py PASSED (self-test 5/5 caught; 11 CTX + 8 TweakKind SPEC-table exact match, SecretKey boundary & signet-verify parity; "
-        f"dynamic trace: {n_ver} unique verify K_pub / 0 K_sec, {n_upors} U-PORS + {n_wots} S-WOTS+Z/Merkle disjoint tweaks, {n_ctx} contexts)."
+        f"dynamic trace: {n_ver} unique verify K_pub / 0 K_sec, {n_upors} U-PORS + {n_wots} WOTS+C/Merkle disjoint tweaks, {n_ctx} contexts)."
     )
     return 0
 

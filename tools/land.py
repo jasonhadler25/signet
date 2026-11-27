@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Exact-commit landing gate for Signet (BLINCS-128-A2).
+"""Exact-commit landing gate for Signet (BLINCS-48-X).
 
 Runs every check required before pushing a commit:
   - clean working tree (unless --skip-clean-check)
   - Python BLAKE3 official 35-vector check
-  - BLINCS-128-A2 exact combinatorial & parameter self-check
+  - BLINCS-48-X exact combinatorial & parameter self-check
   - shipped-code safety counts (0 unsafe, 0 debug_assert!, 0 truncation allows, 0 Drop)
   - static & dynamic domain separation + SPEC.md table check
   - checked-in reference & edge test vectors (SHA-256 + BLAKE3 + Python + Node 24 TypeScript)
@@ -33,13 +33,13 @@ import blake3  # noqa: E402
 import blincs  # noqa: E402
 
 REF_IMP = os.path.join(ROOT, "test_vectors", "reference-imprint-1.bin")
-REF_CTX = b"BLINCS-128-A2 reference vector v1"
-REF_SHA256 = "1617a3dc44e94dda77f019913006a64bedfc4d68b7230d792dde909dc98101ee"
-REF_BLAKE3 = "43c5443aaaf0698cde86c7d2d24898cbac6e7980734023f759d2eac72e79cef2"
+REF_CTX = b"BLINCS-48-X reference vector v1"
+REF_SHA256 = "5ddc2156d48938300f73abfa21fe514b69ed56ffbb44c61b2dc2d2bb6a4f9386"
+REF_BLAKE3 = "cefb8846c95ff890a8e7cb1a51a2d2c2032c3f0de9e57fef8fc3d7943723ac22"
 EDGE_VEC = os.path.join(ROOT, "test_vectors", "edge-vectors.json")
-EDGE_SHA256 = "c947dfa6d4ec02497d7401742c61cd297bf41eb9a544b18b5ed7e5614147f997"
-EDGE_BLAKE3 = "0167f83e8886d90a79ec638a0735504fe7c7e39986320117cdd831fa7a12ee45"
-REF_SIGNET_ID = "eb8e97a4ff2446ed3791cfd9515e1e23982ff22b5103bc0117c3ab69db42bac4"
+EDGE_SHA256 = "89437ccbd170293b5ec20e621a7d528e12696837e681097bff2d24434f3e6a9e"
+EDGE_BLAKE3 = "524d43dea3d631e2baabc04e98f70c7362c6a1ac630d5331f9bd2eee44a88704"
+REF_SIGNET_ID = "7ee7fe20dac820b17625cad3a38a8af696a69a74992f01a7c9ed3680699d2c5c"
 
 EDGE_MSGS = {
     "empty": b"",
@@ -67,7 +67,7 @@ def run(label, cmd, extra_env=None):
 def check_vectors_and_references():
     print("==> Checking reference-imprint-1.bin digests (SHA-256 + BLAKE3)")
     raw = open(REF_IMP, "rb").read()
-    if len(raw) != 3292:
+    if len(raw) != 3990:
         fail(f"unexpected length {len(raw)}")
     got_sha256 = hashlib.sha256(raw).hexdigest()
     got_blake3 = blake3.hash(raw).hex()
@@ -88,12 +88,12 @@ def check_vectors_and_references():
         fail("edge-vectors.json SHA-256 mismatch")
     if blake3.hash(edge_raw).hex() != EDGE_BLAKE3:
         fail("edge-vectors.json BLAKE3 mismatch")
-    edge_entries = json.loads(edge_raw.decode("utf-8"))
-    for entry in edge_entries:
+    edge_doc = json.loads(edge_raw.decode("utf-8"))
+    if edge_doc["suite"] != "BLINCS-48-X" or edge_doc["signet_id_hex"] != REF_SIGNET_ID:
+        fail("edge-vectors.json header mismatch")
+    for entry in edge_doc["vectors"]:
         ctx = bytes.fromhex(entry["ctx_hex"])
         imp = bytes.fromhex(entry["imprint_hex"])
-        if hashlib.sha256(imp).hexdigest() != entry["imprint_sha256"]:
-            fail(f"edge vector SHA-256 mismatch: {entry['name']}")
         if blake3.hash(imp).hex() != entry["imprint_blake3"]:
             fail(f"edge vector BLAKE3 mismatch: {entry['name']}")
         if not sid.verify(ctx, EDGE_MSGS[entry["name"]], imp):
@@ -115,7 +115,7 @@ def check_vectors_and_references():
                 f"ba = bytearray(bytes.fromhex('{REF_SIGNET_ID}'))\n"
                 "sid = blincs.SignetId(ba)\n"
                 "ba[0] ^= 0xff\n"
-                "if sid.bytes[0] != 0xeb: raise SystemExit(1)\n"
+                "if sid.bytes[0] != 0x7e: raise SystemExit(1)\n"
             ),
         ],
     )
@@ -142,7 +142,7 @@ if (verify(vk, refCtx, refMsg, tampered)) throw new Error("accepted tampered sig
 const wrongId = Uint8Array.from(vk); wrongId[0] ^= 1;
 if (verify(wrongId, refCtx, refMsg, refSig)) throw new Error("accepted wrong SignetId");
 if (verify(vk, refCtx, refMsg, refSig.slice(0, -1))) throw new Error("accepted truncated sig");
-const edges = JSON.parse(readFileSync({json.dumps(EDGE_VEC)}, "utf8"));
+const edges = JSON.parse(readFileSync({json.dumps(EDGE_VEC)}, "utf8")).vectors;
 const edgeMsgs = {{
   "empty": new Uint8Array(0),
   "one-byte-zero": new Uint8Array([0]),

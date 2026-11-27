@@ -1,4 +1,4 @@
-//! Standalone `#![no_std]`, zero-allocation, zero-table verifier for **`BLINCS-128-A2`** signatures (`3,292` bytes).
+//! Standalone `#![no_std]`, zero-allocation, zero-table verifier for **`BLINCS-48-X`** signatures (`3,990` bytes).
 //!
 //! **Pre-1.0 experimental software (unsupported):** wire formats, context strings, and APIs may
 //! change before 1.0, and no independent human cryptographic audit has been performed.
@@ -6,7 +6,8 @@
 //! This crate verifies [`ImprintRef`] signatures against an expected [`SignetId`] and bounded
 //! application [`Context`] using pure-Rust BLAKE3 (`blake3` with `default-features = false`,
 //! `features = ["pure"]`), zero static lookup tables (closed-form `U-PORS` hexagon unranking and
-//! `O(S)` boxcar-deconvolution `S-WOTS+Z` Sperner unranking), zero `std`, zero `alloc`, and zero `unsafe`.
+//! direct 6-bit `WOTS+C` decoding — under 1 KiB of stack RAM on ARM Cortex-M33), zero `std`,
+//! zero `alloc`, and zero `unsafe`.
 //!
 //! Both one-shot slice verification ([`SignetId::verify`]) and incremental streaming verification
 //! ([`SignetId::verifier`] -> [`Verifier::update`] -> [`Verifier::finalize`]) are provided.
@@ -18,38 +19,38 @@ use core::array::TryFromSliceError;
 use core::error::Error;
 use core::fmt;
 
-/// Permanent suite identifier for this BLINCS parameter set (`12+7+7+7` `S-WOTS+Z` + `U-PORS`, 2³² budget).
-pub const SUITE_NAME: &str = "BLINCS-128-A2";
+/// Permanent suite identifier for this BLINCS parameter set (`13+7+7+7+7+7` `WOTS+C` + `U-PORS`, 2⁴⁸ budget).
+pub const SUITE_NAME: &str = "BLINCS-48-X";
 /// Byte length of a [`SignetId`] wire encoding (`32` bytes: `public_seed || top_root`).
 pub const SIGNET_ID_LEN: usize = 32;
-/// Byte length of a `BLINCS-128-A2` signature (`3,292` bytes).
-pub const IMPRINT_LEN: usize = 3292;
+/// Byte length of a `BLINCS-48-X` signature (`3,990` bytes).
+pub const IMPRINT_LEN: usize = 3990;
 /// Maximum byte length of a [`Context`] application domain tag (`255` bytes).
 pub const MAX_CONTEXT_LEN: usize = 255;
 
 const N: usize = 16;
-const LAYERS: usize = 4;
+const LAYERS: usize = 6;
 const LOW_HEIGHT: usize = 7;
-const TOP_HEIGHT: usize = 12;
-const HYPER_BITS: usize = 3 * LOW_HEIGHT + TOP_HEIGHT;
+const TOP_HEIGHT: usize = 13;
+const HYPER_BITS: usize = 5 * LOW_HEIGHT + TOP_HEIGHT;
 
-const WOTS_N: usize = 24;
-const WOTS_W: usize = 40;
-const WOTS_STEPS: u8 = 39;
-const WOTS_SUM: usize = 468;
-const WOTS_CTR_LEN: usize = 2;
+const WOTS_N: usize = 21;
+const WOTS_W: usize = 60;
+const WOTS_STEPS: u8 = 59;
+const WOTS_SUM: usize = 679;
+const WOTS_CTR_LEN: usize = 3;
 const WOTS_PK_IN_LEN: usize = 16 + WOTS_N * N;
 
-const UPORS_HEIGHT: usize = 10;
+const UPORS_HEIGHT: usize = 11;
 const UPORS_N: usize = 3;
 const UPORS_STEPS: u8 = 23;
 const UPORS_SUM: usize = 42;
 const UPORS_C: usize = 376;
-const UPORS_K: usize = 10;
-const UPORS_M_MAX: usize = 44;
+const UPORS_K: usize = 9;
+const UPORS_M_MAX: usize = 45;
 const UPORS_CTR_LEN: usize = 4;
 const UPORS_LAYER_U8: u8 = 0x80;
-const UPORS_SELECT_MAX_DRAWS: usize = 22;
+const UPORS_SELECT_MAX_DRAWS: usize = 18;
 
 const SHORT_LEN: usize = N + 32;
 const UPORS_LEN: usize = UPORS_CTR_LEN + (UPORS_K * UPORS_N + UPORS_M_MAX) * N;
@@ -58,15 +59,15 @@ const TOP_LAYER_LEN: usize = WOTS_CTR_LEN + (WOTS_N + TOP_HEIGHT) * N;
 const MSG_DIGEST_INPUT_MAX_LEN: usize = 16 + N + N + SHORT_LEN + 1 + MAX_CONTEXT_LEN;
 
 const _: () = {
-    assert!(HYPER_BITS == 33 && WOTS_PK_IN_LEN == 400);
-    assert!(UPORS_LEN == 1188 && LOW_LAYER_LEN == 498 && TOP_LAYER_LEN == 578);
-    assert!(2 * N + UPORS_LEN + 3 * LOW_LAYER_LEN + TOP_LAYER_LEN == IMPRINT_LEN);
+    assert!(HYPER_BITS == 48 && WOTS_PK_IN_LEN == 352);
+    assert!(UPORS_LEN == 1156 && LOW_LAYER_LEN == 451 && TOP_LAYER_LEN == 547);
+    assert!(2 * N + UPORS_LEN + 5 * LOW_LAYER_LEN + TOP_LAYER_LEN == IMPRINT_LEN);
     assert!(MSG_DIGEST_INPUT_MAX_LEN == 352);
 };
 
 // Public verifier key-derivation contexts (SPEC.md, "Key-derivation contexts").
-const CTX_PUBLIC_HASH: &str = "BLINCS-128-A2 2026-11-26 public hash";
-const CTX_CONTENT: &str = "BLINCS-128-A2 2026-11-26 content";
+const CTX_PUBLIC_HASH: &str = "BLINCS-48-X 2026-11-26 public hash";
+const CTX_CONTENT: &str = "BLINCS-48-X 2026-11-26 content";
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
@@ -142,56 +143,24 @@ fn hex_unrank(mut idx: u16) -> [u8; UPORS_N] {
     unreachable!()
 }
 
-/// Zero-table `O(S)` boxcar-deconvolution Sperner unranker (`L_468(24, 40)`, zero static tables, zero heap!).
-fn sperner_unrank_zero_rom(mut rank: u128) -> [u8; WOTS_N] {
-    let mut cur = [0u128; WOTS_SUM + 1];
-    cur[0] = 1;
-    let mut prev = [0u128; WOTS_SUM + 1];
-    for _ in 0..WOTS_N {
-        let mut acc = 0u128;
-        for s in 0..=WOTS_SUM {
-            acc += cur[s];
-            if s >= WOTS_W {
-                acc -= cur[s - WOTS_W];
-            }
-            prev[s] = acc;
-        }
-        core::mem::swap(&mut cur, &mut prev);
+/// Direct 6-bit `WOTS+C(n = 21, w = 60, z = 2, S = 679)` decoder (`2 + 21 * 6 = 128` bits exact,
+/// zero static tables, zero `u128` DP, zero heap, `< 64 B` stack!).
+fn decode_wots_c(digest: &[u8; 32]) -> Option<[u8; WOTS_N]> {
+    let lo = u128::from_le_bytes(digest[..16].try_into().unwrap());
+    if (lo & 3) != 0 {
+        return None;
     }
-
-    let mut out = [0u8; WOTS_N];
-    let mut rem_s = WOTS_SUM;
-    let max_step = usize::from(WOTS_STEPS);
-    for (i, slot) in out.iter_mut().enumerate() {
-        let k_rem = WOTS_N - 1 - i;
-        let lim = rem_s.min(k_rem * max_step);
-        for s in 0..=lim {
-            let mut v = cur[s];
-            if s > 0 {
-                v = v.wrapping_sub(cur[s - 1]);
-            }
-            if s >= WOTS_W {
-                v = v.wrapping_add(prev[s - WOTS_W]);
-            }
-            prev[s] = v;
+    let mut digits = [0u8; WOTS_N];
+    let mut sum = 0usize;
+    for (i, slot) in digits.iter_mut().enumerate() {
+        let d = u8::try_from((lo >> (2 + 6 * i)) & 63).unwrap();
+        if usize::from(d) >= WOTS_W {
+            return None;
         }
-        let d_lo = rem_s.saturating_sub(lim);
-        let d_hi = rem_s.min(max_step);
-        let mut chosen = d_hi;
-        for d in d_lo..=d_hi {
-            let cnt = prev[rem_s - d];
-            if rank < cnt {
-                chosen = d;
-                break;
-            }
-            rank -= cnt;
-        }
-        *slot = u8::try_from(chosen).unwrap();
-        rem_s -= chosen;
-        core::mem::swap(&mut cur, &mut prev);
+        *slot = d;
+        sum += usize::from(d);
     }
-    assert!(rem_s == 0 && rank == 0);
-    out
+    if sum == WOTS_SUM { Some(digits) } else { None }
 }
 
 fn count_octopus_sibs(sorted_leaves: &[u16; UPORS_K]) -> usize {
@@ -252,15 +221,13 @@ fn parse_select_digest(d: &[u8; 32]) -> Option<(u64, [u16; UPORS_K], usize)> {
     Some((leaf_addr, leaves, sibs))
 }
 
-fn extract_upors_codewords(k_pub: &[u8; 32], d_seed: &[u8; 32], ctr: u32) -> [[u8; UPORS_N]; UPORS_K] {
-    let mut msg = [0u8; 52];
-    msg[16..48].copy_from_slice(d_seed);
-    msg[48..52].copy_from_slice(&ctr.to_le_bytes());
+fn extract_upors_codewords(k_pub: &[u8; 32], h_sel: &[u8; 32]) -> Option<[[u8; UPORS_N]; UPORS_K]> {
+    let mut msg = [0u8; 48];
+    msg[16..48].copy_from_slice(h_sel);
 
     let mut out = [[0u8; UPORS_N]; UPORS_K];
     let mut got = 0usize;
-    let mut block_idx = 0u16;
-    while got < UPORS_K {
+    for block_idx in 0..=u16::MAX {
         msg[..16].copy_from_slice(&tweak(TweakKind::FewCode, UPORS_LAYER_U8, 0, 0, block_idx, 0));
         let blk = keyed(k_pub, &msg);
         for j in 0..28usize {
@@ -269,13 +236,12 @@ fn extract_upors_codewords(k_pub: &[u8; 32], d_seed: &[u8; 32], ctr: u32) -> [[u
                 out[got] = hex_unrank(v);
                 got += 1;
                 if got == UPORS_K {
-                    break;
+                    return Some(out);
                 }
             }
         }
-        block_idx = block_idx.checked_add(1).expect("FewCode block_idx overflow");
     }
-    out
+    None
 }
 
 /// Returned by [`Context::try_new`] when a context slice exceeds [`MAX_CONTEXT_LEN`] (`255`) bytes.
@@ -361,17 +327,17 @@ impl fmt::Display for StreamVerifyError {
 
 impl Error for StreamVerifyError {}
 
-/// Zero-copy borrowed reference to a 3,292-byte `BLINCS-128-A2` signature.
+/// Zero-copy borrowed reference to a 3,990-byte `BLINCS-48-X` signature.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ImprintRef<'a>(&'a [u8; IMPRINT_LEN]);
 
 impl<'a> ImprintRef<'a> {
-    /// Borrow a fixed-length 3,292-byte imprint array.
+    /// Borrow a fixed-length 3,990-byte imprint array.
     pub const fn from_bytes(bytes: &'a [u8; IMPRINT_LEN]) -> Self {
         Self(bytes)
     }
 
-    /// Borrow the underlying 3,292-byte imprint array.
+    /// Borrow the underlying 3,990-byte imprint array.
     pub const fn as_bytes(&self) -> &'a [u8; IMPRINT_LEN] {
         self.0
     }
@@ -390,7 +356,7 @@ impl<'a> ImprintRef<'a> {
 
     fn layer(&self, layer: usize) -> &'a [u8] {
         let off = 2 * N + UPORS_LEN + layer * LOW_LAYER_LEN;
-        let len = if layer == 3 { TOP_LAYER_LEN } else { LOW_LAYER_LEN };
+        let len = if layer == LAYERS - 1 { TOP_LAYER_LEN } else { LOW_LAYER_LEN };
         &self.0[off..off + len]
     }
 }
@@ -409,7 +375,7 @@ impl fmt::Debug for ImprintRef<'_> {
     }
 }
 
-/// A publisher's self-certifying 32-byte `BLINCS-128-A2` identifier and verifying key (`public_seed || top_root`).
+/// A publisher's self-certifying 32-byte `BLINCS-48-X` identifier and verifying key (`public_seed || top_root`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SignetId([u8; SIGNET_ID_LEN]);
 
@@ -444,7 +410,7 @@ impl SignetId {
         keyed(&content_key, &buf[..N + ctx_len])
     }
 
-    /// Verify a 3,292-byte imprint against `ctx` and an in-memory `message` slice (zero allocation).
+    /// Verify a 3,990-byte imprint against `ctx` and an in-memory `message` slice (zero allocation).
     #[must_use = "imprint verification result must be checked"]
     pub fn verify(&self, ctx: Context<'_>, message: &[u8], imprint: ImprintRef<'_>) -> Result<(), InvalidImprint> {
         let mut v = self.verifier(ctx, imprint);
@@ -482,12 +448,12 @@ impl SignetId {
         sel_msg[48..52].copy_from_slice(&ctr_ft.to_le_bytes());
         let d_sel = keyed(&k_pub, &sel_msg);
         let (leaf_addr, leaves, sibs) = parse_select_digest(&d_sel).ok_or(InvalidImprint)?;
-        let codewords = extract_upors_codewords(&k_pub, &d_seed, ctr_ft);
+        let codewords = extract_upors_codewords(&k_pub, &d_sel).ok_or(InvalidImprint)?;
         let mut node = upors_verify(&k_pub, leaf_addr, &leaves, sibs, &codewords, upors_slice).ok_or(InvalidImprint)?;
 
         let mut addr = leaf_addr;
         for layer in 0..LAYERS {
-            let h_l = if layer == 3 { TOP_HEIGHT } else { LOW_HEIGHT };
+            let h_l = if layer == LAYERS - 1 { TOP_HEIGHT } else { LOW_HEIGHT };
             let leaf = u16::try_from(addr & ((1u64 << h_l) - 1)).unwrap();
             let tree = addr >> h_l;
             addr = tree;
@@ -642,18 +608,13 @@ fn upors_verify(
 }
 
 fn verify_layer(k_pub: &[u8; 32], layer: u8, height: usize, tree: u64, leaf: u16, child_root: &[u8; N], layer_sig: &[u8]) -> Option<[u8; N]> {
-    let ctr = u16::from_le_bytes(layer_sig[..WOTS_CTR_LEN].try_into().unwrap());
+    let ctr = u32::from_le_bytes([layer_sig[0], layer_sig[1], layer_sig[2], 0]);
     let mut msg = [0u8; 36];
     msg[..16].copy_from_slice(&tweak(TweakKind::OneTimeMsg, layer, tree, leaf, 0, 0));
     msg[16..32].copy_from_slice(child_root);
-    msg[32..36].copy_from_slice(&u32::from(ctr).to_le_bytes());
+    msg[32..36].copy_from_slice(&ctr.to_le_bytes());
     let h = keyed(k_pub, &msg);
-    if h[0] != 0 {
-        return None;
-    }
-    let mut rbuf = [0u8; 16];
-    rbuf[..15].copy_from_slice(&h[1..16]);
-    let digits = sperner_unrank_zero_rom(u128::from_le_bytes(rbuf));
+    let digits = decode_wots_c(&h)?;
 
     let chains_off = WOTS_CTR_LEN;
     let auth_off = WOTS_CTR_LEN + WOTS_N * N;
