@@ -36,9 +36,9 @@ function loadAndRun(id, sig, ctx, msg, chunkSize) {
   return verify_both(ctx.length, msg.length, chunkSize);
 }
 
-const id = hexBytes("98a5b8314b854e78f72cbadc9f5ed67c15bc2ad253cd98be1d5951595f217512");
+const id = hexBytes("eb8e97a4ff2446ed3791cfd9515e1e23982ff22b5103bc0117c3ab69db42bac4");
 const refSig = new Uint8Array(fs.readFileSync(path.join(ROOT, "test_vectors", "reference-imprint-1.bin")));
-const refCtx = new TextEncoder().encode("BLINCS-128-7x5 reference vector v1");
+const refCtx = new TextEncoder().encode("BLINCS-128-A2 reference vector v1");
 const refMsg = new TextEncoder().encode("hello, BLINCS");
 
 if (loadAndRun(id, refSig, refCtx, refMsg, 7) !== 0) {
@@ -47,7 +47,7 @@ if (loadAndRun(id, refSig, refCtx, refMsg, 7) !== 0) {
 
 // Negative checks in WASM: tampered imprint, wrong ID, wrong context, 256-byte ContextTooLong.
 const badSig = refSig.slice();
-badSig[4096] ^= 1;
+badSig[2048] ^= 1;
 if (loadAndRun(id, badSig, refCtx, refMsg, 7) !== 1) throw new Error("WASM accepted tampered sig");
 
 const badId = id.slice();

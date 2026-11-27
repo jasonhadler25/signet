@@ -1,4 +1,4 @@
-//! Signet (`BLINCS-128-7x5`) benchmark using bench-hashes' `clocks` crate: wall time and core
+//! Signet (`BLINCS-128-A2`) benchmark using bench-hashes' `clocks` crate: wall time and core
 //! cycles together, with background-load detection (`clocks::load`). All summaries are integer
 //! arithmetic over the run's totals (`sum(wall_ns) / sum(calls)`).
 

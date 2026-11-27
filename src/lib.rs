@@ -1,4 +1,4 @@
-//! Signet — a Rust implementation of the **BLINCS** (`BLINCS-128-7x5`) stateless hash-based
+//! Signet — a Rust implementation of the **BLINCS** (`BLINCS-128-A2`) stateless hash-based
 //! post-quantum signature algorithm, based on BLAKE3 and SPHINCS.
 //!
 //! **Pre-1.0 experimental software (unsupported):** formats, context strings, and APIs may change
@@ -7,11 +7,12 @@
 //! Designed for post-quantum use with a 128-bit classical security target at up to 2³² imprints
 //! per signet (do not imprint more than 2³² things with one signet; see `SPEC.md` for bounds).
 //! Runs strictly on the calling thread (`blake3-servil-core`; no background worker threads) with
-//! zero counter grinding (`7×5` uniform hypertree, `U-FORS(3, 10, 16, 64, 5, 15)`, 1 KiB top tree).
+//! a `12+7+7+7` `S-WOTS+Z` hypertree (`128 KiB` cached top tree) and zero-ROM single-tree
+//! `U-PORS` Octopus few-time signatures (`3,292`-byte imprints).
 //! Supported platforms: Linux (`x86_64`, `aarch64`) and macOS (`x86_64`, `aarch64`).
 //! Because a cryptographic key is a transferable bearer authority rather than a person's handwritten
 //! signature, this API calls the secret a [`Signet`], its 32-byte self-certifying identifier a
-//! [`SignetId`] (which names which signet you mean and verifies its imprints), and the 6,432-byte
+//! [`SignetId`] (which names which signet you mean and verifies its imprints), and the 3,292-byte
 //! proof an [`Imprint`]. Pass a domain-separating [`Context`] and the original message bytes or
 //! stream directly: BLINCS hashes the input in a single salted keyed-BLAKE3 pass under a fresh
 //! per-imprint salt.
@@ -50,6 +51,7 @@
 
 #![forbid(unsafe_code)]
 
+mod coding;
 mod content;
 mod few_time;
 mod one_time;
@@ -64,11 +66,11 @@ pub use params::{IMPRINT_LEN, MAX_CONTEXT_LEN, SEED_LEN, SIGNET_ID_LEN, SUITE_NA
 pub use randomness::Randomness;
 
 use content::{content_from_slice, content_with};
-use few_time::{build_all_ufors, parse_digest, ufors_verify};
-use one_time::{Pos, SignWorkspace, build_tree_heap, verify_layer, write_layer_signature};
+use few_time::{extract_upors_codewords, upors_verify, verify_upors_selection};
+use one_time::{build_top_tree, sign_superwave, verify_layer};
 use params::{
-    CTX_CONTENT, CTX_CONTENT_SALT, CTX_GENERATE_SIGNET, CTX_PUBLIC_SEED, CTX_RANDOMIZER, LAYER_LEN, Layer, N, PublicKey, SHORT_LEN, SecretKey, TREE_LEAVES,
-    TweakKind, UFORS_LEN, derive_key, ensure_init, first_n, keyed, tweak,
+    CTX_CONTENT, CTX_CONTENT_SALT, CTX_GENERATE_SIGNET, CTX_PUBLIC_SEED, CTX_RANDOMIZER, Layer, N, PublicKey, SHORT_LEN, SecretKey, TweakKind, UPORS_CTR_LEN,
+    UPORS_LEN, derive_key, ensure_init, first_n, keyed, tweak,
 };
 use randomness::read_os_randomness;
 use std::array::TryFromSliceError;
@@ -225,18 +227,18 @@ pub(crate) fn compute_message_digest(public_key: &PublicKey, randomizer: &[u8; N
     public_key.keyed(&buf[..96 + ctx_len])
 }
 
-/// A 6,432-byte BLINCS-128-7x5 imprint (proof produced by pressing a [`Signet`] onto a context and message).
+/// A 3,292-byte `BLINCS-128-A2` imprint (proof produced by pressing a [`Signet`] onto a context and message).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Imprint([u8; IMPRINT_LEN]);
 
 impl Imprint {
-    /// Wrap a raw 6,432-byte imprint array.
+    /// Wrap a raw 3,292-byte imprint array.
     #[must_use]
     pub fn from_bytes(bytes: &[u8; IMPRINT_LEN]) -> Self {
         Self(*bytes)
     }
 
-    /// Borrow the raw 6,432 imprint bytes.
+    /// Borrow the raw 3,292 imprint bytes.
     pub fn as_bytes(&self) -> &[u8; IMPRINT_LEN] {
         &self.0
     }
@@ -249,13 +251,13 @@ impl Imprint {
         self.0[N..2 * N].try_into().unwrap()
     }
 
-    fn ufors(&self) -> &[u8; UFORS_LEN] {
-        self.0[2 * N..2 * N + UFORS_LEN].try_into().unwrap()
+    fn upors(&self) -> &[u8; UPORS_LEN] {
+        self.0[2 * N..2 * N + UPORS_LEN].try_into().unwrap()
     }
 
     fn layer(&self, layer: Layer) -> &[u8] {
         let off = layer.sig_offset();
-        &self.0[off..off + LAYER_LEN]
+        &self.0[off..off + layer.layer_len()]
     }
 }
 
@@ -275,7 +277,7 @@ impl fmt::Debug for Imprint {
     }
 }
 
-/// A publisher's self-certifying 32-byte identifier and its complete BLINCS-128-7x5 verifying key (`public_seed || top_root`).
+/// A publisher's self-certifying 32-byte identifier and its complete `BLINCS-128-A2` verifying key (`public_seed || top_root`).
 ///
 /// Receiving a `SignetId` does not authenticate the sender: obtain the expected `SignetId` from a
 /// pinned or authenticated channel and call `expected_publisher.verify(ctx, message, &imprint)?`.
@@ -351,28 +353,30 @@ impl SignetId {
         if !ct_eq_n(imprint.salt(), short[..N].try_into().unwrap()) {
             return Err(InvalidImprint);
         }
-        let digest = compute_message_digest(&self.public_key, imprint.randomizer(), self.root(), short, ctx);
+        let d_seed = compute_message_digest(&self.public_key, imprint.randomizer(), self.root(), short, ctx);
         let public = self.public_key.hasher(false);
-        let (ufors_sel, leaf_addr) = parse_digest(&digest);
-        let coords = leaf_addr.split_layers();
-
-        let mut node = ufors_verify(&public, leaf_addr, &ufors_sel, imprint.ufors());
+        let upors_slice = imprint.upors();
+        let ctr_ft = u32::from_le_bytes(upors_slice[..UPORS_CTR_LEN].try_into().unwrap());
+        let sel = verify_upors_selection(&public, &d_seed, ctr_ft).ok_or(InvalidImprint)?;
+        let codewords = extract_upors_codewords(&self.public_key, &d_seed, ctr_ft);
+        let mut node = upors_verify(&public, &sel, &codewords, upors_slice).ok_or(InvalidImprint)?;
+        let coords = sel.leaf_addr.split_layers();
         for layer in Layer::ALL {
             let (tree, leaf) = coords[layer.index()];
-            node = verify_layer(&public, Pos::new(layer, tree, leaf), &node, imprint.layer(layer));
+            node = verify_layer(&public, layer, tree, leaf, &node, imprint.layer(layer)).ok_or(InvalidImprint)?;
         }
         if ct_eq_n(&node, self.root()) { Ok(()) } else { Err(InvalidImprint) }
     }
 }
 
-/// A BLINCS-128-7x5 signet (bearer authority derived from a 32-byte seed, holding the 1 KiB top hypertree in memory).
+/// A `BLINCS-128-A2` signet (bearer authority derived from a 32-byte seed, caching the `128 KiB` height-12 top hypertree in memory).
 pub struct Signet {
     seed: [u8; SEED_LEN],
     secret_key: SecretKey,
     salt_key: [u8; 32],
     randomizer_key: [u8; 32],
     id: SignetId,
-    top_tree: [[u8; N]; 2 * TREE_LEAVES],
+    top_tree: Box<[[u8; N]]>,
 }
 
 impl fmt::Debug for Signet {
@@ -397,8 +401,8 @@ impl Signet {
         Ok(Self::from_seed(&seed))
     }
 
-    /// Derive a signet from a persisted 32-byte `seed`, building the 1 KiB top hypertree on the
-    /// calling thread.
+    /// Derive a signet from a persisted 32-byte `seed`, building and caching the `128 KiB`
+    /// height-12 top hypertree on the calling thread.
     ///
     /// Performs no entropy check on `seed`. For creating new signets, use [`Signet::generate`].
     #[must_use]
@@ -410,8 +414,7 @@ impl Signet {
         let public_seed = first_n(&derive_key(CTX_PUBLIC_SEED, seed));
         let public_key = PublicKey::from_seed(&public_seed);
 
-        let mut ws = SignWorkspace::new(false);
-        let top_tree = build_tree_heap(&secret_key, &public_key, Layer::TOP, 0, &mut ws);
+        let top_tree = build_top_tree(&secret_key, &public_key);
 
         let mut id_bytes = [0u8; SIGNET_ID_LEN];
         id_bytes[..N].copy_from_slice(&public_seed);
@@ -430,33 +433,10 @@ impl Signet {
     }
 
     fn finish_imprint(&self, ctx: Context<'_>, short: &[u8; SHORT_LEN]) -> Imprint {
-        let mut sig = [0u8; IMPRINT_LEN];
+        let salt: &[u8; N] = short[..N].try_into().unwrap();
         let randomizer = compute_randomizer(&self.randomizer_key, short, ctx);
-        sig[..N].copy_from_slice(&short[..N]);
-        sig[N..2 * N].copy_from_slice(&randomizer);
-
-        let digest = compute_message_digest(&self.id.public_key, &randomizer, self.id.root(), short, ctx);
-        let (ufors_sel, leaf_addr) = parse_digest(&digest);
-        let coords = leaf_addr.split_layers();
-        let (sec, pubk) = (self.secret_key, self.id.public_key);
-        let mut ws = SignWorkspace::new(true);
-
-        let ufors_slice: &mut [u8; UFORS_LEN] = (&mut sig[2 * N..2 * N + UFORS_LEN]).try_into().unwrap();
-        let mut node = build_all_ufors(&sec, &pubk, leaf_addr, &ufors_sel, &mut ws, ufors_slice);
-
-        // Build the 6 lower Merkle heaps and imprint all 7 uniform hypertree layers.
-        for layer in Layer::LOWER {
-            let (tree, leaf) = coords[layer.index()];
-            let heap = build_tree_heap(&sec, &pubk, layer, tree, &mut ws);
-            let off = layer.sig_offset();
-            write_layer_signature(&sec, &pubk, Pos::new(layer, tree, leaf), &node, &heap, &mut sig[off..off + LAYER_LEN]);
-            node = heap[1];
-        }
-        let (top_tree_idx, top_leaf) = coords[Layer::TOP.index()];
-        assert_eq!(top_tree_idx, 0);
-        let off = Layer::TOP.sig_offset();
-        write_layer_signature(&sec, &pubk, Pos::new(Layer::TOP, top_tree_idx, top_leaf), &node, &self.top_tree, &mut sig[off..off + LAYER_LEN]);
-
+        let d_seed = compute_message_digest(&self.id.public_key, &randomizer, self.id.root(), short, ctx);
+        let sig = sign_superwave(&self.secret_key, &self.id.public_key, salt, &randomizer, &d_seed, &self.top_tree);
         let imprint = Imprint(sig);
         assert!(self.id.verify_short(ctx, short, &imprint).is_ok(), "internal error: generated imprint failed self-verification");
         imprint

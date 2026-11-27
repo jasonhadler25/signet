@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static and dynamic domain-separation & tweak-uniqueness check for Signet (BLINCS-128-7x5)."""
+"""Static and dynamic domain-separation & tweak-uniqueness check for Signet (BLINCS-128-A2)."""
 
 import os
 import re
@@ -9,7 +9,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC_DIR = os.path.join(ROOT, "src")
 
 SECRET_KINDS = {"ChainSecret"}
-PUBLIC_KINDS = {"Chain", "OneTimeKey", "Node", "FewRoot", "Message"}
+PUBLIC_KINDS = {"Chain", "OneTimeKey", "Node", "OneTimeMsg", "Message", "FewSelect", "FewCode"}
 ALL_KINDS = SECRET_KINDS | PUBLIC_KINDS
 
 # Mapping between Rust TweakKind CamelCase variant names and SPEC.md SCREAMING_SNAKE names.
@@ -18,8 +18,10 @@ KIND_TO_SPEC = {
     "Chain": "CHAIN",
     "OneTimeKey": "ONE_TIME_KEY",
     "Node": "NODE",
-    "FewRoot": "FEW_ROOT",
+    "OneTimeMsg": "ONE_TIME_MSG",
     "Message": "MESSAGE",
+    "FewSelect": "FEW_SELECT",
+    "FewCode": "FEW_CODE",
 }
 
 
@@ -50,8 +52,8 @@ def strip_cfg_test_items(src):
 
 
 def parse_spec_contexts(spec_text):
-    """Parse exact name -> value table from SPEC.md 'Key-derivation contexts', rejecting duplicate rows."""
-    m = re.search(r"## Key-derivation contexts(.*?)(?=\n## |\Z)", spec_text, re.S)
+    """Parse exact name -> value table from SPEC.md Key-Derivation Contexts, rejecting duplicate rows."""
+    m = re.search(r"## (?:\d+\.\s+)?Key-[Dd]erivation [Cc]ontexts(.*?)(?=\n## |\Z)", spec_text, re.S)
     if not m:
         return None, ["Key-derivation contexts table not found in SPEC.md"]
     rows = re.findall(r'^\|\s*`([A-Z0-9_]+)`\s*\|\s*`"([^"]+)"`\s*\|', m.group(1), re.M)
@@ -65,8 +67,8 @@ def parse_spec_contexts(spec_text):
 
 
 def parse_spec_tweaks(spec_text):
-    """Parse exact tag -> (SPEC_NAME, key_role) table from SPEC.md 'Tweaks', rejecting duplicate rows."""
-    m = re.search(r"## Tweaks(.*?)(?=\n## |\Z)", spec_text, re.S)
+    """Parse exact tag -> (SPEC_NAME, key_role) table from SPEC.md Tweaks, rejecting duplicate rows."""
+    m = re.search(r"## (?:\d+\.\s+)?Tweaks(.*?)(?=\n## |\Z)", spec_text, re.S)
     if not m:
         return None, ["Tweaks table not found in SPEC.md"]
     rows = re.findall(r"^\|\s*(\d+)\s*\|\s*`([A-Z0-9_]+)`\s*\|\s*`(K_sec|K_pub)`\s*\|", m.group(1), re.M)
@@ -113,8 +115,8 @@ def check_static(params_src, spec_text, shipped_sources, verify_src=None):
     rust_tweak_map = {}
     for name, raw_tag in kinds:
         tag = int(raw_tag)
-        if not (1 <= tag <= 6):
-            errors.append(f"TweakKind::{name} tag {tag} outside 1..=6")
+        if not (1 <= tag <= 8):
+            errors.append(f"TweakKind::{name} tag {tag} outside 1..=8")
         if tag in rust_tweak_map:
             errors.append(f"duplicate TweakKind tag {tag} for {name} and {rust_tweak_map[tag]}")
         role = "K_sec" if name in SECRET_KINDS else "K_pub"
@@ -141,7 +143,7 @@ def check_static(params_src, spec_text, shipped_sources, verify_src=None):
                 errors.append(f"signet-verify TweakKind {v_tweaks} != expected {want_v_tweaks}")
 
     # 3. Structural key-role boundary: SecretKey never exports a raw TreeHasher, and secret tweak
-    # kinds (ChainSecret, FewSecret) may appear ONLY inside src/params.rs (SecretKey methods),
+    # kinds (ChainSecret) may appear ONLY inside src/params.rs (SecretKey methods),
     # while public tweak kinds appear only in algorithm modules outside SecretKey.
     sec_impl = re.search(r"impl\s+SecretKey\s*\{(.*?)\n\}", params_src, re.S)
     if not sec_impl or re.search(r"\bfn\s+hasher\b|->\s*TreeHasher\b", sec_impl.group(1)):
@@ -165,16 +167,16 @@ def check_static(params_src, spec_text, shipped_sources, verify_src=None):
 
 
 def self_test(params_src, spec_text, shipped_sources, verify_src):
-    bad_ctx = params_src.replace('"BLINCS-128-7x5 2026-11-26 content"', '"BLINCS-128-7x5 2026-11-26 public hash"', 1)
+    bad_ctx = params_src.replace('"BLINCS-128-A2 2026-11-26 content"', '"BLINCS-128-A2 2026-11-26 public hash"', 1)
     ctx_errs = check_static(bad_ctx, spec_text, shipped_sources, verify_src)
     if not any("duplicate context string" in e for e in ctx_errs):
         raise RuntimeError(f"self-test failed: duplicate CTX diagnostic not triggered: {ctx_errs}")
 
-    bad_spec = spec_text.replace('| `CONTENT` | `"BLINCS-128-7x5 2026-11-26 content"` |', '| `CONTENT` | `"BLINCS-128-7x5 2026-11-26 wrong"` |', 1)
+    bad_spec = spec_text.replace('| `CONTENT` | `"BLINCS-128-A2 2026-11-26 content"` |', '| `CONTENT` | `"BLINCS-128-A2 2026-11-26 wrong"` |', 1)
     if not check_static(params_src, bad_spec, shipped_sources, verify_src):
         raise RuntimeError("self-test failed: SPEC.md name-to-value mismatch escaped")
 
-    bad_tag = params_src.replace("Message = 6,", "Message = 5,", 1)
+    bad_tag = params_src.replace("FewCode = 8,", "FewCode = 7,", 1)
     tag_errs = check_static(bad_tag, spec_text, shipped_sources, verify_src)
     if not any("duplicate TweakKind tag" in e for e in tag_errs):
         raise RuntimeError(f"self-test failed: duplicate TweakKind tag escaped: {tag_errs}")
@@ -184,7 +186,7 @@ def self_test(params_src, spec_text, shipped_sources, verify_src):
     if not check_static(params_src, spec_text, bad_role, verify_src):
         raise RuntimeError("self-test failed: secret tweak outside SecretKey escaped")
 
-    bad_verify = verify_src.replace("Message = 6,", "Message = 5,", 1)
+    bad_verify = verify_src.replace("FewCode = 8,", "FewCode = 7,", 1)
     if not check_static(params_src, spec_text, shipped_sources, bad_verify):
         raise RuntimeError("self-test failed: signet-verify TweakKind mismatch escaped")
 
@@ -200,8 +202,8 @@ def check_dynamic_reference():
     derived_ctxs = set()
     ver_sec_tweaks = []
     ver_pub_tweaks = []
-    ufors_sec_tweaks = []
-    ufors_pub_tweaks = []
+    upors_sec_tweaks = []
+    upors_pub_tweaks = []
     wots_sec_tweaks = []
     wots_pub_tweaks = []
 
@@ -209,9 +211,9 @@ def check_dynamic_reference():
     k_sec_expected = orig_derive(blincs.CTX_SECRET_VALUES, seed)
     pk_seed = orig_derive(blincs.CTX_PUBLIC_SEED, seed)[:16]
     k_pub_expected = orig_derive(blincs.CTX_PUBLIC_HASH, pk_seed)
-    id_bytes = bytes.fromhex("98a5b8314b854e78f72cbadc9f5ed67c15bc2ad253cd98be1d5951595f217512")
+    id_bytes = bytes.fromhex("eb8e97a4ff2446ed3791cfd9515e1e23982ff22b5103bc0117c3ab69db42bac4")
     imp_bytes = open(os.path.join(ROOT, "test_vectors", "reference-imprint-1.bin"), "rb").read()
-    ref_ctx = b"BLINCS-128-7x5 reference vector v1"
+    ref_ctx = b"BLINCS-128-A2 reference vector v1"
 
     bucket = [ver_sec_tweaks, ver_pub_tweaks]
 
@@ -235,16 +237,16 @@ def check_dynamic_reference():
         if not sid.verify(ref_ctx, b"hello, BLINCS", imp_bytes):
             raise RuntimeError("reference verification failed")
 
-        bucket[0], bucket[1] = ufors_sec_tweaks, ufors_pub_tweaks
-        ufors_leaves = [
-            blincs.chain_leaf(k_sec_expected, k_pub_expected, blincs.UFORS_LAYER_BASE, 42, i, blincs.UFORS_CHAINS, blincs.UFORS_STEPS)
+        bucket[0], bucket[1] = upors_sec_tweaks, upors_pub_tweaks
+        upors_leaves = [
+            blincs.chain_leaf(k_sec_expected, k_pub_expected, blincs.UPORS_LAYER, 42, i, blincs.UPORS_N, blincs.UPORS_STEPS)
             for i in range(4)
         ]
-        _ = blincs.merkle_tree(k_pub_expected, blincs.UFORS_LAYER_BASE, 42, ufors_leaves)
+        _ = blincs.merkle_tree(k_pub_expected, blincs.UPORS_LAYER, 42, upors_leaves)
 
         bucket[0], bucket[1] = wots_sec_tweaks, wots_pub_tweaks
         wots_leaves = [
-            blincs.chain_leaf(k_sec_expected, k_pub_expected, 0, 7, leaf, blincs.CHAINS, blincs.CHAIN_STEPS)
+            blincs.chain_leaf(k_sec_expected, k_pub_expected, 0, 7, leaf, blincs.WOTS_N, blincs.WOTS_STEPS)
             for leaf in range(4)
         ]
         _ = blincs.merkle_tree(k_pub_expected, 0, 7, wots_leaves)
@@ -254,13 +256,13 @@ def check_dynamic_reference():
 
     if len(ver_sec_tweaks) != 0 or len(ver_pub_tweaks) == 0 or len(ver_pub_tweaks) != len(set(ver_pub_tweaks)):
         raise RuntimeError("verify tweak invariant failed")
-    if len(ufors_sec_tweaks) != 4 * 3 or len(set(ufors_sec_tweaks)) != 4 * 3 or len(ufors_pub_tweaks) != len(set(ufors_pub_tweaks)):
-        raise RuntimeError("U-FORS tweak invariant failed")
-    if len(wots_sec_tweaks) != 4 * 35 or len(set(wots_sec_tweaks)) != 4 * 35 or len(wots_pub_tweaks) != len(set(wots_pub_tweaks)):
-        raise RuntimeError("WOTS tweak invariant failed")
-    if not set(ufors_sec_tweaks).isdisjoint(wots_sec_tweaks) or not set(ufors_pub_tweaks).isdisjoint(wots_pub_tweaks):
-        raise RuntimeError("U-FORS and WOTS tweaks overlapped")
-    return len(ver_pub_tweaks), len(ufors_pub_tweaks), len(wots_pub_tweaks), len(derived_ctxs)
+    if len(upors_sec_tweaks) != 4 * blincs.UPORS_N or len(set(upors_sec_tweaks)) != 4 * blincs.UPORS_N or len(upors_pub_tweaks) != len(set(upors_pub_tweaks)):
+        raise RuntimeError("U-PORS tweak invariant failed")
+    if len(wots_sec_tweaks) != 4 * blincs.WOTS_N or len(set(wots_sec_tweaks)) != 4 * blincs.WOTS_N or len(wots_pub_tweaks) != len(set(wots_pub_tweaks)):
+        raise RuntimeError("S-WOTS+Z tweak invariant failed")
+    if not set(upors_sec_tweaks).isdisjoint(wots_sec_tweaks) or not set(upors_pub_tweaks).isdisjoint(wots_pub_tweaks):
+        raise RuntimeError("U-PORS and S-WOTS+Z tweaks overlapped")
+    return len(ver_pub_tweaks), len(upors_pub_tweaks), len(wots_pub_tweaks), len(derived_ctxs)
 
 
 def main():
@@ -279,10 +281,10 @@ def main():
             print("FAIL:", e, file=sys.stderr)
         return 1
 
-    n_ver, n_ufors, n_wots, n_ctx = check_dynamic_reference()
+    n_ver, n_upors, n_wots, n_ctx = check_dynamic_reference()
     print(
-        f"domain_sep.py PASSED (self-test 5/5 caught; 11 CTX + 6 TweakKind SPEC-table exact match, SecretKey boundary & signet-verify parity; "
-        f"dynamic trace: {n_ver} unique verify K_pub / 0 K_sec, {n_ufors} U-FORS + {n_wots} WOTS+/Merkle disjoint tweaks, {n_ctx} contexts)."
+        f"domain_sep.py PASSED (self-test 5/5 caught; 11 CTX + 8 TweakKind SPEC-table exact match, SecretKey boundary & signet-verify parity; "
+        f"dynamic trace: {n_ver} unique verify K_pub / 0 K_sec, {n_upors} U-PORS + {n_wots} S-WOTS+Z/Merkle disjoint tweaks, {n_ctx} contexts)."
     )
     return 0
 

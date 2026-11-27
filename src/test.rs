@@ -1,16 +1,19 @@
 include!("../tools/require_nextest.rs");
 
+use crate::coding::{hex_unrank, rank_from_15_bytes, sperner_unrank};
 use crate::content::{content_from_slice, content_with, derive_msg_key};
-use crate::few_time::{UforsSel, build_all_ufors, parse_digest, ufors_verify};
-use crate::one_time::{Pos, SignWorkspace, advance_chains, digits};
+use crate::few_time::{count_octopus_sibs, extract_upors_codewords, parse_select_digest, verify_upors_selection};
+use crate::one_time::verify_wots_msg;
 use crate::params::{
-    CHAIN_STEPS, CHAINS, CTX_CONTENT, HYPER_BITS, IMPRINT_LEN, LAYER_LEN, Layer, LeafAddr, MAX_CONTEXT_LEN, MSG_CHAINS, N, PublicKey, SUITE_NAME, SecretKey,
-    TweakKind, UFORS_CODE, UFORS_LEN, UFORS_STEPS, UFORS_SUM, UFORS_TREES, derive_key, ensure_init, read_bits, tweak,
+    CTX_CONTENT, HYPER_BITS, IMPRINT_LEN, Layer, LeafAddr, MAX_CONTEXT_LEN, N, PublicKey, SUITE_NAME, TOP_LAYER_LEN, TweakKind, UPORS_C, UPORS_CTR_LEN,
+    UPORS_HEIGHT, UPORS_K, UPORS_LEN, UPORS_M_MAX, UPORS_N, UPORS_SELECT_MAX_DRAWS, UPORS_STEPS, UPORS_SUM, WOTS_N, WOTS_STEPS, WOTS_SUM, derive_key,
+    ensure_init, read_bits, tweak,
 };
 use crate::randomness::{SEED_FILE_LEN, expand_pool, mix_pool, read_exact_seed, read_monotonic_clock, read_os_randomness};
 use crate::{
     Context, ContextTooLong, Imprint, InvalidImprint, Randomness, SEED_LEN, SIGNET_ID_LEN, Signet, SignetId, VerifyError, compute_message_digest, generate_seed,
 };
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fs;
 use std::io::{self, Cursor, ErrorKind, Read, Write};
@@ -19,8 +22,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
-const REF_VK_HEX: &str = "98a5b8314b854e78f72cbadc9f5ed67c15bc2ad253cd98be1d5951595f217512";
-const REF_CTX: Context<'static> = Context::new(b"BLINCS-128-7x5 reference vector v1");
+const REF_VK_HEX: &str = "eb8e97a4ff2446ed3791cfd9515e1e23982ff22b5103bc0117c3ab69db42bac4";
+const REF_CTX: Context<'static> = Context::new(b"BLINCS-128-A2 reference vector v1");
 const TEST_CTX: Context<'static> = Context::new(b"signet unit test v1");
 
 fn from_hex(s: &str) -> Vec<u8> {
@@ -110,7 +113,7 @@ impl Read for FailAfterReader {
 
 #[test]
 fn reference_vector_and_intermediate_kats_match_python_byte_for_byte() {
-    assert_eq!(SUITE_NAME, "BLINCS-128-7x5");
+    assert_eq!(SUITE_NAME, "BLINCS-128-A2");
     let seed: [u8; SEED_LEN] = core::array::from_fn(|i| u8::try_from(i).unwrap());
     let draw = [7u8; 32];
     let msg = b"hello, BLINCS";
@@ -123,24 +126,30 @@ fn reference_vector_and_intermediate_kats_match_python_byte_for_byte() {
     assert_eq!(expected.len(), IMPRINT_LEN);
     let ref_sig = Imprint::try_from(expected.as_slice()).unwrap();
 
-    // Intermediate Known Answer Tests (KATs) matching reference/blincs.py.
+    // Intermediate Known Answer Tests (KATs) matching blincs/SPEC.md & reference/blincs.py.
     let e: [u8; N] = ref_sig.as_bytes()[..N].try_into().unwrap();
     let r: [u8; N] = ref_sig.as_bytes()[N..2 * N].try_into().unwrap();
-    assert_eq!(to_hex(&e), "3ee655b325f3fef998372326a6ad5bd4");
-    assert_eq!(to_hex(&r), "4f6bc05208d26834de62980950f120c4");
+    assert_eq!(to_hex(&e), "73eabb4a158088cb5560a0ac53a56f94");
+    assert_eq!(to_hex(&r), "99b91679fcf65f9a5c6921f33e560c35");
     let ck = derive_key(CTX_CONTENT, sk.id().as_bytes());
     let k_msg = derive_msg_key(&ck, &e, REF_CTX);
-    assert_eq!(to_hex(&k_msg), "10dc74ca12332248a57f4a7d634d0e33a66e328daefc974846b4f797357bc9b0");
+    assert_eq!(to_hex(&k_msg), "e81dcdc2fbf14d588961d18dbf8d8c13d0b88d9620c91fa4b1d9d3e5bc803867");
     let short = content_from_slice(&ck, &e, REF_CTX, msg);
-    assert_eq!(to_hex(&short[N..]), "97519fba890010cfb56d70e5b362d7a7a08acc9ed03a55b961abe1f67c1812f3");
+    assert_eq!(to_hex(&short[N..]), "e02cefa736d2adf65658b8271bc8edb4216696b1291a83d66b2a4afadf78ab38");
     let pk = PublicKey::from_seed(sk.id().as_bytes()[..N].try_into().unwrap());
     let root: [u8; N] = sk.id().as_bytes()[N..].try_into().unwrap();
-    let d = compute_message_digest(&pk, &r, &root, &short, REF_CTX);
-    assert_eq!(to_hex(&d), "e68bbde745c55884532af2f0ebeb2fa98e03de57be31ca2cb88ec347edff9495");
-    let (ufors_sel, leaf_addr) = parse_digest(&d);
-    assert_eq!(ufors_sel[0], UforsSel { leaf: 6, code: 31 });
-    assert_eq!(ufors_sel[14], UforsSel { leaf: 21, code: 60 });
-    assert_eq!(leaf_addr.as_u64(), 0x5c166518d);
+    let d_seed = compute_message_digest(&pk, &r, &root, &short, REF_CTX);
+    assert_eq!(to_hex(&d_seed), "b5044d6e9253abc1cdb13893663db4531e015000ca5a666f5521c11a18f8b69f");
+
+    let ctr_ft = u32::from_le_bytes(ref_sig.as_bytes()[2 * N..2 * N + UPORS_CTR_LEN].try_into().unwrap());
+    assert_eq!(ctr_ft, 2049);
+    let sel = verify_upors_selection(&pk.hasher(false), &d_seed, ctr_ft).unwrap();
+    assert_eq!(sel.leaf_addr.as_u64(), 0x166278a1d);
+    assert_eq!(sel.sibs, 44);
+    let cws = extract_upors_codewords(&pk, &d_seed, ctr_ft);
+    for cw in &cws {
+        assert_eq!(cw.iter().map(|&x| usize::from(x)).sum::<usize>(), UPORS_SUM);
+    }
 
     let rust_sig = sk.imprint_with_draw(&draw, REF_CTX, msg);
     assert_eq!(rust_sig.as_bytes().as_slice(), expected.as_slice());
@@ -191,7 +200,6 @@ fn context_validation_framing_and_error_contracts() {
     assert_eq!(Context::try_from(over_bytes.as_slice()).unwrap_err(), err);
     assert!(catch_unwind(|| Context::new(&over_bytes)).is_err());
 
-    // Distinct contexts and length-framing boundaries cannot cross-verify, and derive_msg_key itself binds ctx.
     let sk = Signet::from_seed(&[0x31u8; SEED_LEN]);
     let vk = sk.id();
     let ck = derive_key(CTX_CONTENT, vk.as_bytes());
@@ -203,7 +211,6 @@ fn context_validation_framing_and_error_contracts() {
     assert_eq!(vk.verify(Context::new(b"abc"), b"", &sig_ab_c), Err(InvalidImprint));
     assert_eq!(vk.verify(Context::EMPTY, b"abc", &sig_ab_c), Err(InvalidImprint));
 
-    // Error Display / Error::source / From conversions on InvalidImprint and VerifyError.
     assert!(InvalidImprint.to_string().contains("invalid"));
     let ve_inv: VerifyError = InvalidImprint.into();
     assert!(matches!(ve_inv, VerifyError::Invalid));
@@ -229,7 +236,6 @@ fn context_validation_framing_and_error_contracts() {
         }),
         Err(VerifyError::Source(e)) if e.kind() == ErrorKind::BrokenPipe
     ));
-    // Verify custom non-io::Error producer error types work cleanly too.
     assert!(matches!(vk.verify_with(Context::new(b"ab"), &sig_ab_c, |_sink| Err("custom failure")), Err(VerifyError::Source("custom failure"))));
 }
 
@@ -243,136 +249,160 @@ fn verify_short_rejects_mismatched_salt_against_short() {
     let short = content_from_slice(&ck, &salt, TEST_CTX, b"salt-check");
     vk.verify_short(TEST_CTX, &short, &sig).unwrap();
 
-    // Corrupt only imprint.salt() (sig[0]) while keeping short intact: D and all trees still match,
-    // so ONLY the explicit ct_eq_n(imprint.salt(), short[..N]) check in verify_short rejects this.
     let mut bad_raw = *sig.as_bytes();
     bad_raw[0] ^= 0x01;
     assert_eq!(vk.verify_short(TEST_CTX, &short, &Imprint::from_bytes(&bad_raw)), Err(InvalidImprint));
 }
 
 #[test]
-fn wots_digits_and_checksum_boundaries() {
-    let d0 = digits(&[0u8; N]);
-    assert!(d0[..MSG_CHAINS].iter().all(|&x| x == 0));
-    assert_eq!(&d0[MSG_CHAINS..], &[0, 14, 1]);
-
-    let dmax = digits(&[0xffu8; N]);
-    assert!(dmax[..MSG_CHAINS].iter().all(|&x| x == 15));
-    assert_eq!(&dmax[MSG_CHAINS..], &[0, 0, 0]);
-
-    let mut one = [0u8; N];
-    one[0] = 1;
-    let d1 = digits(&one);
-    assert_eq!(&d1[MSG_CHAINS..], &[15, 13, 1]);
-
-    let node: [u8; N] = core::array::from_fn(|i| {
-        let hi = u8::try_from(i).unwrap();
-        let lo = u8::try_from(15 - i).unwrap();
-        (hi << 4) | lo
-    });
-    let dm = digits(&node);
-    for i in 0..N {
-        assert_eq!(dm[2 * i], u8::try_from(15 - i).unwrap());
-        assert_eq!(dm[2 * i + 1], u8::try_from(i).unwrap());
-    }
-    let expected_csum: u16 = dm[..MSG_CHAINS].iter().map(|&v| 15 - u16::from(v)).sum();
-    assert_eq!(expected_csum, 240);
-    assert_eq!(&dm[MSG_CHAINS..], &[0, 15, 0]);
-}
-
-#[test]
-fn parse_digest_extracts_all_ufors_selections_and_35bit_leaf_addr() {
-    let expected_sel: [UforsSel; UFORS_TREES] =
-        core::array::from_fn(|t| UforsSel { leaf: u8::try_from((t * 7 + 3) & 31).unwrap(), code: u8::try_from((t * 11 + 5) & 63).unwrap() });
-    let expected_addr = (1u64 << (HYPER_BITS - 1)) | 0x0123_4567;
-    let mut d = [0u8; 32];
-    let set_bits = |buf: &mut [u8; 32], bit_off: usize, width: usize, val: u64| {
-        for i in 0..width {
-            if (val >> i) & 1 != 0 {
-                let b = bit_off + i;
-                buf[b / 8] |= 1u8 << (b % 8);
-            }
+fn hex_and_sperner_unranking_and_fast_select_parser_are_exact() {
+    // 1. Exhaustive bijection check for hex_unrank across all 376 codewords in L_42(3, 24).
+    let mut seen = BTreeSet::new();
+    let mut prev: Option<[u8; UPORS_N]> = None;
+    for idx in 0..u16::try_from(UPORS_C).unwrap() {
+        let cw = hex_unrank(idx);
+        assert!(cw.iter().all(|&d| d <= UPORS_STEPS));
+        assert_eq!(cw.iter().map(|&d| usize::from(d)).sum::<usize>(), UPORS_SUM);
+        if let Some(p) = prev {
+            assert!(p < cw, "hex_unrank must be strictly lexicographic");
         }
-    };
-    for (t, s) in expected_sel.iter().enumerate() {
-        set_bits(&mut d, 11 * t, 5, u64::from(s.leaf));
-        set_bits(&mut d, 11 * t + 5, 6, u64::from(s.code));
+        prev = Some(cw);
+        assert!(seen.insert(cw));
     }
-    set_bits(&mut d, 165, HYPER_BITS, expected_addr);
-    // Unused top 56 bits (200..256) set to 1 must be ignored by parse_digest and masked by LeafAddr.
-    d[25..32].fill(0xff);
+    assert_eq!(seen.len(), UPORS_C);
+    assert!(catch_unwind(|| hex_unrank(u16::try_from(UPORS_C).unwrap())).is_err());
 
-    let (sel, addr) = parse_digest(&d);
-    assert_eq!(sel, expected_sel);
-    assert_eq!(addr.as_u64(), expected_addr);
-    assert_eq!(LeafAddr::from_digest_word(expected_addr | (0x1fff_ffff_u64 << HYPER_BITS)).as_u64(), expected_addr);
+    // 2. Sperner unrank bounds, exact sum 468, strict lexicographic monotonicity, and 15-byte rank extraction.
+    let ranks = [0u128, 1, 42, (1u128 << 64) - 1, 1u128 << 100, (1u128 << 120) - 2, (1u128 << 120) - 1];
+    let mut prev_s: Option<[u8; WOTS_N]> = None;
+    for r in ranks {
+        let d = sperner_unrank(r);
+        assert!(d.iter().all(|&x| x <= WOTS_STEPS));
+        assert_eq!(d.iter().map(|&x| usize::from(x)).sum::<usize>(), WOTS_SUM);
+        if let Some(p) = prev_s {
+            assert!(p < d, "sperner_unrank must be strictly increasing");
+            assert!((0..WOTS_N).any(|c| p[c] < d[c]) && (0..WOTS_N).any(|c| d[c] < p[c]));
+        }
+        prev_s = Some(d);
+    }
+    assert_eq!(rank_from_15_bytes(&[0xffu8; 15]), (1u128 << 120) - 1);
+    assert_eq!(rank_from_15_bytes(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 1);
 
-    // Exercise read_bits right at the end of the 32-byte digest (byte_off > 24 => avail < 8).
+    // 3. LeafAddr 33-bit masking & read_bits tail check.
+    let expected_addr = (1u64 << (HYPER_BITS - 1)) | 0x0123_4567;
+    assert_eq!(LeafAddr::from_word(expected_addr | (0x7fff_ffff_u64 << HYPER_BITS)).as_u64(), expected_addr);
+    let splits = LeafAddr::from_word(expected_addr).split_layers();
+    assert_eq!(splits[3].0, 0);
     let mut tail = [0u8; 32];
     tail[30] = 0b1010_0101;
     tail[31] = 0b1101_0011;
     assert_eq!(read_bits(&tail, 240, 16), 0b1101_0011_1010_0101);
     assert_eq!(read_bits(&tail, 250, 6), 0b11_0100);
 
-    // Exhaustively verify UFORS_CODE matches its mathematical extreme-variance definition.
-    let mut all = Vec::new();
-    for a in 0..=UFORS_STEPS {
-        for b in 0..=UFORS_STEPS {
-            let s = usize::from(a) + usize::from(b);
-            if s <= UFORS_SUM && UFORS_SUM - s <= usize::from(UFORS_STEPS) {
-                all.push([a, b, u8::try_from(UFORS_SUM - s).unwrap()]);
+    // 4. Differential parity: fast u128+u64 early-out `parse_select_digest` vs naive reference loop over 20,000 digests.
+    let naive_parse = |d: &[u8; 32]| -> Option<(LeafAddr, [u16; UPORS_K], usize)> {
+        let mut leaves = [0u16; UPORS_K];
+        let mut found = 0usize;
+        for i in 0..UPORS_SELECT_MAX_DRAWS {
+            let x = u16::try_from(read_bits(d, i * UPORS_HEIGHT, UPORS_HEIGHT)).unwrap();
+            if !leaves[..found].contains(&x) {
+                leaves[found] = x;
+                found += 1;
+                if found == UPORS_K {
+                    break;
+                }
             }
         }
+        if found < UPORS_K {
+            return None;
+        }
+        leaves.sort_unstable();
+        let sibs = count_octopus_sibs(&leaves);
+        if sibs > UPORS_M_MAX {
+            return None;
+        }
+        let leaf_addr = LeafAddr::from_word(read_bits(d, UPORS_SELECT_MAX_DRAWS * UPORS_HEIGHT, HYPER_BITS));
+        Some((leaf_addr, leaves, sibs))
+    };
+    let mut state = 0x1234_5678_9abc_def0_u64;
+    let mut accepted = 0usize;
+    for _ in 0..20_000usize {
+        let mut d = [0u8; 32];
+        for chunk in d.as_chunks_mut::<8>().0 {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            chunk.copy_from_slice(&(z ^ (z >> 31)).to_le_bytes());
+        }
+        let fast = parse_select_digest(&d);
+        let slow = naive_parse(&d);
+        assert_eq!(fast, slow, "fast early-out parse_select_digest diverged from naive reference");
+        if fast.is_some() {
+            accepted += 1;
+        }
     }
-    let mut by_norm = all.clone();
-    by_norm.sort_by_key(|&[a, b, c]| (u16::from(a) * u16::from(a) + u16::from(b) * u16::from(b) + u16::from(c) * u16::from(c), [a, b, c]));
-    let dropped = &by_norm[..all.len() - 64];
-    let expected_code: Vec<[u8; 3]> = all.into_iter().filter(|cw| !dropped.contains(cw)).collect();
-    assert_eq!(expected_code.as_slice(), UFORS_CODE.as_slice());
-}
+    assert!(accepted >= 5, "expected at least 5 accepted selections in 20,000 random digests");
 
-#[test]
-fn advance_chains_handles_zero_partial_and_full_lengths() {
+    // Exact boundary tests for `parse_select_digest`:
+    //   - all-zero digest (< 10 distinct leaves) -> None
+    assert_eq!(parse_select_digest(&[0u8; 32]), None);
+    //   - crafted exact sibs == 44 (accepted) vs sibs == 45 (rejected)
+    let pack_leaves = |vals: &[u16; UPORS_K]| -> [u8; 32] {
+        let mut d = [0u8; 32];
+        for (i, &v) in vals.iter().enumerate() {
+            let bit = i * UPORS_HEIGHT;
+            for b in 0..UPORS_HEIGHT {
+                if ((v >> b) & 1) != 0 {
+                    d[(bit + b) / 8] |= 1u8 << ((bit + b) % 8);
+                }
+            }
+        }
+        d
+    };
+    let leaves_44: [u16; UPORS_K] = [221, 514, 527, 552, 575, 654, 743, 992, 993, 994];
+    let leaves_45: [u16; UPORS_K] = [94, 189, 190, 540, 541, 715, 719, 866, 875, 935];
+    assert_eq!(count_octopus_sibs(&leaves_44), UPORS_M_MAX);
+    assert_eq!(count_octopus_sibs(&leaves_45), UPORS_M_MAX + 1);
+    assert!(parse_select_digest(&pack_leaves(&leaves_44)).is_some());
+    assert!(parse_select_digest(&pack_leaves(&leaves_45)).is_none());
+
+    // Exact `v == 376` (`UPORS_C`) rejection boundary in `extract_upors_codewords`:
+    // Find a deterministic `ctr` whose first 10 valid 9-bit draws encounter `v == 376` and verify it is skipped.
     ensure_init();
-    let public = PublicKey::from_seed(&[0x33u8; N]);
-    let starts: [u8; CHAINS] = core::array::from_fn(|i| u8::try_from(i % 5).unwrap());
-    let ends: [u8; CHAINS] = core::array::from_fn(|i| if i % 6 == 0 { starts[i] } else { CHAIN_STEPS - u8::try_from(i % 4).unwrap() });
-    let initial: [[u8; N]; CHAINS] = core::array::from_fn(|i| [u8::try_from(i).unwrap(); N]);
-
-    let mut batched = initial;
-    let pub_core = public.hasher(false);
-    let pos2 = Pos::new(Layer::L2, 17, 9);
-    advance_chains(&pub_core, pos2, &mut batched, &starts, &ends);
-
-    for c in 0..CHAINS {
-        let mut expected = initial[c];
-        for step in starts[c]..ends[c] {
-            let t = tweak(TweakKind::Chain, Layer::L2.as_u8(), 17, 9, u16::try_from(c).unwrap(), u32::from(step));
-            expected = crate::params::short_hash(&public, t, &expected);
+    let pk = PublicKey::from_seed(&[0x5au8; N]);
+    let d_seed = [0xa5u8; 32];
+    let mut hit_376 = false;
+    for ctr in 0u32..2000 {
+        let mut msg = [0u8; 52];
+        msg[..16].copy_from_slice(&tweak(TweakKind::FewCode, crate::params::UPORS_LAYER_U8, 0, 0, 0, 0));
+        msg[16..48].copy_from_slice(&d_seed);
+        msg[48..52].copy_from_slice(&ctr.to_le_bytes());
+        let blk = pk.keyed(&msg);
+        let mut valid_before_376 = 0usize;
+        let mut saw_376 = false;
+        for j in 0..28usize {
+            let v = u16::try_from(read_bits(&blk, j * 9, 9)).unwrap();
+            if usize::from(v) == UPORS_C {
+                saw_376 = true;
+                break;
+            }
+            if usize::from(v) < UPORS_C {
+                valid_before_376 += 1;
+            }
         }
-        assert_eq!(batched[c], expected, "chain {c}");
-    }
-
-    let mut noop = initial;
-    advance_chains(&pub_core, Pos::new(Layer::L0, 0, 0), &mut noop, &[5u8; CHAINS], &[5u8; CHAINS]);
-    assert_eq!(noop, initial);
-
-    let mut short = initial;
-    let short_starts = [2u8; CHAINS];
-    let short_ends: [u8; CHAINS] = core::array::from_fn(|i| 2 + u8::try_from(i % 5).unwrap());
-    advance_chains(&pub_core, Pos::new(Layer::L1, 3, 2), &mut short, &short_starts, &short_ends);
-    for c in 0..CHAINS {
-        let mut expected = initial[c];
-        for step in short_starts[c]..short_ends[c] {
-            let t = tweak(TweakKind::Chain, Layer::L1.as_u8(), 3, 2, u16::try_from(c).unwrap(), u32::from(step));
-            expected = crate::params::short_hash(&public, t, &expected);
+        if saw_376 && valid_before_376 < UPORS_K {
+            let cws = extract_upors_codewords(&pk, &d_seed, ctr);
+            assert!(cws.iter().all(|cw| cw.iter().map(|&x| usize::from(x)).sum::<usize>() == UPORS_SUM));
+            hit_376 = true;
+            break;
         }
-        assert_eq!(short[c], expected, "short chain {c}");
     }
+    assert!(hit_376, "expected to find a deterministic FewCode block containing exact v == 376");
 }
 
 #[test]
-fn every_signature_region_is_checked() {
+fn every_signature_region_and_canonical_padding_are_checked() {
     let seed: [u8; SEED_LEN] = core::array::from_fn(|i| u8::try_from(i).unwrap());
     let sk = Signet::from_seed(&seed);
     let vk = sk.id();
@@ -387,13 +417,47 @@ fn every_signature_region_is_checked() {
         vk.verify(REF_CTX, msg, &Imprint::from_bytes(&raw)).is_ok()
     };
 
-    // Mutate one byte in EVERY 16-byte wire field across the entire 6,432-byte imprint (402 fields):
-    // salt (0..16), randomizer (16..32), every U-FORS chain & sibling, and every WOTS chain & Merkle sibling.
-    for field in 0..(IMPRINT_LEN / N) {
-        let off = field * N + (field % N);
-        assert!(!flip(off), "accepted flip in 16-byte wire field {field} (offset {off})");
+    // Mutate one byte in EVERY 16-byte block PLUS every counter byte and last byte across all 3,292 B!
+    for off in (0..IMPRINT_LEN).step_by(N).chain([32usize, 35, 1220, 1221, 1718, 1719, 2216, 2217, 2714, 2715, IMPRINT_LEN - 1]) {
+        assert!(!flip(off), "accepted flip at offset {off}");
     }
-    assert_eq!(Layer::TOP.sig_offset() + LAYER_LEN, IMPRINT_LEN);
+    assert_eq!(Layer::TOP.sig_offset() + TOP_LAYER_LEN, IMPRINT_LEN);
+
+    // Explicit canonical trailing zero-padding test using edge vector `one-byte-zero` (sibs = 41/44 -> 48 B trailing zeros).
+    let edge_json = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/test_vectors/edge-vectors.json")).unwrap();
+    let block = edge_json.split("\"name\": \"one-byte-zero\"").nth(1).unwrap();
+    let pat = "\"imprint_hex\": \"";
+    let s = block.find(pat).unwrap() + pat.len();
+    let e = block[s..].find('"').unwrap();
+    let pad_sig = from_hex(&block[s..s + e]);
+    let pad_ctx_pat = "\"ctx_hex\": \"";
+    let cs = block.find(pad_ctx_pat).unwrap() + pad_ctx_pat.len();
+    let ce = block[cs..].find('"').unwrap();
+    let pad_ctx_bytes = from_hex(&block[cs..cs + ce]);
+    let pad_ctx = Context::try_new(&pad_ctx_bytes).unwrap();
+    vk.verify(pad_ctx, b"\x00", &Imprint::try_from(pad_sig.as_slice()).unwrap()).unwrap();
+    // Flip a byte inside the trailing 3 zero-padded sibling slots (offsets 2*N + UPORS_LEN - 48 .. 2*N + UPORS_LEN): MUST REJECT!
+    for tail_off in [2 * N + UPORS_LEN - 48, 2 * N + UPORS_LEN - 16, 2 * N + UPORS_LEN - 1] {
+        assert_eq!(pad_sig[tail_off], 0);
+        let mut mutated = pad_sig.clone();
+        mutated[tail_off] = 1;
+        assert_eq!(
+            vk.verify(pad_ctx, b"\x00", &Imprint::try_from(mutated.as_slice()).unwrap()),
+            Err(InvalidImprint),
+            "canonical zero-padding check missed byte {tail_off}"
+        );
+    }
+
+    // Explicit verify_wots_msg leading-zero check (`h[0] != 0` rejected).
+    let pk = PublicKey::from_seed(&[0x55u8; N]);
+    let pub_h = pk.hasher(false);
+    let mut rejected_ctr = 0usize;
+    for ctr in 0u16..32 {
+        if verify_wots_msg(&pub_h, Layer::L0, 0, 0, &[0x11u8; N], ctr).is_none() {
+            rejected_ctr += 1;
+        }
+    }
+    assert!(rejected_ctr >= 25);
 
     let mut bad_vk = *vk.as_bytes();
     bad_vk[0] ^= 1;
@@ -402,7 +466,6 @@ fn every_signature_region_is_checked() {
     bad_root[31] ^= 1;
     assert_eq!(SignetId::from_bytes(&bad_root).verify(REF_CTX, msg, &base), Err(InvalidImprint));
 
-    // A valid imprint from a different signet must be rejected.
     let other_sk = Signet::from_seed(&[0x99u8; SEED_LEN]);
     let other_sig = other_sk.imprint_with_draw(&[7u8; 32], REF_CTX, msg);
     other_sk.id().verify(REF_CTX, msg, &other_sig).unwrap();
@@ -421,7 +484,6 @@ fn arbitrary_imprints_never_panic_and_are_rejected() {
     let mut raw = [0u8; IMPRINT_LEN];
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;
     for round in 0..1000u32 {
-        // Fill with deterministic SplitMix64 pseudorandom bytes (plus boundary all-0 and all-ff patterns).
         if round == 0 {
             raw.fill(0x00);
         } else if round == 1 {
@@ -452,7 +514,6 @@ fn streaming_imprint_with_and_verify_with_match_slices() {
         let sig = sk.imprint_with_draw(&draw, TEST_CTX, &msg);
         vk.verify(TEST_CTX, &msg, &sig).unwrap();
 
-        // Push-side `Sink::update` in fragmented chunks matches slice byte for byte.
         let sig_upd = sk
             .imprint_with_draw_stream(&draw, TEST_CTX, |sink| {
                 for chunk in msg.chunks(7717) {
@@ -463,7 +524,6 @@ fn streaming_imprint_with_and_verify_with_match_slices() {
             .unwrap();
         assert_eq!(sig_upd, sig, "Sink::update signature differed for len {len}");
 
-        // `std::io::Write` via `io::copy` with a fragmented reader matches too.
         let mut frag_sign = FragmentedReader::new(&msg, 7717, 5);
         let sig_copy = sk
             .imprint_with_draw_stream(&draw, TEST_CTX, |sink| {
@@ -491,7 +551,6 @@ fn streaming_imprint_with_and_verify_with_match_slices() {
         }
     }
 
-    // Producer errors abort cleanly without producing an imprint or accepting verification.
     let ck = derive_key(CTX_CONTENT, vk.as_bytes());
     let err = content_with(&ck, &[0u8; N], TEST_CTX, |sink| {
         io::copy(&mut FailingReader::default(), sink)?;
@@ -521,15 +580,14 @@ fn streaming_imprint_with_and_verify_with_match_slices() {
     .unwrap_err();
     assert_eq!(err_mid.kind(), ErrorKind::BrokenPipe);
 
-    // Sticky u64::MAX overflow poisoning on both Sink::update and Sink::write (and Debug impl).
     assert!(matches!(
         vk.verify_with(TEST_CTX, &sig, |sink| {
             let dbg = format!("{sink:?}");
             assert!(dbg.contains("Sink"));
             sink.set_total_for_test(u64::MAX - 1);
             sink.update(b"x");
-            sink.update(b"yz"); // overflows -> sticky poison
-            sink.update(b""); // remains poisoned
+            sink.update(b"yz");
+            sink.update(b"");
             assert!(sink.write(b"a").is_err());
             Ok::<(), io::Error>(())
         }),
@@ -577,7 +635,6 @@ fn randomness_mix_matches_python_reference() {
     assert_eq!(to_hex(&run_key), "0c098f138cdb2414e1d302cc2239c6083666a0a0df0a09b5e016f3425ebcb663");
     assert_eq!(to_hex(&keygen_key), "6c6e05e84a6afff9374640a0f0db963b696a501e88f175967efd5b8c8a74b8e7");
 
-    // Prior salt, PID, system randomness, and clock all affect the mixed pool independently.
     assert_ne!(mix_pool(None, &system, pid, clock), pool);
     assert_ne!(mix_pool(Some(&prior), &system, pid + 1, clock), pool);
     assert_ne!(mix_pool(Some(&prior), &[0x03u8; 32], pid, clock), pool);
@@ -589,7 +646,6 @@ fn randomness_mix_matches_python_reference() {
     let rk = Randomness::from_keys_at(run_key, keygen_key, 0);
     assert_eq!(to_hex(&rk.draw_for_keygen()), "70b5ece1669e05c593c9e0a7a7cb56efbd4f5f0135f12a758f21ec5354a0589b");
 
-    // read_exact_seed retries Interrupted, accepts exact 32 bytes, rejects 0/31/33 bytes, propagates errors.
     let mut frag32 = FragmentedReader::new(&[0x55u8; SEED_FILE_LEN], 5, 2);
     assert_eq!(read_exact_seed(&mut frag32).unwrap(), [0x55u8; SEED_FILE_LEN]);
     let mut frag0 = FragmentedReader::new(b"", 5, 2);
@@ -622,20 +678,17 @@ fn randomness_state_file_lifecycle_and_concurrency() {
     assert_eq!(init_bytes.len(), SEED_FILE_LEN);
     assert_ne!(init_bytes.as_slice(), &[0u8; 32]);
 
-    // Umask-tolerant permission check: group/other bits must be zero (owner-only 0600).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(fs::metadata(&state).unwrap().permissions().mode() & 0o077, 0);
     }
 
-    // Separate create() produces distinct initial state.
     let state_other = temp_state_dir("lifecycle-other");
     Randomness::create(&state_other).unwrap();
     assert_ne!(init_bytes, fs::read(&state_other).unwrap());
     let _ = fs::remove_dir_all(state_other.parent().unwrap());
 
-    // Sequential initializations atomically rotate the 32-byte state file with no leftover temp files.
     let rng1 = Randomness::initialize(&state).unwrap();
     let after1 = fs::read(&state).unwrap();
     assert_eq!(after1.len(), SEED_FILE_LEN);
@@ -648,8 +701,6 @@ fn randomness_state_file_lifecycle_and_concurrency() {
     assert_ne!(rng1.draw(), rng2.draw());
     assert_eq!(fs::read_dir(state.parent().unwrap()).unwrap().count(), 1);
 
-    // Concurrent lock-free startups across 8 threads x 10 rounds (= 80 overlapping atomic renames)
-    // all succeed cleanly with 80 distinct draws and leave a single valid 32-byte state file.
     let shared = Arc::new(state.clone());
     let handles: Vec<_> = (0..8)
         .map(|_| {
@@ -664,7 +715,6 @@ fn randomness_state_file_lifecycle_and_concurrency() {
     assert_eq!(fs::read(&state).unwrap().len(), SEED_FILE_LEN);
     assert_eq!(fs::read_dir(state.parent().unwrap()).unwrap().count(), 1);
 
-    // read_os_randomness returns fresh, non-constant 32-byte OS entropy.
     let os_a = read_os_randomness().unwrap();
     let os_b = read_os_randomness().unwrap();
     assert_ne!(os_a, os_b);
@@ -680,12 +730,10 @@ fn hostile_state_path_and_bad_files_are_rejected_without_clobbering() {
     let _ = fs::remove_dir_all(&base);
     fs::create_dir_all(&base).unwrap();
 
-    // Directory is rejected without modification.
     let dir = base.join("a-dir");
     fs::create_dir_all(&dir).unwrap();
     assert_eq!(Randomness::initialize(&dir).unwrap_err().kind(), ErrorKind::InvalidInput);
 
-    // Non-private (0644) state file is rejected with PermissionDenied without modifying it.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -697,7 +745,6 @@ fn hostile_state_path_and_bad_files_are_rejected_without_clobbering() {
         assert_eq!(fs::read(&pub_file).unwrap(), before);
     }
 
-    // Empty (0 B), truncated (31 B), and oversized (33 B) private files are rejected untouched.
     for (tag, bad_bytes) in [("zero", vec![]), ("short", vec![0x66u8; 31]), ("over", vec![0x77u8; 33])] {
         let f = base.join(format!("badsize-{tag}.salt"));
         fs::write(&f, &bad_bytes).unwrap();
@@ -710,7 +757,6 @@ fn hostile_state_path_and_bad_files_are_rejected_without_clobbering() {
         assert_eq!(fs::read(&f).unwrap(), bad_bytes);
     }
 
-    // Symlink to a valid state file is rejected without touching target.
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
@@ -742,7 +788,6 @@ fn monotonic_clock_advances_and_is_nontrivial() {
 #[test]
 fn signet_generate_produces_distinct_valid_signets() {
     ensure_init();
-    // Pure keygen combiner KAT: depends on BOTH local draw and OS bytes independently.
     let local_a = [0x11u8; 32];
     let local_b = [0x22u8; 32];
     let os_a = [0x33u8; 32];
@@ -776,39 +821,6 @@ fn signet_generate_produces_distinct_valid_signets() {
 }
 
 #[test]
-fn ufors_batched_root_is_selection_independent_at_extreme_addresses() {
-    ensure_init();
-    let secret = SecretKey::derive(&[0x77u8; SEED_LEN]);
-    let public = PublicKey::from_seed(&[0x88u8; N]);
-    let pub_h = public.hasher(false);
-    let mut ws = SignWorkspace::new(true);
-
-    for raw_addr in [0u64, 1, (1u64 << HYPER_BITS) - 1] {
-        let addr = LeafAddr::from_digest_word(raw_addr);
-        // Includes code 0 = [0, 7, 9] (tests digit 0 AND digit 9!) and code 63 = [9, 7, 0].
-        let sel_zero = [UforsSel { leaf: 0, code: 0 }; UFORS_TREES];
-        let sel_max = [UforsSel { leaf: 31, code: 63 }; UFORS_TREES];
-        let sel_mix: [UforsSel; UFORS_TREES] =
-            core::array::from_fn(|t| UforsSel { leaf: if t % 2 == 0 { 0 } else { 31 }, code: u8::try_from((t * 5) & 63).unwrap() });
-
-        let (mut sig_z, mut sig_m, mut sig_x) = ([0u8; UFORS_LEN], [0u8; UFORS_LEN], [0u8; UFORS_LEN]);
-        let r_z = build_all_ufors(&secret, &public, addr, &sel_zero, &mut ws, &mut sig_z);
-        let r_m = build_all_ufors(&secret, &public, addr, &sel_max, &mut ws, &mut sig_m);
-        let r_x = build_all_ufors(&secret, &public, addr, &sel_mix, &mut ws, &mut sig_x);
-
-        // Changing U-FORS selections at the same leaf address must change openings while preserving the U-FORS root!
-        assert_eq!(r_z, r_m);
-        assert_eq!(r_z, r_x);
-        assert_ne!(sig_z, sig_m);
-        assert_ne!(sig_z, sig_x);
-
-        assert_eq!(ufors_verify(&pub_h, addr, &sel_zero, &sig_z), r_z);
-        assert_eq!(ufors_verify(&pub_h, addr, &sel_max, &sig_m), r_m);
-        assert_eq!(ufors_verify(&pub_h, addr, &sel_mix, &sig_x), r_x);
-    }
-}
-
-#[test]
 fn debug_redacts_secrets() {
     let seed = [0xabu8; SEED_LEN];
     let sk = Signet::from_seed(&seed);
@@ -821,7 +833,7 @@ fn debug_redacts_secrets() {
 
     let sig = sk.imprint_with_draw(&[1u8; 32], TEST_CTX, b"dbg");
     let sd = format!("{sig:?}");
-    assert!(sd.contains(SUITE_NAME) && sd.contains("6432 bytes") && sd.contains(&to_hex(&sig.as_bytes()[..N])));
+    assert!(sd.contains(SUITE_NAME) && sd.contains("3292 bytes") && sd.contains(&to_hex(&sig.as_bytes()[..N])));
 }
 
 #[test]
@@ -893,20 +905,10 @@ fn checked_constructors_reject_out_of_range_values() {
     assert_eq!(&max_t[2..8], &[0xff; 6]);
     assert!(catch_unwind(|| tweak(TweakKind::Node, 0, 1u64 << 48, 0, 0, 0)).is_err());
 
-    // Exact per-layer hypertree bounds: L0 < 2^30 .. L5 < 2^5, L6 == 0 (all 32 leaves).
-    for (layer, max_trees) in [
-        (Layer::L0, 1u64 << 30),
-        (Layer::L1, 1u64 << 25),
-        (Layer::L2, 1u64 << 20),
-        (Layer::L3, 1u64 << 15),
-        (Layer::L4, 1u64 << 10),
-        (Layer::L5, 1u64 << 5),
-        (Layer::L6, 1),
-    ] {
-        let _ = Pos::new(layer, max_trees - 1, 31);
-        assert!(catch_unwind(|| Pos::new(layer, max_trees, 0)).is_err());
-        assert!(catch_unwind(|| Pos::new(layer, 0, 32)).is_err());
-    }
+    assert_eq!(Layer::L0.trees(), 1u64 << 26);
+    assert_eq!(Layer::L1.trees(), 1u64 << 19);
+    assert_eq!(Layer::L2.trees(), 1u64 << 12);
+    assert_eq!(Layer::L3.trees(), 1);
 }
 
 #[test]

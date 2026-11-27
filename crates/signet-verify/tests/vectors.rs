@@ -26,20 +26,20 @@ fn json_u64_field(block: &str, key: &str) -> u64 {
 
 #[test]
 fn reference_and_edge_vectors_verify_oneshot_and_streamed() {
-    assert_eq!(SUITE_NAME, "BLINCS-128-7x5");
+    assert_eq!(SUITE_NAME, "BLINCS-128-A2");
     assert_eq!(SIGNET_ID_LEN, 32);
-    assert_eq!(IMPRINT_LEN, 6432);
+    assert_eq!(IMPRINT_LEN, 3292);
     assert_eq!(MAX_CONTEXT_LEN, 255);
     assert_eq!(Context::try_new(&[0u8; 256]), Err(ContextTooLong { len: 256 }));
 
     // 1. Primary reference vector (`test_vectors/reference-imprint-1.bin`).
-    let id_bytes = hex_decode("98a5b8314b854e78f72cbadc9f5ed67c15bc2ad253cd98be1d5951595f217512");
+    let id_bytes = hex_decode("eb8e97a4ff2446ed3791cfd9515e1e23982ff22b5103bc0117c3ab69db42bac4");
     let id = SignetId::try_from(id_bytes.as_slice()).unwrap();
     let imp_bytes = include_bytes!("../../../test_vectors/reference-imprint-1.bin");
     let sig = ImprintRef::try_from(imp_bytes.as_slice()).unwrap();
     assert!(ImprintRef::try_from(&imp_bytes[..IMPRINT_LEN - 1]).is_err());
 
-    let ctx = Context::new(b"BLINCS-128-7x5 reference vector v1");
+    let ctx = Context::new(b"BLINCS-128-A2 reference vector v1");
     let msg = b"hello, BLINCS";
     assert_eq!(id.verify(ctx, msg, sig), Ok(()));
 
@@ -51,12 +51,11 @@ fn reference_and_edge_vectors_verify_oneshot_and_streamed() {
     let wrong_id = SignetId::from_bytes(&wrong_id_bytes);
     assert_eq!(wrong_id.verify(ctx, msg, sig), Err(InvalidImprint));
 
-    // Mutate one byte in EVERY 16-byte wire field (402 fields across 6,432 B): every mutation rejects!
+    // Mutate one byte in EVERY 16-byte chunk (plus counters and tail) across 3,292 B: every mutation rejects!
     let mut buf = *sig.as_bytes();
-    for field in 0..(IMPRINT_LEN / 16) {
-        let pos = field * 16 + (field % 16);
+    for pos in (0..IMPRINT_LEN).step_by(16).chain([32usize, 1220, 1718, 2216, 2714, IMPRINT_LEN - 1]) {
         buf[pos] ^= 0x80;
-        assert_eq!(id.verify(ctx, msg, ImprintRef::from_bytes(&buf)), Err(InvalidImprint), "field {field} escaped");
+        assert_eq!(id.verify(ctx, msg, ImprintRef::from_bytes(&buf)), Err(InvalidImprint), "byte {pos} escaped");
         buf[pos] ^= 0x80;
     }
 

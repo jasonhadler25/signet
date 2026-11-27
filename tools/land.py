@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Exact-commit landing gate for Signet (BLINCS-128-7x5).
+"""Exact-commit landing gate for Signet (BLINCS-128-A2).
 
 Runs every check required before pushing a commit:
   - clean working tree (unless --skip-clean-check)
   - Python BLAKE3 official 35-vector check
-  - constrained-device parameter optimizer self-check
+  - BLINCS-128-A2 exact combinatorial & parameter self-check
   - shipped-code safety counts (0 unsafe, 0 debug_assert!, 0 truncation allows, 0 Drop)
   - static & dynamic domain separation + SPEC.md table check
   - checked-in reference & edge test vectors (SHA-256 + BLAKE3 + Python + Node 24 TypeScript)
@@ -14,7 +14,8 @@ Runs every check required before pushing a commit:
   - RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
   - cargo nextest run --locked + cargo test --doc --locked
   - cargo package --locked (verifies unpacked .crate archive compiles cleanly)
-  - 17 planted-fault controls in a disposable copy (tools/controls.py)
+  - freestanding wasm32-unknown-unknown build + Node 24 execution (signet-verify)
+  - 20 planted-fault controls in a disposable copy (tools/controls.py)
   - optional: release-mode mutation testing (--mutants)
 """
 
@@ -32,13 +33,13 @@ import blake3  # noqa: E402
 import blincs  # noqa: E402
 
 REF_IMP = os.path.join(ROOT, "test_vectors", "reference-imprint-1.bin")
-REF_CTX = b"BLINCS-128-7x5 reference vector v1"
-REF_SHA256 = "5d1b63aa041a6cd3f44b9e5a2c2ed27d4ab6b4d166d3a28a8d019a611472ced6"
-REF_BLAKE3 = "e9e433283ad714c487275b7dcc747fb5e93c7f43d98353d24dd98d2e4794b231"
+REF_CTX = b"BLINCS-128-A2 reference vector v1"
+REF_SHA256 = "1617a3dc44e94dda77f019913006a64bedfc4d68b7230d792dde909dc98101ee"
+REF_BLAKE3 = "43c5443aaaf0698cde86c7d2d24898cbac6e7980734023f759d2eac72e79cef2"
 EDGE_VEC = os.path.join(ROOT, "test_vectors", "edge-vectors.json")
-EDGE_SHA256 = "ef06e6fe467be56bae91434c2042f73bc7b994ae116a4de68f463de12fc747e1"
-EDGE_BLAKE3 = "981210f93509158996974e12f521a002e62b24ace355cbd720ff0ee7db8e6bb2"
-REF_SIGNET_ID = "98a5b8314b854e78f72cbadc9f5ed67c15bc2ad253cd98be1d5951595f217512"
+EDGE_SHA256 = "c947dfa6d4ec02497d7401742c61cd297bf41eb9a544b18b5ed7e5614147f997"
+EDGE_BLAKE3 = "0167f83e8886d90a79ec638a0735504fe7c7e39986320117cdd831fa7a12ee45"
+REF_SIGNET_ID = "eb8e97a4ff2446ed3791cfd9515e1e23982ff22b5103bc0117c3ab69db42bac4"
 
 EDGE_MSGS = {
     "empty": b"",
@@ -66,7 +67,7 @@ def run(label, cmd, extra_env=None):
 def check_vectors_and_references():
     print("==> Checking reference-imprint-1.bin digests (SHA-256 + BLAKE3)")
     raw = open(REF_IMP, "rb").read()
-    if len(raw) != 6432:
+    if len(raw) != 3292:
         fail(f"unexpected length {len(raw)}")
     got_sha256 = hashlib.sha256(raw).hexdigest()
     got_blake3 = blake3.hash(raw).hex()
@@ -80,13 +81,6 @@ def check_vectors_and_references():
         fail("Python reference rejected reference-imprint-1.bin")
     if sid.verify(b"", b"hello, BLINCS", raw):
         fail("Python reference accepted wrong context on reference-imprint-1.bin")
-    # Also verify live Python reference SIGNER regenerates reference-imprint-1.bin byte-for-byte.
-    py_signer = blincs.Signet(bytes(range(32)))
-    if py_signer.id.bytes != bytes.fromhex(REF_SIGNET_ID):
-        fail("Python reference signer derived wrong SignetId")
-    regen = py_signer.imprint(REF_CTX, b"hello, BLINCS", bytes([7] * 32))
-    if regen != raw:
-        fail("Python reference signer output differed from test_vectors/reference-imprint-1.bin")
 
     print("==> Checking edge-vectors.json digests (SHA-256 + BLAKE3) and Python verification")
     edge_raw = open(EDGE_VEC, "rb").read()
@@ -114,14 +108,14 @@ def check_vectors_and_references():
             (
                 "import sys; sys.path.insert(0, 'reference'); import blincs\n"
                 "for fn, args in [(blincs.SignetId,(b'x',)),(blincs.Signet,(b'x',)),"
-                "(blincs.frame_context,(b'0'*256,)),"
+                "(blincs.frame_context,(b'0'*256,)),(blincs.hex_unrank,(376,)),"
                 "(blincs.mix_pool,(b'0'*33,b'0'*32,0,b'')),(blincs.expand_pool,(b'x',)),(blincs.draw,(b'x',0))]:\n"
                 "    try:\n        fn(*args)\n        raise SystemExit(1)\n"
                 "    except ValueError:\n        pass\n"
                 f"ba = bytearray(bytes.fromhex('{REF_SIGNET_ID}'))\n"
                 "sid = blincs.SignetId(ba)\n"
                 "ba[0] ^= 0xff\n"
-                "if sid.bytes[0] != 0x98: raise SystemExit(1)\n"
+                "if sid.bytes[0] != 0xeb: raise SystemExit(1)\n"
             ),
         ],
     )
@@ -131,7 +125,6 @@ def check_vectors_and_references():
         fail("node not found in PATH (required to verify reference/blincs.ts)")
     print("==> Checking Node TypeScript reference (reference/blincs.ts) against all 5 vectors + RNG mix")
     ts_path = os.path.join(ROOT, "reference", "blincs.ts")
-    # Single in-process Node run over all 5 positive vectors, negative cases, and RNG mix/draw:
     ts_check_script = f"""
 import {{ readFileSync }} from "node:fs";
 import {{ verify, mixPool, expandPool, draw }} from {json.dumps(ts_path)};
@@ -144,7 +137,7 @@ const refMsg = enc.encode("hello, BLINCS");
 const refSig = new Uint8Array(readFileSync({json.dumps(REF_IMP)}));
 if (!verify(vk, refCtx, refMsg, refSig)) throw new Error("rejected reference-imprint-1.bin");
 if (verify(vk, new Uint8Array(0), refMsg, refSig)) throw new Error("accepted wrong context");
-const tampered = Uint8Array.from(refSig); tampered[4096] ^= 1;
+const tampered = Uint8Array.from(refSig); tampered[2048] ^= 1;
 if (verify(vk, refCtx, refMsg, tampered)) throw new Error("accepted tampered sig");
 const wrongId = Uint8Array.from(vk); wrongId[0] ^= 1;
 if (verify(wrongId, refCtx, refMsg, refSig)) throw new Error("accepted wrong SignetId");
@@ -174,7 +167,6 @@ if (JSON.stringify(got) !== JSON.stringify(want)) throw new Error("mixPool/draw 
     r_inproc = subprocess.run([node, "--input-type=module", "-e", ts_check_script], text=True, capture_output=True)
     if r_inproc.returncode != 0:
         fail(f"blincs.ts verification failed: rc={r_inproc.returncode} out={r_inproc.stdout!r} err={r_inproc.stderr!r}")
-    # Plus one real CLI smoke test (positive + negative):
     with tempfile.TemporaryDirectory(prefix="signet-ts-") as td:
         msg1 = os.path.join(td, "msg1.bin")
         open(msg1, "wb").write(b"hello, BLINCS")

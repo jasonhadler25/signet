@@ -1,193 +1,176 @@
-use crate::one_time::SignWorkspace;
+use crate::coding::hex_unrank;
 use crate::params::{
-    HYPER_BITS, LeafAddr, N, PublicKey, SecretKey, TREE_HEIGHT, TREE_LEAVES, TweakKind, UFORS_CHAINS, UFORS_CODE, UFORS_CODE_BITS, UFORS_LAYER_BASE, UFORS_LEN,
-    UFORS_STEPS, UFORS_TOTAL_CHAINS, UFORS_TOTAL_LEAVES, UFORS_TREE_LEN, UFORS_TREES, first_n, pack_pair, pack_tagged, read_bits, tweak,
+    HYPER_BITS, LeafAddr, N, PublicKey, TweakKind, UPORS_C, UPORS_CTR_LEN, UPORS_HEIGHT, UPORS_K, UPORS_LAYER_U8, UPORS_LEN, UPORS_M_MAX, UPORS_N,
+    UPORS_SELECT_MAX_DRAWS, UPORS_STEPS, first_n, pack_pair, pack_tagged, read_bits, tweak,
 };
 use blake3_servil_core::throughput::{Batch, Block, TreeHasher};
+use constant_time_eq::constant_time_eq;
 
-const UFORS_VERIFY_CHAINS: usize = UFORS_TREES * UFORS_CHAINS;
-
-/// Selected `(leaf, code_idx)` pair for one U-FORS tree (`leaf < 32`, `code < 64`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct UforsSel {
-    pub leaf: u8,
-    pub code: u8,
+pub(crate) struct UporsSelection {
+    pub(crate) ctr: u32,
+    pub(crate) leaf_addr: LeafAddr,
+    pub(crate) leaves: [u16; UPORS_K],
+    pub(crate) sibs: usize,
 }
 
-/// Extract all 15 U-FORS `(leaf: 5 bits, code: 6 bits)` selections (`bits 0..165`) and the
-/// 35-bit hypertree `leaf_addr` (`bits 165..200`) from the 32-byte digest `D` (`SPEC.md`).
-pub(crate) fn parse_digest(digest: &[u8; 32]) -> ([UforsSel; UFORS_TREES], LeafAddr) {
-    let sel = core::array::from_fn(|t| {
-        let base = (TREE_HEIGHT + UFORS_CODE_BITS) * t;
-        UforsSel {
-            leaf: u8::try_from(read_bits(digest, base, TREE_HEIGHT)).unwrap(),
-            code: u8::try_from(read_bits(digest, base + TREE_HEIGHT, UFORS_CODE_BITS)).unwrap(),
+/// Count exact Octopus authentication siblings for `sorted_leaves` in a height-10 binary tree.
+#[inline]
+pub(crate) fn count_octopus_sibs(sorted_leaves: &[u16; UPORS_K]) -> usize {
+    let mut cur = *sorted_leaves;
+    let mut len = UPORS_K;
+    let mut sibs = 0usize;
+    for _ in 0..UPORS_HEIGHT {
+        let mut out_len = 0usize;
+        let mut i = 0usize;
+        while i < len {
+            let x = cur[i];
+            if i + 1 < len && (x & 1) == 0 && cur[i + 1] == x + 1 {
+                cur[out_len] = x >> 1;
+                out_len += 1;
+                i += 2;
+            } else {
+                sibs += 1;
+                cur[out_len] = x >> 1;
+                out_len += 1;
+                i += 1;
+            }
         }
-    });
-    let leaf_addr = LeafAddr::from_digest_word(read_bits(digest, UFORS_TREES * (TREE_HEIGHT + UFORS_CODE_BITS), HYPER_BITS));
-    (sel, leaf_addr)
+        len = out_len;
+    }
+    sibs
 }
 
-/// Build all 15 U-FORS height-5 trees (`480` leaves, `1,440 = 45 × 32` equal-length chains of 9 steps)
-/// in lockstep so SIMD/SME2 stays saturated across every step, writing chain values and authentication
-/// paths into `out_sig` and returning the 16-byte `ufors_root`.
-pub(crate) fn build_all_ufors(
-    secret: &SecretKey,
-    public: &PublicKey,
-    leaf_addr: LeafAddr,
-    sel: &[UforsSel; UFORS_TREES],
-    ws: &mut SignWorkspace,
-    out_sig: &mut [u8; UFORS_LEN],
-) -> [u8; N] {
-    let tree = leaf_addr.as_u64();
-    let pub_h = public.hasher(true);
+/// Parse a `FewSelect` digest into `(leaf_addr, sorted_leaves, sibs)` if 10 distinct leaves appear
+/// within 22 10-bit draws and their Octopus sibling count is `<= UPORS_M_MAX` (44).
+#[inline]
+pub(crate) fn parse_select_digest(d: &[u8; 32]) -> Option<(LeafAddr, [u16; UPORS_K], usize)> {
+    let mut leaves = [0u16; UPORS_K];
+    let mut found = 0usize;
 
-    // 1. Derive all 1,440 U-FORS chain starts in one batched call.
-    secret.derive_ufors_starts(leaf_addr, &mut ws.b16, &mut ws.out);
-
-    let target_digits: [[u8; UFORS_CHAINS]; UFORS_TREES] = core::array::from_fn(|t| UFORS_CODE[usize::from(sel[t].code)]);
-
-    // Capture any target chains whose codeword digit is 0 directly from the start values.
-    for t in 0..UFORS_TREES {
-        let target_base = (t * TREE_LEAVES + usize::from(sel[t].leaf)) * UFORS_CHAINS;
-        for c in 0..UFORS_CHAINS {
-            if target_digits[t][c] == 0 {
-                out_sig[t * UFORS_TREE_LEN + c * N..t * UFORS_TREE_LEN + (c + 1) * N].copy_from_slice(&ws.out[target_base + c][..N]);
+    for i in 0..UPORS_SELECT_MAX_DRAWS {
+        let x = u16::try_from(read_bits(d, i * UPORS_HEIGHT, UPORS_HEIGHT)).unwrap();
+        if !leaves[..found].contains(&x) {
+            leaves[found] = x;
+            found += 1;
+            if found == UPORS_K {
+                break;
             }
         }
     }
+    if found != UPORS_K {
+        return None;
+    }
+    leaves.sort_unstable();
+    let sibs = count_octopus_sibs(&leaves);
+    if sibs > UPORS_M_MAX {
+        return None;
+    }
+    let leaf_addr = LeafAddr::from_word(read_bits(d, UPORS_SELECT_MAX_DRAWS * UPORS_HEIGHT, HYPER_BITS));
+    Some((leaf_addr, leaves, sibs))
+}
 
-    // 2. Pack the invariant 12-byte tweak prefix for all 1,440 chains, then step all 9 waves in lockstep.
-    let mut slot = 0usize;
-    for t in 0..UFORS_TREES {
-        let layer_u8 = UFORS_LAYER_BASE + u8::try_from(t).unwrap();
-        for leaf in 0..TREE_LEAVES {
-            let leaf_u16 = u16::try_from(leaf).unwrap();
-            for c in 0..UFORS_CHAINS {
-                let tw = tweak(TweakKind::Chain, layer_u8, tree, leaf_u16, u16::try_from(c).unwrap(), 0);
-                ws.b32[slot][..12].copy_from_slice(&tw[..12]);
-                slot += 1;
+/// Grind `ctr_ft` via register-only SIMD `TreeHasher::hash_counter_range` (batches of 512).
+pub(crate) fn grind_upors_selection(pub_h: &TreeHasher, d_seed: &[u8; 32]) -> UporsSelection {
+    let mut tmpl = [0u8; 52];
+    tmpl[..16].copy_from_slice(&tweak(TweakKind::FewSelect, UPORS_LAYER_U8, 0, 0, 0, 0));
+    tmpl[16..48].copy_from_slice(d_seed);
+
+    const BATCH: usize = 512;
+    let mut out = [[0u8; 32]; BATCH];
+    let mut start = 0u32;
+    loop {
+        pub_h.hash_counter_range(&tmpl, 12, start, &mut out);
+        for (i, digest) in out.iter().enumerate() {
+            if let Some((leaf_addr, leaves, sibs)) = parse_select_digest(digest) {
+                return UporsSelection { ctr: start + u32::try_from(i).unwrap(), leaf_addr, leaves, sibs };
             }
         }
+        start = start.checked_add(u32::try_from(BATCH).unwrap()).expect("u32 ctr_ft exhausted");
     }
+}
 
-    for step in 0..UFORS_STEPS {
-        let step_bytes = u32::from(step).to_le_bytes();
-        for i in 0..UFORS_TOTAL_CHAINS {
-            let m = &mut ws.b32[i];
-            m[12..16].copy_from_slice(&step_bytes);
-            m[16..32].copy_from_slice(&ws.out[i][..N]);
-        }
-        pub_h.hash_many(&ws.b32[..UFORS_TOTAL_CHAINS], &mut ws.out[..UFORS_TOTAL_CHAINS]);
-        let completed = step + 1;
-        for t in 0..UFORS_TREES {
-            let target_base = (t * TREE_LEAVES + usize::from(sel[t].leaf)) * UFORS_CHAINS;
-            for c in 0..UFORS_CHAINS {
-                if target_digits[t][c] == completed {
-                    out_sig[t * UFORS_TREE_LEN + c * N..t * UFORS_TREE_LEN + (c + 1) * N].copy_from_slice(&ws.out[target_base + c][..N]);
+/// Verify a single `ctr_ft` during verification (`1` compression).
+#[inline]
+pub(crate) fn verify_upors_selection(pub_h: &TreeHasher, d_seed: &[u8; 32], ctr: u32) -> Option<UporsSelection> {
+    let mut msg = [0u8; 52];
+    msg[..16].copy_from_slice(&tweak(TweakKind::FewSelect, UPORS_LAYER_U8, 0, 0, 0, 0));
+    msg[16..48].copy_from_slice(d_seed);
+    msg[48..52].copy_from_slice(&ctr.to_le_bytes());
+    let h = *pub_h.hash(&msg).as_bytes();
+    let (leaf_addr, leaves, sibs) = parse_select_digest(&h)?;
+    Some(UporsSelection { ctr, leaf_addr, leaves, sibs })
+}
+
+/// Derive the 10 unbiased `U-PORS` codewords in `L_42(3, 24)` (`C = 376`) via indexed 32-byte
+/// `Keyed` hashes (`TweakKind::FewCode`, 28 9-bit draws/block, 99.9996% single compression, zero XOF).
+pub(crate) fn extract_upors_codewords(public: &PublicKey, d_seed: &[u8; 32], ctr: u32) -> [[u8; UPORS_N]; UPORS_K] {
+    let mut msg = [0u8; 52];
+    msg[16..48].copy_from_slice(d_seed);
+    msg[48..52].copy_from_slice(&ctr.to_le_bytes());
+
+    let mut out = [[0u8; UPORS_N]; UPORS_K];
+    let mut got = 0usize;
+    let mut block_idx = 0u16;
+    while got < UPORS_K {
+        msg[..16].copy_from_slice(&tweak(TweakKind::FewCode, UPORS_LAYER_U8, 0, 0, block_idx, 0));
+        let blk = public.keyed(&msg);
+        for j in 0..28usize {
+            let v = u16::try_from(read_bits(&blk, j * 9, 9)).unwrap();
+            if usize::from(v) < UPORS_C {
+                out[got] = hex_unrank(v);
+                got += 1;
+                if got == UPORS_K {
+                    break;
                 }
             }
         }
+        block_idx = block_idx.checked_add(1).expect("FewCode block_idx overflow");
     }
-
-    // 3. Compress all 480 = 15 × 32 U-FORS leaves (exact 64 B = 1 BLAKE3 compression each!).
-    for t in 0..UFORS_TREES {
-        let layer_u8 = UFORS_LAYER_BASE + u8::try_from(t).unwrap();
-        for leaf in 0..TREE_LEAVES {
-            let leaf_slot = t * TREE_LEAVES + leaf;
-            let chain_base = leaf_slot * UFORS_CHAINS;
-            let dst = &mut ws.b64[leaf_slot].0;
-            dst[..16].copy_from_slice(&tweak(TweakKind::OneTimeKey, layer_u8, tree, u16::try_from(leaf).unwrap(), 0, 0));
-            for c in 0..UFORS_CHAINS {
-                dst[16 + c * N..16 + (c + 1) * N].copy_from_slice(&ws.out[chain_base + c][..N]);
-            }
-        }
-    }
-    pub_h.hash_many(&Batch::from_blocks(&ws.b64[..UFORS_TOTAL_LEAVES], 64), &mut ws.out[..UFORS_TOTAL_LEAVES]);
-
-    // 4. Five uniform batched Merkle levels across all 15 trees (240 -> 120 -> 60 -> 30 -> 15).
-    let mut cur_idx: [usize; UFORS_TREES] = core::array::from_fn(|t| usize::from(sel[t].leaf));
-    let mut width = TREE_LEAVES;
-    let auth_off = UFORS_CHAINS * N;
-    for level in 1..=TREE_HEIGHT {
-        let level_u16 = u16::try_from(level).unwrap();
-        let parents = width / 2;
-        let total_parents = UFORS_TREES * parents;
-        for t in 0..UFORS_TREES {
-            let layer_u8 = UFORS_LAYER_BASE + u8::try_from(t).unwrap();
-            let base = t * width;
-            let sib_off = t * UFORS_TREE_LEN + auth_off + (level - 1) * N;
-            out_sig[sib_off..sib_off + N].copy_from_slice(&ws.out[base + (cur_idx[t] ^ 1)][..N]);
-            let p_base = t * parents;
-            for p in 0..parents {
-                pack_pair(
-                    &mut ws.b48[p_base + p],
-                    tweak(TweakKind::Node, layer_u8, tree, 0, level_u16, u32::try_from(p).unwrap()),
-                    &ws.out[base + 2 * p][..N],
-                    &ws.out[base + 2 * p + 1][..N],
-                );
-            }
-            cur_idx[t] >>= 1;
-        }
-        pub_h.hash_many(&ws.b48[..total_parents], &mut ws.out[..total_parents]);
-        width = parents;
-    }
-
-    let roots: [[u8; N]; UFORS_TREES] = core::array::from_fn(|t| first_n(&ws.out[t]));
-    ufors_root(&public.hasher(false), leaf_addr, &roots)
+    out
 }
 
-/// Compress the 15 U-FORS tree roots into the 16-byte `ufors_root` signed by hypertree layer 0.
-pub(crate) fn ufors_root(public: &TreeHasher, leaf_addr: LeafAddr, roots: &[[u8; N]; UFORS_TREES]) -> [u8; N] {
-    let mut input = [0u8; 16 + N * UFORS_TREES];
-    input[..16].copy_from_slice(&tweak(TweakKind::FewRoot, 0, leaf_addr.as_u64(), 0, 0, 0));
-    for t in 0..UFORS_TREES {
-        input[16 + t * N..16 + (t + 1) * N].copy_from_slice(&roots[t]);
-    }
-    first_n(public.hash(&input).as_bytes())
-}
+/// Zero-allocation stack-batched `U-PORS` Octopus verifier (`270` chain + `10` leaf + `<= 44` node hashes).
+/// Enforces canonical all-zero padding on unused sibling slots in constant time.
+pub(crate) fn upors_verify(pub_h: &TreeHasher, sel: &UporsSelection, codewords: &[[u8; UPORS_N]; UPORS_K], sig: &[u8; UPORS_LEN]) -> Option<[u8; N]> {
+    let tree = sel.leaf_addr.as_u64();
+    let chains_off = UPORS_CTR_LEN;
+    let octo_off = UPORS_CTR_LEN + UPORS_K * UPORS_N * N;
 
-/// Verify a U-FORS signature on the stack (zero heap allocation), batching all 45 chains across
-/// all 15 trees (exact constant 165 chain compressions), 15 single-block leaf hashes, and 5 Merkle levels.
-pub(crate) fn ufors_verify(public: &TreeHasher, leaf_addr: LeafAddr, sel: &[UforsSel; UFORS_TREES], sig: &[u8; UFORS_LEN]) -> [u8; N] {
-    let tree = leaf_addr.as_u64();
-
-    // Load all 45 chain values and their starting digits.
-    let mut vals: [[u8; N]; UFORS_VERIFY_CHAINS] = [[0u8; N]; UFORS_VERIFY_CHAINS];
-    let mut starts: [u8; UFORS_VERIFY_CHAINS] = [0u8; UFORS_VERIFY_CHAINS];
-    let mut order: [(u8, u8); UFORS_VERIFY_CHAINS] = [(0, 0); UFORS_VERIFY_CHAINS];
-    for t in 0..UFORS_TREES {
-        let cw = UFORS_CODE[usize::from(sel[t].code)];
-        for c in 0..UFORS_CHAINS {
-            let idx = t * UFORS_CHAINS + c;
-            vals[idx].copy_from_slice(&sig[t * UFORS_TREE_LEN + c * N..t * UFORS_TREE_LEN + (c + 1) * N]);
-            starts[idx] = cw[c];
-            order[idx] = (UFORS_STEPS - cw[c], u8::try_from(idx).unwrap());
+    // 1. Batch-advance all 30 opened U-PORS chains to step 23 on stack!
+    const TOTAL: usize = UPORS_K * UPORS_N;
+    let mut vals = [[0u8; N]; TOTAL];
+    let mut starts = [0u8; TOTAL];
+    let mut order = [(0u8, 0u8); TOTAL];
+    for (t, cw) in codewords.iter().enumerate() {
+        for (c, &d) in cw.iter().enumerate() {
+            let idx = t * UPORS_N + c;
+            let off = chains_off + idx * N;
+            vals[idx].copy_from_slice(&sig[off..off + N]);
+            starts[idx] = d;
+            order[idx] = (UPORS_STEPS - d, u8::try_from(idx).unwrap());
         }
     }
-    order.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
-
+    order.sort_unstable_by_key(|x| core::cmp::Reverse(x.0));
     let mut active = order.partition_point(|&(rem, _)| rem > 0);
 
-    let mut b32 = [[0u8; 32]; UFORS_VERIFY_CHAINS];
-    let mut out = [[0u8; 32]; UFORS_VERIFY_CHAINS];
+    let mut b32 = [[0u8; 32]; TOTAL];
+    let mut out = [[0u8; 32]; TOTAL];
     for (slot, &(_, idx_u8)) in order[..active].iter().enumerate() {
         let idx = usize::from(idx_u8);
-        let t = idx / UFORS_CHAINS;
-        let c = idx % UFORS_CHAINS;
-        let layer_u8 = UFORS_LAYER_BASE + u8::try_from(t).unwrap();
+        let t = idx / UPORS_N;
+        let c = idx % UPORS_N;
         pack_tagged(
             &mut b32[slot],
-            tweak(TweakKind::Chain, layer_u8, tree, u16::from(sel[t].leaf), u16::try_from(c).unwrap(), u32::from(starts[idx])),
+            tweak(TweakKind::Chain, UPORS_LAYER_U8, tree, sel.leaves[t], u16::try_from(c).unwrap(), u32::from(starts[idx])),
             &vals[idx],
         );
     }
-
-    for step in 1..=UFORS_STEPS {
+    for step in 1..=UPORS_STEPS {
         if active == 0 {
             break;
         }
-        public.hash_many(&b32[..active], &mut out[..active]);
+        pub_h.hash_many(&b32[..active], &mut out[..active]);
         while active > 0 && order[active - 1].0 == step {
             active -= 1;
             vals[usize::from(order[active].1)].copy_from_slice(&out[active][..N]);
@@ -200,38 +183,66 @@ pub(crate) fn ufors_verify(public: &TreeHasher, leaf_addr: LeafAddr, sel: &[Ufor
         }
     }
 
-    // Compress all 15 U-FORS leaves (64 B = 1 compression each, cache-line aligned on stack).
-    let mut b64 = [Block::ZERO; UFORS_TREES];
-    for t in 0..UFORS_TREES {
-        let layer_u8 = UFORS_LAYER_BASE + u8::try_from(t).unwrap();
-        let dst = &mut b64[t].0;
-        dst[..16].copy_from_slice(&tweak(TweakKind::OneTimeKey, layer_u8, tree, u16::from(sel[t].leaf), 0, 0));
-        for c in 0..UFORS_CHAINS {
-            dst[16 + c * N..16 + (c + 1) * N].copy_from_slice(&vals[t * UFORS_CHAINS + c]);
+    // 2. Hash all 10 64-byte leaf public keys in ONE stack batch!
+    let mut b64 = [Block::ZERO; UPORS_K];
+    let mut leaf_hashes = [[0u8; 32]; UPORS_K];
+    for t in 0..UPORS_K {
+        b64[t].0[..16].copy_from_slice(&tweak(TweakKind::OneTimeKey, UPORS_LAYER_U8, tree, sel.leaves[t], 0, 0));
+        let base = t * UPORS_N;
+        for c in 0..UPORS_N {
+            b64[t].0[16 + c * N..16 + (c + 1) * N].copy_from_slice(&vals[base + c]);
         }
     }
-    public.hash_many(&Batch::from_blocks(&b64[..], 64), &mut out[..UFORS_TREES]);
+    pub_h.hash_many(&Batch::from_blocks(&b64[..], 64), &mut leaf_hashes[..]);
 
-    // Walk all 15 height-5 Merkle paths in lockstep.
-    let mut cur: [[u8; N]; UFORS_TREES] = core::array::from_fn(|t| first_n(&out[t]));
-    let mut idx: [u32; UFORS_TREES] = core::array::from_fn(|t| u32::from(sel[t].leaf));
-    let mut b48 = [[0u8; 48]; UFORS_TREES];
-    let auth_off = UFORS_CHAINS * N;
+    // 3. Climb the Octopus bottom-up across levels 1..=10, batching each level on stack!
+    let mut cur_idx = sel.leaves;
+    let mut cur_val: [[u8; N]; UPORS_K] = core::array::from_fn(|t| first_n(&leaf_hashes[t]));
+    let mut cur_len = UPORS_K;
+    let mut sib_cursor = 0usize;
+    let mut b48 = [[0u8; 48]; UPORS_K];
+    let mut node_out = [[0u8; 32]; UPORS_K];
 
-    for level in 1..=TREE_HEIGHT {
+    for level in 1..=UPORS_HEIGHT {
         let level_u16 = u16::try_from(level).unwrap();
-        for t in 0..UFORS_TREES {
-            let layer_u8 = UFORS_LAYER_BASE + u8::try_from(t).unwrap();
-            let sib = &sig[t * UFORS_TREE_LEN + auth_off + (level - 1) * N..t * UFORS_TREE_LEN + auth_off + level * N];
-            let (left, right) = if idx[t] & 1 == 0 { (&cur[t][..], sib) } else { (sib, &cur[t][..]) };
-            pack_pair(&mut b48[t], tweak(TweakKind::Node, layer_u8, tree, 0, level_u16, idx[t] >> 1), left, right);
+        let mut next_len = 0usize;
+        let mut i = 0usize;
+        while i < cur_len {
+            let x = cur_idx[i];
+            let p = x >> 1;
+            let tw = tweak(TweakKind::Node, UPORS_LAYER_U8, tree, 0, level_u16, u32::from(p));
+            if i + 1 < cur_len && (x & 1) == 0 && cur_idx[i + 1] == x + 1 {
+                pack_pair(&mut b48[next_len], tw, &cur_val[i], &cur_val[i + 1]);
+                cur_idx[next_len] = p;
+                next_len += 1;
+                i += 2;
+            } else {
+                let off = octo_off + sib_cursor * N;
+                let sib = &sig[off..off + N];
+                sib_cursor += 1;
+                if (x & 1) == 0 {
+                    pack_pair(&mut b48[next_len], tw, &cur_val[i], sib);
+                } else {
+                    pack_pair(&mut b48[next_len], tw, sib, &cur_val[i]);
+                }
+                cur_idx[next_len] = p;
+                next_len += 1;
+                i += 1;
+            }
         }
-        public.hash_many(&b48[..], &mut out[..UFORS_TREES]);
-        for t in 0..UFORS_TREES {
-            cur[t] = first_n(&out[t]);
-            idx[t] >>= 1;
+        pub_h.hash_many(&b48[..next_len], &mut node_out[..next_len]);
+        for j in 0..next_len {
+            cur_val[j] = first_n(&node_out[j]);
         }
+        cur_len = next_len;
     }
+    assert_eq!(sib_cursor, sel.sibs);
 
-    ufors_root(public, leaf_addr, &cur)
+    // 4. Strictly enforce canonical all-zero trailing padding on unused Octopus slots.
+    let pad = &sig[octo_off + sib_cursor * N..octo_off + UPORS_M_MAX * N];
+    let zeros = [0u8; UPORS_M_MAX * N];
+    if !constant_time_eq(pad, &zeros[..pad.len()]) {
+        return None;
+    }
+    Some(cur_val[0])
 }

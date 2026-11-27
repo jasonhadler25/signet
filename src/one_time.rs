@@ -1,218 +1,490 @@
+use crate::coding::{rank_from_15_bytes, sperner_unrank};
+use crate::few_time::{extract_upors_codewords, grind_upors_selection};
 use crate::params::{
-    CHAIN_STEPS, CHAINS, LAYER_LEN, Layer, MSG_CHAINS, N, PublicKey, SecretKey, TREE_HEIGHT, TREE_LEAVES, TweakKind, UFORS_TOTAL_CHAINS, UFORS_TOTAL_LEAVES,
-    first_n, pack_pair, pack_tagged, tweak,
+    IMPRINT_LEN, LAYERS, LOW_HEIGHT, LOW_LEAVES, Layer, N, PublicKey, SecretKey, TOP_HEIGHT, TOP_LEAVES, TweakKind, UPORS_CTR_LEN, UPORS_HEIGHT, UPORS_K,
+    UPORS_LAYER_U8, UPORS_LEAVES, UPORS_M_MAX, UPORS_N, UPORS_STEPS, WOTS_CTR_LEN, WOTS_N, WOTS_PK_IN_LEN, WOTS_STEPS, first_n, pack_pair, pack_tagged, tweak,
 };
-use blake3_servil_core::throughput::{Batch, Block, Prepared, TreeHasher};
+use blake3_servil_core::throughput::{Batch, Block, Packed, Prepared, TreeHasher};
 
-const WOTS_BATCH_SLOTS: usize = TREE_LEAVES * CHAINS;
-const MERKLE_BATCH_SLOTS: usize = UFORS_TOTAL_LEAVES / 2;
+const TOP_TILE_LEAVES: usize = 1024;
+const TOP_MERKLE_PARENTS: usize = TOP_LEAVES / 2;
+const LOW_LAYERS: usize = LAYERS - 1;
+const LOW_TOTAL_LEAVES: usize = LOW_LAYERS * LOW_LEAVES;
+const UPORS_MERKLE_PARENTS: usize = UPORS_LEAVES / 2;
+const LOW_TOTAL_CHAINS: usize = LOW_TOTAL_LEAVES * WOTS_N;
+const UPORS_TOTAL_CHAINS: usize = UPORS_LEAVES * UPORS_N;
+const SUPER_CHAINS: usize = LOW_TOTAL_CHAINS + UPORS_TOTAL_CHAINS;
 
 const _: () = {
-    assert!(WOTS_BATCH_SLOTS == 1120 && UFORS_TOTAL_CHAINS == 1440 && UFORS_TOTAL_CHAINS >= WOTS_BATCH_SLOTS);
-    assert!(UFORS_TOTAL_LEAVES == 480 && MERKLE_BATCH_SLOTS == 240);
+    assert!(TOP_LEAVES.is_multiple_of(TOP_TILE_LEAVES));
+    assert!(TOP_MERKLE_PARENTS == 2048 && UPORS_MERKLE_PARENTS == 512);
+    assert!(LOW_TOTAL_LEAVES == 384 && LOW_TOTAL_CHAINS == 9216 && UPORS_TOTAL_CHAINS == 3072 && SUPER_CHAINS == 12288);
 };
 
-/// Transient heap workspace owned by a single `Signet::from_seed` or `Signet::imprint` call.
-pub(crate) struct SignWorkspace {
-    pub b16: Vec<[u8; 16]>,
-    pub b32: Vec<[u8; 32]>,
-    pub b48: Vec<[u8; 48]>,
-    pub b64: Vec<Block>,
-    pub b_pk: Batch<'static>,
-    pub out: Vec<[u8; 32]>,
-}
-
-impl SignWorkspace {
-    pub(crate) fn new(for_imprint: bool) -> Self {
-        let batch_chains = if for_imprint { UFORS_TOTAL_CHAINS } else { WOTS_BATCH_SLOTS };
-        let batch_48 = if for_imprint { MERKLE_BATCH_SLOTS } else { TREE_LEAVES / 2 };
-        let batch_64 = if for_imprint { UFORS_TOTAL_LEAVES } else { 0 };
-        Self {
-            b16: vec![[0u8; 16]; batch_chains],
-            b32: vec![[0u8; 32]; batch_chains],
-            b48: vec![[0u8; 48]; batch_48],
-            b64: vec![Block::ZERO; batch_64],
-            b_pk: Batch::new(16 + N * CHAINS, TREE_LEAVES),
-            out: vec![[0u8; 32]; batch_chains],
-        }
-    }
-}
-
-/// Checked position of a one-time signature in the hypertree (`tree < layer.trees()` and `leaf < TREE_LEAVES`).
-#[derive(Clone, Copy)]
-pub(crate) struct Pos {
-    layer: Layer,
-    tree: u64,
-    leaf: u16,
-}
-
-impl Pos {
-    pub(crate) fn new(layer: Layer, tree: u64, leaf: u16) -> Self {
-        assert!(tree < layer.trees() && usize::from(leaf) < TREE_LEAVES);
-        Self { layer, tree, leaf }
-    }
-}
-
-/// Convert a 16-byte node into 35 WOTS+ nibble digits (32 message nibbles + 3 checksum nibbles,
-/// little-endian nibble order; SPEC.md, "One-time signatures").
-pub(crate) fn digits(node: &[u8; N]) -> [u8; CHAINS] {
-    let mut out = [0u8; CHAINS];
-    let mut csum = 0u16;
-    for (i, &byte) in node.iter().enumerate() {
-        let (lo, hi) = (byte & 0x0f, byte >> 4);
-        out[2 * i] = lo;
-        out[2 * i + 1] = hi;
-        csum += u16::from(CHAIN_STEPS - lo) + u16::from(CHAIN_STEPS - hi);
-    }
-    out[MSG_CHAINS] = u8::try_from(csum & 0x0f).unwrap();
-    out[MSG_CHAINS + 1] = u8::try_from((csum >> 4) & 0x0f).unwrap();
-    out[MSG_CHAINS + 2] = u8::try_from((csum >> 8) & 0x0f).unwrap();
-    out
-}
-
-/// Advance each of 35 chains in place from `starts[c]` to `ends[c]`, batching active chains per step.
-pub(crate) fn advance_chains(public: &TreeHasher, pos: Pos, values: &mut [[u8; N]; CHAINS], starts: &[u8; CHAINS], ends: &[u8; CHAINS]) {
-    let mut order: [(u8, u8); CHAINS] = core::array::from_fn(|c| {
-        assert!(starts[c] <= ends[c] && ends[c] <= CHAIN_STEPS);
-        (ends[c] - starts[c], u8::try_from(c).unwrap())
-    });
-    order.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
-
-    let mut active = CHAINS;
-    while active > 0 && order[active - 1].0 == 0 {
-        active -= 1;
-    }
-    let mut b32 = [[0u8; 32]; CHAINS];
-    let mut out = [[0u8; 32]; CHAINS];
-    let layer = pos.layer.as_u8();
-    for (slot, &(_, c)) in order[..active].iter().enumerate() {
-        let idx = usize::from(c);
-        pack_tagged(&mut b32[slot], tweak(TweakKind::Chain, layer, pos.tree, pos.leaf, u16::from(c), u32::from(starts[idx])), &values[idx]);
-    }
-    for step in 1..=CHAIN_STEPS {
-        if active == 0 {
-            break;
-        }
-        public.hash_many(&b32[..active], &mut out[..active]);
-        while active > 0 && order[active - 1].0 == step {
-            active -= 1;
-            values[usize::from(order[active].1)].copy_from_slice(&out[active][..N]);
-        }
-        for (slot, &(_, c)) in order[..active].iter().enumerate() {
-            let idx = usize::from(c);
-            let m = &mut b32[slot];
-            m[12..16].copy_from_slice(&u32::from(starts[idx] + step).to_le_bytes());
-            m[16..32].copy_from_slice(&out[slot][..N]);
-        }
-    }
-}
-
-/// Build all `TREE_LEAVES` (32) WOTS+ verifying-key leaves for `(layer, tree)` and its 1-indexed
-/// binary Merkle heap (`2 * TREE_LEAVES` nodes; index `1` is the root).
-pub(crate) fn build_tree_heap(secret: &SecretKey, public: &PublicKey, layer: Layer, tree: u64, ws: &mut SignWorkspace) -> [[u8; N]; 2 * TREE_LEAVES] {
-    assert!(tree < layer.trees());
-    let layer_u8 = layer.as_u8();
+/// Build the `128 KiB` cached height-12 top Merkle heap (`2 * 4,096` 16-byte nodes, 1-indexed)
+/// using L1-friendly `1,024`-leaf SIMD tiling (zero `Drop`).
+pub(crate) fn build_top_tree(secret: &SecretKey, public: &PublicKey) -> Box<[[u8; N]]> {
     let pub_h = public.hasher(true);
+    let tile_chains = TOP_TILE_LEAVES * WOTS_N;
+    let mut b32 = Packed::<32>::new(tile_chains);
+    let mut b_pk = Batch::new(WOTS_PK_IN_LEN, TOP_TILE_LEAVES);
+    let mut b48 = Packed::<48>::new(TOP_MERKLE_PARENTS);
+    let mut out = vec![[0u8; 32]; tile_chains];
+    let mut nodes = vec![[0u8; N]; 2 * TOP_LEAVES].into_boxed_slice();
 
-    secret.derive_wots_tree_starts(layer, tree, &mut ws.b16, &mut ws.out);
+    let layer_u8 = Layer::TOP.as_u8();
+    let mut leaf_base = 0usize;
+    while leaf_base < TOP_LEAVES {
+        let leaf_end = leaf_base + TOP_TILE_LEAVES;
+        secret.derive_chain_starts(layer_u8, 0, u32::try_from(leaf_base * WOTS_N).unwrap(), true, &mut out[..tile_chains]);
 
-    for i in 0..TREE_LEAVES {
-        let leaf = u16::try_from(i).unwrap();
-        for c in 0..CHAINS {
-            let slot = i * CHAINS + c;
-            pack_tagged(&mut ws.b32[slot], tweak(TweakKind::Chain, layer_u8, tree, leaf, u16::try_from(c).unwrap(), 0), &ws.out[slot][..N]);
+        let mut slot = 0usize;
+        for l in leaf_base..leaf_end {
+            let leaf_u16 = u16::try_from(l).unwrap();
+            for c in 0..WOTS_N {
+                let tw = tweak(TweakKind::Chain, layer_u8, 0, leaf_u16, u16::try_from(c).unwrap(), 0);
+                b32[slot][..12].copy_from_slice(&tw[..12]);
+                slot += 1;
+            }
         }
-    }
-    pub_h.hash_many(&ws.b32[..WOTS_BATCH_SLOTS], &mut ws.out[..WOTS_BATCH_SLOTS]);
-    for step in 1..CHAIN_STEPS {
-        let next = u32::from(step).to_le_bytes();
-        for slot in 0..WOTS_BATCH_SLOTS {
-            let m = &mut ws.b32[slot];
-            m[12..16].copy_from_slice(&next);
-            m[16..32].copy_from_slice(&ws.out[slot][..N]);
+
+        for step in 0..WOTS_STEPS {
+            let step_bytes = u32::from(step).to_le_bytes();
+            for (m, o) in b32[..tile_chains].iter_mut().zip(out[..tile_chains].iter()) {
+                m[12..16].copy_from_slice(&step_bytes);
+                m[16..32].copy_from_slice(&o[..N]);
+            }
+            pub_h.hash_many(&b32.part(0..tile_chains), &mut out[..tile_chains]);
         }
-        pub_h.hash_many(&ws.b32[..WOTS_BATCH_SLOTS], &mut ws.out[..WOTS_BATCH_SLOTS]);
-    }
 
-    for i in 0..TREE_LEAVES {
-        let leaf = u16::try_from(i).unwrap();
-        let m = ws.b_pk.message_mut(i);
-        m[..16].copy_from_slice(&tweak(TweakKind::OneTimeKey, layer_u8, tree, leaf, 0, 0));
-        for c in 0..CHAINS {
-            m[16 + c * N..16 + (c + 1) * N].copy_from_slice(&ws.out[i * CHAINS + c][..N]);
+        for rel in 0..TOP_TILE_LEAVES {
+            let l = leaf_base + rel;
+            let m = b_pk.message_mut(rel);
+            m[..16].copy_from_slice(&tweak(TweakKind::OneTimeKey, layer_u8, 0, u16::try_from(l).unwrap(), 0, 0));
+            let cbase = rel * WOTS_N;
+            for c in 0..WOTS_N {
+                m[16 + c * N..16 + (c + 1) * N].copy_from_slice(&out[cbase + c][..N]);
+            }
         }
+        pub_h.hash_many(&b_pk.part(0..TOP_TILE_LEAVES), &mut out[..TOP_TILE_LEAVES]);
+        for rel in 0..TOP_TILE_LEAVES {
+            nodes[TOP_LEAVES + leaf_base + rel] = first_n(&out[rel]);
+        }
+        leaf_base = leaf_end;
     }
-    pub_h.hash_many(&ws.b_pk.part(0..TREE_LEAVES), &mut ws.out[..TREE_LEAVES]);
 
-    let mut nodes = [[0u8; N]; 2 * TREE_LEAVES];
-    for i in 0..TREE_LEAVES {
-        nodes[TREE_LEAVES + i] = first_n(&ws.out[i]);
-    }
-
-    let (mut level_start, mut count) = (TREE_LEAVES, TREE_LEAVES);
-    for level in 1..=TREE_HEIGHT {
+    let mut level_start = TOP_LEAVES;
+    let mut count = TOP_LEAVES;
+    for level in 1..=TOP_HEIGHT {
         let level_u16 = u16::try_from(level).unwrap();
-        let (parents, parent_start) = (count / 2, level_start / 2);
-        for (j, slot) in ws.b48[..parents].iter_mut().enumerate() {
+        let parents = count / 2;
+        let parent_start = level_start / 2;
+        for j in 0..parents {
             pack_pair(
-                slot,
-                tweak(TweakKind::Node, layer_u8, tree, 0, level_u16, u32::try_from(j).unwrap()),
+                &mut b48[j],
+                tweak(TweakKind::Node, layer_u8, 0, 0, level_u16, u32::try_from(j).unwrap()),
                 &nodes[level_start + 2 * j],
                 &nodes[level_start + 2 * j + 1],
             );
         }
-        pub_h.hash_many(&ws.b48[..parents], &mut ws.out[..parents]);
+        pub_h.hash_many(&b48.part(0..parents), &mut out[..parents]);
         for j in 0..parents {
-            nodes[parent_start + j] = first_n(&ws.out[j]);
+            nodes[parent_start + j] = first_n(&out[j]);
         }
-        (level_start, count) = (parent_start, parents);
+        level_start = parent_start;
+        count = parents;
     }
     nodes
 }
 
-/// Write a WOTS+ signature (35 chains) and authentication path (`TREE_HEIGHT` nodes) into `out`.
-pub(crate) fn write_layer_signature(secret: &SecretKey, public: &PublicKey, pos: Pos, node: &[u8; N], tree_nodes: &[[u8; N]; 2 * TREE_LEAVES], out: &mut [u8]) {
-    assert_eq!(out.len(), LAYER_LEN);
+/// Grind the deterministic smallest `u16` counter `ctr` for `S-WOTS+Z(z = 8)` via register-only
+/// `TreeHasher::hash_counter_range` on `OneTimeMsg` (`counter_word = 8`).
+pub(crate) fn grind_wots_msg(pub_h: &TreeHasher, layer: Layer, tree: u64, leaf: u16, child_root: &[u8; N]) -> (u16, u128) {
+    let mut tmpl = [0u8; 36];
+    tmpl[..16].copy_from_slice(&tweak(TweakKind::OneTimeMsg, layer.as_u8(), tree, leaf, 0, 0));
+    tmpl[16..32].copy_from_slice(child_root);
 
-    let pub_h = public.hasher(false);
-    let mut values = secret.derive_wots_leaf_starts(pos.layer, pos.tree, pos.leaf);
-    advance_chains(&pub_h, pos, &mut values, &[0u8; CHAINS], &digits(node));
-
-    for c in 0..CHAINS {
-        out[c * N..(c + 1) * N].copy_from_slice(&values[c]);
+    const BATCH: usize = 256;
+    const _: () = assert!((u16::MAX as usize + 1).is_multiple_of(BATCH));
+    let mut out = [[0u8; 32]; BATCH];
+    let mut start = 0u32;
+    while u16::try_from(start).is_ok() {
+        pub_h.hash_counter_range(&tmpl, 8, start, &mut out);
+        for (i, h) in out.iter().enumerate() {
+            if h[0] == 0 {
+                let ctr = u16::try_from(start + u32::try_from(i).unwrap()).unwrap();
+                return (ctr, rank_from_15_bytes(&h[1..16]));
+            }
+        }
+        start += u32::try_from(BATCH).unwrap();
     }
-    let mut cursor = TREE_LEAVES + usize::from(pos.leaf);
-    let auth_off = CHAINS * N;
-    for level in 0..TREE_HEIGHT {
-        out[auth_off + level * N..auth_off + (level + 1) * N].copy_from_slice(&tree_nodes[cursor ^ 1]);
-        cursor >>= 1;
-    }
+    panic!("S-WOTS+Z u16 counter exhausted (probability 2^-370)");
 }
 
-/// Verify one hypertree layer signature and return its reconstructed Merkle root.
-pub(crate) fn verify_layer(public: &TreeHasher, pos: Pos, node: &[u8; N], layer_sig: &[u8]) -> [u8; N] {
-    assert_eq!(layer_sig.len(), LAYER_LEN);
-
-    let mut values: [[u8; N]; CHAINS] = core::array::from_fn(|c| layer_sig[c * N..(c + 1) * N].try_into().unwrap());
-    advance_chains(public, pos, &mut values, &digits(node), &[CHAIN_STEPS; CHAINS]);
-
-    let layer_u8 = pos.layer.as_u8();
-    let mut pk_in = [0u8; 16 + N * CHAINS];
-    pk_in[..16].copy_from_slice(&tweak(TweakKind::OneTimeKey, layer_u8, pos.tree, pos.leaf, 0, 0));
-    for c in 0..CHAINS {
-        pk_in[16 + c * N..16 + (c + 1) * N].copy_from_slice(&values[c]);
+/// Verify one `S-WOTS+Z(z = 8)` counter `ctr` and return its 120-bit Sperner rank iff `h[0] == 0`.
+#[inline]
+pub(crate) fn verify_wots_msg(pub_h: &TreeHasher, layer: Layer, tree: u64, leaf: u16, child_root: &[u8; N], ctr: u16) -> Option<u128> {
+    let mut msg = [0u8; 36];
+    msg[..16].copy_from_slice(&tweak(TweakKind::OneTimeMsg, layer.as_u8(), tree, leaf, 0, 0));
+    msg[16..32].copy_from_slice(child_root);
+    msg[32..36].copy_from_slice(&u32::from(ctr).to_le_bytes());
+    let h = *pub_h.hash(&msg).as_bytes();
+    if h[0] != 0 {
+        return None;
     }
-    let mut cur = first_n(public.hash(&pk_in).as_bytes());
+    Some(rank_from_15_bytes(&h[1..16]))
+}
 
-    let auth_off = CHAINS * N;
-    let mut index = u32::from(pos.leaf);
-    let mut pair = [0u8; 48];
-    for level in 1..=TREE_HEIGHT {
-        let sib = &layer_sig[auth_off + (level - 1) * N..auth_off + level * N];
-        let (left, right) = if index & 1 == 0 { (&cur[..], sib) } else { (sib, &cur[..]) };
-        pack_pair(&mut pair, tweak(TweakKind::Node, layer_u8, pos.tree, 0, u16::try_from(level).unwrap(), index >> 1), left, right);
-        cur = first_n(public.hash(&pair).as_bytes());
-        index >>= 1;
+/// Sign a `BLINCS-128-A2` imprint using a single merged `12,288`-chain single-threaded SIMD
+/// super-wave (all three lower hypertree layers + height-10 `U-PORS` tree stepped in lockstep),
+/// keeping stack usage tiny (< 16 KiB) with zero `Drop` implementations.
+pub(crate) fn sign_superwave(secret: &SecretKey, public: &PublicKey, e: &[u8; N], r: &[u8; N], d_seed: &[u8; 32], top_tree: &[[u8; N]]) -> [u8; IMPRINT_LEN] {
+    let pub_h = public.hasher(true);
+    let sel = grind_upors_selection(&pub_h, d_seed);
+    let codewords = extract_upors_codewords(public, d_seed, sel.ctr);
+    let splits = sel.leaf_addr.split_layers();
+
+    let mut sig = [0u8; IMPRINT_LEN];
+    sig[..N].copy_from_slice(e);
+    sig[N..2 * N].copy_from_slice(r);
+    let upors_base = 2 * N;
+    sig[upors_base..upors_base + UPORS_CTR_LEN].copy_from_slice(&sel.ctr.to_le_bytes());
+    let upors_chains_off = upors_base + UPORS_CTR_LEN;
+    let upors_octo_off = upors_chains_off + UPORS_K * UPORS_N * N;
+
+    let mut b32 = Packed::<32>::new(SUPER_CHAINS);
+    let mut b48 = Packed::<48>::new(UPORS_MERKLE_PARENTS);
+    let mut b64 = vec![Block::ZERO; UPORS_LEAVES];
+    let mut b_pk = Batch::new(WOTS_PK_IN_LEN, LOW_TOTAL_LEAVES);
+    let mut out = vec![[0u8; 32]; SUPER_CHAINS];
+    let mut upors_hashes = vec![[0u8; 32]; UPORS_LEAVES];
+    let mut upors_nodes = vec![[0u8; N]; UPORS_LEAVES];
+    let mut low_nodes = vec![[0u8; N]; LOW_LAYERS * 2 * LOW_LEAVES];
+
+    // 1. Derive all 12,288 chain starts via 4 register-only `hash_counter_range` calls.
+    for layer in Layer::LOWER {
+        let (tree, _) = splits[layer.index()];
+        let off = layer.index() * LOW_LEAVES * WOTS_N;
+        secret.derive_chain_starts(layer.as_u8(), tree, 0, true, &mut out[off..off + LOW_LEAVES * WOTS_N]);
     }
-    cur
+    let upors_tree = sel.leaf_addr.as_u64();
+    secret.derive_chain_starts(UPORS_LAYER_U8, upors_tree, 0, true, &mut out[LOW_TOTAL_CHAINS..SUPER_CHAINS]);
+
+    for t in 0..UPORS_K {
+        let base = LOW_TOTAL_CHAINS + usize::from(sel.leaves[t]) * UPORS_N;
+        for c in 0..UPORS_N {
+            if codewords[t][c] == 0 {
+                let dst = upors_chains_off + (t * UPORS_N + c) * N;
+                sig[dst..dst + N].copy_from_slice(&out[base + c][..N]);
+            }
+        }
+    }
+
+    // 2. Pack invariant 12-byte tweak prefix once across all 12,288 slots.
+    let mut slot = 0usize;
+    for layer in Layer::LOWER {
+        let layer_u8 = layer.as_u8();
+        let (tree, _) = splits[layer.index()];
+        for l in 0..LOW_LEAVES {
+            let leaf_u16 = u16::try_from(l).unwrap();
+            for c in 0..WOTS_N {
+                let tw = tweak(TweakKind::Chain, layer_u8, tree, leaf_u16, u16::try_from(c).unwrap(), 0);
+                b32[slot][..12].copy_from_slice(&tw[..12]);
+                slot += 1;
+            }
+        }
+    }
+    for l in 0..UPORS_LEAVES {
+        let leaf_u16 = u16::try_from(l).unwrap();
+        for c in 0..UPORS_N {
+            let tw = tweak(TweakKind::Chain, UPORS_LAYER_U8, upors_tree, leaf_u16, u16::try_from(c).unwrap(), 0);
+            b32[slot][..12].copy_from_slice(&tw[..12]);
+            slot += 1;
+        }
+    }
+    assert_eq!(slot, SUPER_CHAINS);
+
+    // 3. Steps 0..23: all 12,288 chains (L0 + L1 + L2 + U-PORS) in one lockstep super-wave.
+    for step in 0..UPORS_STEPS {
+        let step_bytes = u32::from(step).to_le_bytes();
+        for (m, o) in b32[..SUPER_CHAINS].iter_mut().zip(out[..SUPER_CHAINS].iter()) {
+            m[12..16].copy_from_slice(&step_bytes);
+            m[16..32].copy_from_slice(&o[..N]);
+        }
+        pub_h.hash_many(&b32.part(0..SUPER_CHAINS), &mut out[..SUPER_CHAINS]);
+
+        let completed = step + 1;
+        for t in 0..UPORS_K {
+            let base = LOW_TOTAL_CHAINS + usize::from(sel.leaves[t]) * UPORS_N;
+            for c in 0..UPORS_N {
+                if codewords[t][c] == completed {
+                    let dst = upors_chains_off + (t * UPORS_N + c) * N;
+                    sig[dst..dst + N].copy_from_slice(&out[base + c][..N]);
+                }
+            }
+        }
+    }
+
+    // 4. Finish U-PORS 64-byte leaves while U-PORS endpoints sit in out[9216..12288].
+    for (l, blk) in b64.iter_mut().enumerate() {
+        let cbase = LOW_TOTAL_CHAINS + l * UPORS_N;
+        let dst = &mut blk.0;
+        dst[..16].copy_from_slice(&tweak(TweakKind::OneTimeKey, UPORS_LAYER_U8, upors_tree, u16::try_from(l).unwrap(), 0, 0));
+        for c in 0..UPORS_N {
+            dst[16 + c * N..16 + (c + 1) * N].copy_from_slice(&out[cbase + c][..N]);
+        }
+    }
+    pub_h.hash_many(&Batch::from_blocks(&b64[..UPORS_LEAVES], 64), &mut upors_hashes[..UPORS_LEAVES]);
+    for (dst, src) in upors_nodes.iter_mut().zip(upors_hashes.iter()) {
+        *dst = first_n(src);
+    }
+
+    // 5. Steps 23..39: finish the remaining 16 steps on all 9,216 lower-hypertree chains.
+    for step in UPORS_STEPS..WOTS_STEPS {
+        let step_bytes = u32::from(step).to_le_bytes();
+        for (m, o) in b32[..LOW_TOTAL_CHAINS].iter_mut().zip(out[..LOW_TOTAL_CHAINS].iter()) {
+            m[12..16].copy_from_slice(&step_bytes);
+            m[16..32].copy_from_slice(&o[..N]);
+        }
+        pub_h.hash_many(&b32.part(0..LOW_TOTAL_CHAINS), &mut out[..LOW_TOTAL_CHAINS]);
+    }
+
+    // 6. Hash all 384 lower-hypertree 400-byte WOTS public keys in one batch.
+    for layer in Layer::LOWER {
+        let layer_u8 = layer.as_u8();
+        let (tree, _) = splits[layer.index()];
+        for l in 0..LOW_LEAVES {
+            let pk_idx = layer.index() * LOW_LEAVES + l;
+            let m = b_pk.message_mut(pk_idx);
+            m[..16].copy_from_slice(&tweak(TweakKind::OneTimeKey, layer_u8, tree, u16::try_from(l).unwrap(), 0, 0));
+            let cbase = pk_idx * WOTS_N;
+            for c in 0..WOTS_N {
+                m[16 + c * N..16 + (c + 1) * N].copy_from_slice(&out[cbase + c][..N]);
+            }
+        }
+    }
+    pub_h.hash_many(&b_pk.part(0..LOW_TOTAL_LEAVES), &mut out[..LOW_TOTAL_LEAVES]);
+    for layer in Layer::LOWER {
+        let heap_base = layer.index() * 2 * LOW_LEAVES;
+        for l in 0..LOW_LEAVES {
+            low_nodes[heap_base + LOW_LEAVES + l] = first_n(&out[layer.index() * LOW_LEAVES + l]);
+        }
+    }
+
+    // 7. Build U-PORS height-10 Merkle tree + extract Octopus siblings -> `upors_root`.
+    let mut cur_idx = sel.leaves;
+    let mut cur_len = UPORS_K;
+    let mut sib_cursor = 0usize;
+    let mut width = UPORS_LEAVES;
+    for level in 1..=UPORS_HEIGHT {
+        let level_u16 = u16::try_from(level).unwrap();
+        let mut next_len = 0usize;
+        let mut i = 0usize;
+        while i < cur_len {
+            let x = cur_idx[i];
+            if i + 1 < cur_len && (x & 1) == 0 && cur_idx[i + 1] == x + 1 {
+                cur_idx[next_len] = x >> 1;
+                next_len += 1;
+                i += 2;
+            } else {
+                let off = upors_octo_off + sib_cursor * N;
+                sig[off..off + N].copy_from_slice(&upors_nodes[usize::from(x ^ 1)]);
+                sib_cursor += 1;
+                cur_idx[next_len] = x >> 1;
+                next_len += 1;
+                i += 1;
+            }
+        }
+        cur_len = next_len;
+
+        let parents = width / 2;
+        for p in 0..parents {
+            pack_pair(
+                &mut b48[p],
+                tweak(TweakKind::Node, UPORS_LAYER_U8, upors_tree, 0, level_u16, u32::try_from(p).unwrap()),
+                &upors_nodes[2 * p],
+                &upors_nodes[2 * p + 1],
+            );
+        }
+        pub_h.hash_many(&b48.part(0..parents), &mut out[..parents]);
+        for p in 0..parents {
+            upors_nodes[p] = first_n(&out[p]);
+        }
+        width = parents;
+    }
+    assert_eq!(sib_cursor, sel.sibs);
+    sig[upors_octo_off + sib_cursor * N..upors_octo_off + UPORS_M_MAX * N].fill(0);
+    let upors_root = upors_nodes[0];
+
+    // 8. Build all 3 lower Merkle heaps (L0, L1, L2) in lockstep.
+    let mut level_start = LOW_LEAVES;
+    let mut count = LOW_LEAVES;
+    for level in 1..=LOW_HEIGHT {
+        let level_u16 = u16::try_from(level).unwrap();
+        let parents = count / 2;
+        let parent_start = level_start / 2;
+        let mut pslot = 0usize;
+        for layer in Layer::LOWER {
+            let layer_u8 = layer.as_u8();
+            let (tree, _) = splits[layer.index()];
+            let heap_base = layer.index() * 2 * LOW_LEAVES;
+            for j in 0..parents {
+                pack_pair(
+                    &mut b48[pslot],
+                    tweak(TweakKind::Node, layer_u8, tree, 0, level_u16, u32::try_from(j).unwrap()),
+                    &low_nodes[heap_base + level_start + 2 * j],
+                    &low_nodes[heap_base + level_start + 2 * j + 1],
+                );
+                pslot += 1;
+            }
+        }
+        pub_h.hash_many(&b48.part(0..pslot), &mut out[..pslot]);
+        let mut rslot = 0usize;
+        for layer in Layer::LOWER {
+            let heap_base = layer.index() * 2 * LOW_LEAVES;
+            for j in 0..parents {
+                low_nodes[heap_base + parent_start + j] = first_n(&out[rslot]);
+                rslot += 1;
+            }
+        }
+        level_start = parent_start;
+        count = parents;
+    }
+
+    // 9. Grind all 4 S-WOTS+Z counters, unrank Sperner vectors, and advance all 96 active chains in one NEON batch.
+    let child_roots = [upors_root, low_nodes[1], low_nodes[2 * LOW_LEAVES + 1], low_nodes[4 * LOW_LEAVES + 1]];
+    const ACTIVE_TOTAL: usize = LAYERS * WOTS_N;
+    let mut active_vals = [[0u8; N]; ACTIVE_TOTAL];
+    let mut active_ends = [0u8; ACTIVE_TOTAL];
+    let mut raw_starts = [[0u8; 32]; WOTS_N];
+
+    for layer in Layer::ALL {
+        let li = layer.index();
+        let (tree, leaf) = splits[li];
+        let (ctr, rank) = grind_wots_msg(&pub_h, layer, tree, leaf, &child_roots[li]);
+        let digits = sperner_unrank(rank);
+
+        let off = layer.sig_offset();
+        sig[off..off + WOTS_CTR_LEN].copy_from_slice(&ctr.to_le_bytes());
+
+        secret.derive_chain_starts(layer.as_u8(), tree, u32::from(leaf) * u32::try_from(WOTS_N).unwrap(), false, &mut raw_starts);
+        for c in 0..WOTS_N {
+            active_vals[li * WOTS_N + c] = first_n(&raw_starts[c]);
+            active_ends[li * WOTS_N + c] = digits[c];
+        }
+    }
+
+    let mut order: [(u8, u8); ACTIVE_TOTAL] = core::array::from_fn(|i| (active_ends[i], u8::try_from(i).unwrap()));
+    order.sort_unstable_by_key(|x| core::cmp::Reverse(x.0));
+    let mut active = order.partition_point(|&(rem, _)| rem > 0);
+    let mut ab32 = [[0u8; 32]; ACTIVE_TOTAL];
+    let mut aout = [[0u8; 32]; ACTIVE_TOTAL];
+    for (slot, &(_, idx_u8)) in order[..active].iter().enumerate() {
+        let idx = usize::from(idx_u8);
+        let li = idx / WOTS_N;
+        let c = idx % WOTS_N;
+        let (tree, leaf) = splits[li];
+        pack_tagged(&mut ab32[slot], tweak(TweakKind::Chain, u8::try_from(li).unwrap(), tree, leaf, u16::try_from(c).unwrap(), 0), &active_vals[idx]);
+    }
+    let pub_neon = public.hasher(false);
+    for step in 1..=WOTS_STEPS {
+        if active == 0 {
+            break;
+        }
+        pub_neon.hash_many(&ab32[..active], &mut aout[..active]);
+        while active > 0 && order[active - 1].0 == step {
+            active -= 1;
+            active_vals[usize::from(order[active].1)].copy_from_slice(&aout[active][..N]);
+        }
+        let next_step = u32::from(step).to_le_bytes();
+        for slot in 0..active {
+            let m = &mut ab32[slot];
+            m[12..16].copy_from_slice(&next_step);
+            m[16..32].copy_from_slice(&aout[slot][..N]);
+        }
+    }
+
+    for layer in Layer::ALL {
+        let li = layer.index();
+        let off = layer.sig_offset();
+        for c in 0..WOTS_N {
+            sig[off + WOTS_CTR_LEN + c * N..off + WOTS_CTR_LEN + (c + 1) * N].copy_from_slice(&active_vals[li * WOTS_N + c]);
+        }
+        let auth_off = off + WOTS_CTR_LEN + WOTS_N * N;
+        let (_, leaf) = splits[li];
+        if layer == Layer::TOP {
+            let mut cursor = TOP_LEAVES + usize::from(leaf);
+            for level in 0..TOP_HEIGHT {
+                sig[auth_off + level * N..auth_off + (level + 1) * N].copy_from_slice(&top_tree[cursor ^ 1]);
+                cursor >>= 1;
+            }
+        } else {
+            let heap_base = li * 2 * LOW_LEAVES;
+            let mut cursor = LOW_LEAVES + usize::from(leaf);
+            for level in 0..LOW_HEIGHT {
+                sig[auth_off + level * N..auth_off + (level + 1) * N].copy_from_slice(&low_nodes[heap_base + (cursor ^ 1)]);
+                cursor >>= 1;
+            }
+        }
+    }
+    sig
+}
+
+/// Zero-allocation stack-batched `S-WOTS+Z` + Merkle path verifier for one hypertree layer.
+pub(crate) fn verify_layer(pub_h: &TreeHasher, layer: Layer, tree: u64, leaf: u16, child_root: &[u8; N], layer_sig: &[u8]) -> Option<[u8; N]> {
+    let ctr = u16::from_le_bytes(layer_sig[..WOTS_CTR_LEN].try_into().unwrap());
+    let rank = verify_wots_msg(pub_h, layer, tree, leaf, child_root, ctr)?;
+    let digits = sperner_unrank(rank);
+
+    let chains_off = WOTS_CTR_LEN;
+    let auth_off = WOTS_CTR_LEN + WOTS_N * N;
+    let mut vals: [[u8; N]; WOTS_N] = core::array::from_fn(|c| layer_sig[chains_off + c * N..chains_off + (c + 1) * N].try_into().unwrap());
+    let mut order: [(u8, u8); WOTS_N] = core::array::from_fn(|c| (WOTS_STEPS - digits[c], u8::try_from(c).unwrap()));
+    order.sort_unstable_by_key(|x| core::cmp::Reverse(x.0));
+    let mut active = order.partition_point(|&(rem, _)| rem > 0);
+
+    let layer_u8 = layer.as_u8();
+    let mut b32 = [[0u8; 32]; WOTS_N];
+    let mut out = [[0u8; 32]; WOTS_N];
+    for (slot, &(_, c_u8)) in order[..active].iter().enumerate() {
+        let c = usize::from(c_u8);
+        pack_tagged(&mut b32[slot], tweak(TweakKind::Chain, layer_u8, tree, leaf, u16::from(c_u8), u32::from(digits[c])), &vals[c]);
+    }
+    for step in 1..=WOTS_STEPS {
+        if active == 0 {
+            break;
+        }
+        pub_h.hash_many(&b32[..active], &mut out[..active]);
+        while active > 0 && order[active - 1].0 == step {
+            active -= 1;
+            vals[usize::from(order[active].1)].copy_from_slice(&out[active][..N]);
+        }
+        for (slot, &(_, c_u8)) in order[..active].iter().enumerate() {
+            let c = usize::from(c_u8);
+            let m = &mut b32[slot];
+            m[12..16].copy_from_slice(&u32::from(digits[c] + step).to_le_bytes());
+            m[16..32].copy_from_slice(&out[slot][..N]);
+        }
+    }
+
+    let mut pk_buf = [0u8; WOTS_PK_IN_LEN];
+    pk_buf[..16].copy_from_slice(&tweak(TweakKind::OneTimeKey, layer_u8, tree, leaf, 0, 0));
+    for c in 0..WOTS_N {
+        pk_buf[16 + c * N..16 + (c + 1) * N].copy_from_slice(&vals[c]);
+    }
+    let mut node = first_n(pub_h.hash(&pk_buf).as_bytes());
+    let mut idx = usize::from(leaf);
+    let mut buf = [0u8; 48];
+    for level in 0..layer.height() {
+        let sib = &layer_sig[auth_off + level * N..auth_off + (level + 1) * N];
+        let tw = tweak(TweakKind::Node, layer_u8, tree, 0, u16::try_from(level + 1).unwrap(), u32::try_from(idx >> 1).unwrap());
+        if (idx & 1) == 0 {
+            pack_pair(&mut buf, tw, &node, sib);
+        } else {
+            pack_pair(&mut buf, tw, sib, &node);
+        }
+        node = first_n(pub_h.hash(&buf).as_bytes());
+        idx >>= 1;
+    }
+    Some(node)
 }

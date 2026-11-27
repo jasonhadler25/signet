@@ -78,37 +78,41 @@ const enc = new TextEncoder();
 export const derive = (ctx: string, m: Uint8Array): Uint8Array =>
   b3(toWords(b3(IV, DK_CTX, enc.encode(ctx)), 0, 32, 8), DK_MAT, m);
 
-// ---------------- BLINCS-128-7x5 ----------------
-const N = 16, LAYERS = 7, TREE_HEIGHT = 5, CHAINS = 35, SIG_LEN = 6432, MAX_CTX = 255;
-const UFORS_TREES = 15, UFORS_CHAINS = 3, UFORS_STEPS = 9, UFORS_SUM = 16, UFORS_CODE_BITS = 6, UFORS_LAYER_BASE = 0x80;
-const UFORS_TREE_LEN = (UFORS_CHAINS + TREE_HEIGHT) * N;
-const BP = "BLINCS-128-7x5 2026-11-26 ";
+// ---------------- BLINCS-128-A2 ----------------
+const N = 16, LAYERS = 4, LOW_HEIGHT = 7, TOP_HEIGHT = 12, HYPER_BITS = 33, SIG_LEN = 3292, MAX_CTX = 255;
+const WOTS_N = 24, WOTS_W = 40, WOTS_STEPS = 39, WOTS_SUM = 468, WOTS_CTR_LEN = 2;
+const UPORS_HEIGHT = 10, UPORS_N = 3, UPORS_STEPS = 23, UPORS_SUM = 42, UPORS_C = 376;
+const UPORS_K = 10, UPORS_M_MAX = 44, UPORS_CTR_LEN = 4, UPORS_LAYER = 0x80, UPORS_SELECT_MAX_DRAWS = 22;
+const BP = "BLINCS-128-A2 2026-11-26 ";
 const SP = "Signet 2026-11-26 randomness: ";
 const CTX_PUBLIC_HASH = BP + "public hash", CTX_CONTENT = BP + "content",
   CTX_MIX = SP + "mix", CTX_NEXT_SEED = SP + "next seed",
   CTX_RUN_KEY = SP + "key of this run", CTX_KEYGEN_KEY = SP + "keygen key";
-const CHAIN = 2, ONE_TIME_KEY = 3, NODE = 4, FEW_ROOT = 5, MESSAGE = 6;
+const CHAIN = 2, ONE_TIME_KEY = 3, NODE = 4, ONE_TIME_MSG = 5, MESSAGE = 6, FEW_SELECT = 7, FEW_CODE = 8;
 
-const UFORS_CODE: readonly [number, number, number][] = (() => {
-  const all: [number, number, number][] = [];
-  for (let a = 0; a <= UFORS_STEPS; a++) {
-    for (let b = 0; b <= UFORS_STEPS; b++) {
-      const c = UFORS_SUM - a - b;
-      if (c >= 0 && c <= UFORS_STEPS) all.push([a, b, c]);
+const SPERNER_DP: bigint[][] = (() => {
+  const dp: bigint[][] = Array.from({ length: WOTS_N + 1 }, () => Array<bigint>(WOTS_SUM + 1).fill(0n));
+  dp[0][0] = 1n;
+  for (let k = 1; k <= WOTS_N; k++) {
+    let acc = 0n;
+    for (let s = 0; s <= WOTS_SUM; s++) {
+      acc += dp[k - 1][s];
+      if (s >= WOTS_W) acc -= dp[k - 1][s - WOTS_W];
+      dp[k][s] = acc;
     }
   }
-  const byNorm = [...all].sort((x, y) => {
-    const nx = x[0] * x[0] + x[1] * x[1] + x[2] * x[2];
-    const ny = y[0] * y[0] + y[1] * y[1] + y[2] * y[2];
-    return nx - ny || x[0] - y[0] || x[1] - y[1] || x[2] - y[2];
-  });
-  const dropped = new Set(byNorm.slice(0, all.length - (1 << UFORS_CODE_BITS)).map((t) => t.join(",")));
-  return all.filter((t) => !dropped.has(t.join(",")));
+  return dp;
 })();
 
 function cat(...xs: Uint8Array[]): Uint8Array {
   const r = new Uint8Array(xs.reduce((s, x) => s + x.length, 0));
   let o = 0; for (const x of xs) { r.set(x, o); o += x.length; } return r;
+}
+function u32le(x: number): Uint8Array {
+  return new Uint8Array([x & 0xff, (x >>> 8) & 0xff, (x >>> 16) & 0xff, (x >>> 24) & 0xff]);
+}
+function readU32le(b: Uint8Array, off: number): number {
+  return (b[off] | (b[off + 1] << 8) | (b[off + 2] << 16) | (b[off + 3] << 24)) >>> 0;
 }
 function tweak(kind: number, layer: number, tree: number, leaf: number, a: number, b: number): Uint8Array {
   const t = new Uint8Array(16);
@@ -129,31 +133,71 @@ function readBits(d: Uint8Array, bitOff: number, width: number): number {
   for (let i = 31; i >= 0; i--) acc = (acc << 8n) | BigInt(d[i]);
   return Number((acc >> BigInt(bitOff)) & ((1n << BigInt(width)) - 1n));
 }
-function digits(node: Uint8Array): number[] {
-  const d: number[] = [];
-  for (let i = 0; i < 16; i++) { d.push(node[i] & 0x0f, node[i] >> 4); }
-  let cs = 0; for (let j = 0; j < 32; j++) cs += 15 - d[j];
-  d.push(cs & 0x0f, (cs >> 4) & 0x0f, (cs >> 8) & 0x0f);
-  return d;
+function hexUnrank(idx: number): [number, number, number] {
+  let remIdx = idx;
+  for (let a = 0; a <= UPORS_STEPS; a++) {
+    const rem = UPORS_SUM - a;
+    const bLo = Math.max(0, rem - UPORS_STEPS);
+    const bHi = Math.min(rem, UPORS_STEPS);
+    if (bHi < bLo) continue;
+    const len = bHi - bLo + 1;
+    if (remIdx < len) { const b = bLo + remIdx; return [a, b, rem - b]; }
+    remIdx -= len;
+  }
+  throw new Error("hexUnrank out of range");
 }
-function verifyTreeLeaf(
-  kPub: Uint8Array, layer: number, tree: number, leaf: number,
-  ds: readonly number[], maxSteps: number, sig: Uint8Array, off: number,
-): Uint8Array {
-  const ends: Uint8Array[] = [];
-  for (let c = 0; c < ds.length; c++) {
-    let v: Uint8Array = sig.slice(off + c * N, off + (c + 1) * N);
-    for (let s = ds[c]; s < maxSteps; s++) v = shortHash(kPub, tweak(CHAIN, layer, tree, leaf, c, s), v);
-    ends.push(v);
+function spernerUnrank(rank: bigint): number[] {
+  let r = rank, rem = WOTS_SUM;
+  const out: number[] = [];
+  for (let i = 0; i < WOTS_N; i++) {
+    const row = SPERNER_DP[WOTS_N - 1 - i];
+    const dHi = Math.min(rem, WOTS_STEPS);
+    for (let d = 0; d <= dHi; d++) {
+      const cnt = row[rem - d];
+      if (r < cnt) { out.push(d); rem -= d; break; }
+      r -= cnt;
+    }
   }
-  let v = shortHash(kPub, tweak(ONE_TIME_KEY, layer, tree, leaf, 0, 0), cat(...ends));
-  for (let lv = 1; lv <= TREE_HEIGHT; lv++) {
-    const a0 = off + (ds.length + lv - 1) * N;
-    const auth = sig.subarray(a0, a0 + N);
-    const tw = tweak(NODE, layer, tree, 0, lv, leaf >> lv);
-    v = shortHash(kPub, tw, ((leaf >> (lv - 1)) & 1) === 0 ? cat(v, auth) : cat(auth, v));
+  return out;
+}
+function countOctopusSibs(sortedLeaves: number[]): number {
+  let cur = [...sortedLeaves], sibs = 0;
+  for (let lv = 0; lv < UPORS_HEIGHT; lv++) {
+    const nxt: number[] = [];
+    for (let i = 0; i < cur.length;) {
+      const x = cur[i];
+      if (i + 1 < cur.length && (x ^ 1) === cur[i + 1]) { nxt.push(x >> 1); i += 2; }
+      else { sibs++; nxt.push(x >> 1); i++; }
+    }
+    cur = nxt;
   }
-  return v;
+  return sibs;
+}
+function parseSelectDigest(d: Uint8Array): { leafAddr: number; leaves: number[]; sibs: number } | null {
+  const seen = new Set<number>();
+  const leaves: number[] = [];
+  for (let i = 0; i < UPORS_SELECT_MAX_DRAWS; i++) {
+    const x = readBits(d, i * UPORS_HEIGHT, UPORS_HEIGHT);
+    if (!seen.has(x)) { seen.add(x); leaves.push(x); if (leaves.length === UPORS_K) break; }
+  }
+  if (leaves.length < UPORS_K) return null;
+  leaves.sort((a, b) => a - b);
+  const sibs = countOctopusSibs(leaves);
+  if (sibs > UPORS_M_MAX) return null;
+  const leafAddr = readBits(d, UPORS_SELECT_MAX_DRAWS * UPORS_HEIGHT, HYPER_BITS);
+  return { leafAddr, leaves, sibs };
+}
+function extractUporsCodewords(kPub: Uint8Array, dSeed: Uint8Array, ctrFt: number): [number, number, number][] {
+  const out: [number, number, number][] = [];
+  const tail = cat(dSeed, u32le(ctrFt));
+  for (let blockIdx = 0; out.length < UPORS_K; blockIdx++) {
+    const blk = keyed(kPub, cat(tweak(FEW_CODE, UPORS_LAYER, 0, 0, blockIdx, 0), tail));
+    for (let j = 0; j < 28 && out.length < UPORS_K; j++) {
+      const v = readBits(blk, j * 9, 9);
+      if (v < UPORS_C) out.push(hexUnrank(v));
+    }
+  }
+  return out;
 }
 
 export function verify(vk: Uint8Array, ctx: Uint8Array, message: Uint8Array, sig: Uint8Array): boolean {
@@ -166,25 +210,81 @@ export function verify(vk: Uint8Array, ctx: Uint8Array, message: Uint8Array, sig
   const e = sig.slice(0, 16), R = sig.slice(16, 32);
   const kMsg = keyed(kContent, cat(e, framedCtx));
   const short = cat(e, keyed(kMsg, message));
-  const D = keyed(kPub, cat(tweak(MESSAGE, 0, 0, 0, 0, 0), R, root, short, framedCtx));
-  const leafAddr = readBits(D, UFORS_TREES * (TREE_HEIGHT + UFORS_CODE_BITS), LAYERS * TREE_HEIGHT);
+  const dSeed = keyed(kPub, cat(tweak(MESSAGE, 0, 0, 0, 0, 0), R, root, short, framedCtx));
 
-  // U-FORS (15 uniform height-5 trees, 3 chains/leaf, w=10, S=16)
-  const roots: Uint8Array[] = [];
-  for (let t = 0; t < UFORS_TREES; t++) {
-    const leaf = readBits(D, 11 * t, TREE_HEIGHT);
-    const code = readBits(D, 11 * t + TREE_HEIGHT, UFORS_CODE_BITS);
-    roots.push(verifyTreeLeaf(kPub, UFORS_LAYER_BASE + t, leafAddr, leaf, UFORS_CODE[code], UFORS_STEPS, sig, 32 + t * UFORS_TREE_LEN));
+  // U-PORS verification (height-10 tree + Octopus multi-proof)
+  let off = 32;
+  const ctrFt = readU32le(sig, off); off += UPORS_CTR_LEN;
+  const dSel = keyed(kPub, cat(tweak(FEW_SELECT, UPORS_LAYER, 0, 0, 0, 0), dSeed, u32le(ctrFt)));
+  const sel = parseSelectDigest(dSel);
+  if (!sel) return false;
+  const codewords = extractUporsCodewords(kPub, dSeed, ctrFt);
+
+  let curVal: Uint8Array[] = [];
+  for (let t = 0; t < UPORS_K; t++) {
+    const leaf = sel.leaves[t], cw = codewords[t];
+    const ends: Uint8Array[] = [];
+    for (let c = 0; c < UPORS_N; c++) {
+      let v: Uint8Array = sig.slice(off, off + N); off += N;
+      for (let s = cw[c]; s < UPORS_STEPS; s++) v = shortHash(kPub, tweak(CHAIN, UPORS_LAYER, sel.leafAddr, leaf, c, s), v);
+      ends.push(v);
+    }
+    curVal.push(shortHash(kPub, tweak(ONE_TIME_KEY, UPORS_LAYER, sel.leafAddr, leaf, 0, 0), cat(...ends)));
   }
-  let node = shortHash(kPub, tweak(FEW_ROOT, 0, leafAddr, 0, 0, 0), cat(...roots));
 
-  // Hypertree (7 uniform height-5 layers)
-  let addr = leafAddr, off = 32 + UFORS_TREES * UFORS_TREE_LEN;
+  const octoOff = off; off += UPORS_M_MAX * N;
+  let curIdx = [...sel.leaves], sibCursor = 0;
+  for (let lv = 1; lv <= UPORS_HEIGHT; lv++) {
+    const nxtIdx: number[] = [], nxtVal: Uint8Array[] = [];
+    for (let i = 0; i < curIdx.length;) {
+      const x = curIdx[i], p = x >> 1;
+      const tw = tweak(NODE, UPORS_LAYER, sel.leafAddr, 0, lv, p);
+      let pair: Uint8Array;
+      if (i + 1 < curIdx.length && (x ^ 1) === curIdx[i + 1]) {
+        pair = cat(curVal[i], curVal[i + 1]); i += 2;
+      } else {
+        const s0 = octoOff + sibCursor * N;
+        const sib = sig.subarray(s0, s0 + N);
+        sibCursor++;
+        pair = (x & 1) === 0 ? cat(curVal[i], sib) : cat(sib, curVal[i]);
+        i++;
+      }
+      nxtIdx.push(p); nxtVal.push(shortHash(kPub, tw, pair));
+    }
+    curIdx = nxtIdx; curVal = nxtVal;
+  }
+  if (sibCursor !== sel.sibs) return false;
+  let padOr = 0;
+  for (let i = octoOff + sibCursor * N; i < octoOff + UPORS_M_MAX * N; i++) padOr |= sig[i];
+  if (padOr !== 0) return false;
+  let node = curVal[0];
+
+  // Hypertree verification (12+7+7+7 S-WOTS+Z)
+  let addr = sel.leafAddr;
   for (let layer = 0; layer < LAYERS; layer++) {
-    const leaf = addr % (1 << TREE_HEIGHT), tree = Math.floor(addr / (1 << TREE_HEIGHT));
-    node = verifyTreeLeaf(kPub, layer, tree, leaf, digits(node), 15, sig, off);
-    addr = tree; off += (CHAINS + TREE_HEIGHT) * N;
+    const hL = layer === 3 ? TOP_HEIGHT : LOW_HEIGHT;
+    const leaf = addr % (1 << hL), tree = Math.floor(addr / (1 << hL));
+    const ctrL = sig[off] | (sig[off + 1] << 8); off += WOTS_CTR_LEN;
+    const hMsg = keyed(kPub, cat(tweak(ONE_TIME_MSG, layer, tree, leaf, 0, 0), node, u32le(ctrL)));
+    if (hMsg[0] !== 0) return false;
+    let rank = 0n;
+    for (let i = 15; i >= 1; i--) rank = (rank << 8n) | BigInt(hMsg[i]);
+    const ds = spernerUnrank(rank);
+    const ends: Uint8Array[] = [];
+    for (let c = 0; c < WOTS_N; c++) {
+      let v: Uint8Array = sig.slice(off, off + N); off += N;
+      for (let s = ds[c]; s < WOTS_STEPS; s++) v = shortHash(kPub, tweak(CHAIN, layer, tree, leaf, c, s), v);
+      ends.push(v);
+    }
+    let v = shortHash(kPub, tweak(ONE_TIME_KEY, layer, tree, leaf, 0, 0), cat(...ends));
+    for (let lv = 1; lv <= hL; lv++) {
+      const auth = sig.subarray(off, off + N); off += N;
+      const tw = tweak(NODE, layer, tree, 0, lv, leaf >> lv);
+      v = shortHash(kPub, tw, ((leaf >> (lv - 1)) & 1) === 0 ? cat(v, auth) : cat(auth, v));
+    }
+    node = v; addr = tree;
   }
+  if (off !== SIG_LEN) return false;
   let diff = 0; for (let i = 0; i < 16; i++) diff |= node[i] ^ root[i];
   return diff === 0;
 }
@@ -196,8 +296,7 @@ export function mixPool(priorSalt: Uint8Array | null, system: Uint8Array, pid: n
     if (priorSalt.length !== 32) throw new Error("prior salt must be 32 bytes");
     return cat(new Uint8Array([32]), priorSalt);
   })();
-  const pidBytes = new Uint8Array([pid & 0xff, (pid >>> 8) & 0xff, (pid >>> 16) & 0xff, (pid >>> 24) & 0xff]);
-  return derive(CTX_MIX, cat(prefix, system, pidBytes, clock));
+  return derive(CTX_MIX, cat(prefix, system, u32le(pid), clock));
 }
 export function expandPool(pool: Uint8Array): [Uint8Array, Uint8Array, Uint8Array] {
   if (pool.length !== 32) throw new Error("pool must be 32 bytes");

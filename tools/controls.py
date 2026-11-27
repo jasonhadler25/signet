@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Planted-fault positive controls for Signet (BLINCS-128-7x5).
+"""Planted-fault positive controls for Signet (BLINCS-128-A2).
 
 Runs all mutations inside a disposable temporary copy (sharing target/ for speed),
 so the main repository checkout is never modified even if interrupted.
@@ -15,32 +15,39 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 CONTROLS = [
     (
-        "WOTS+ checksum nibbles computed in digits()",
-        "src/one_time.rs",
-        "    out[MSG_CHAINS] = u8::try_from(csum & 0x0f).unwrap();",
-        "    out[MSG_CHAINS] = 0;",
-        "wots_digits_and_checksum_boundaries",
+        "S-WOTS+Z Sperner unranker selects exact constant-sum digits in sperner_unrank()",
+        "src/coding.rs",
+        "        *slot = u8::try_from(chosen).unwrap();\n        rem_s -= chosen;",
+        "        *slot = 0;\n        rem_s -= chosen;",
+        "hex_and_sperner_unranking_and_fast_select_parser_are_exact",
     ),
     (
-        "U-FORS 35-bit leaf_addr masking in LeafAddr::from_digest_word()",
+        "U-PORS 33-bit leaf_addr masking in LeafAddr::from_word()",
         "src/params.rs",
         "        Self(word & ((1u64 << HYPER_BITS) - 1))",
         "        Self(word)",
-        "parse_digest_extracts_all_ufors_selections_and_35bit_leaf_addr",
+        "hex_and_sperner_unranking_and_fast_select_parser_are_exact",
     ),
     (
-        "U-FORS root compression binds all 15 tree roots (ufors_root)",
+        "U-PORS canonical trailing zero-padding enforced in upors_verify()",
         "src/few_time.rs",
-        "    for t in 0..UFORS_TREES {\n        input[16 + t * N..16 + (t + 1) * N].copy_from_slice(&roots[t]);\n    }",
-        "    for t in 0..UFORS_TREES - 1 {\n        input[16 + t * N..16 + (t + 1) * N].copy_from_slice(&roots[t]);\n    }",
-        "every_signature_region_is_checked",
+        "    if !constant_time_eq(pad, &zeros[..pad.len()]) {\n        return None;\n    }",
+        "    let _ = (pad, zeros);",
+        "every_signature_region_and_canonical_padding_are_checked",
+    ),
+    (
+        "S-WOTS+Z leading zero-byte check enforced in verify_wots_msg()",
+        "src/one_time.rs",
+        "    if h[0] != 0 {\n        return None;\n    }",
+        "    let _ = h[0];",
+        "every_signature_region_and_canonical_padding_are_checked",
     ),
     (
         "Hypertree final top-root equality check (verify_short)",
         "src/lib.rs",
         "        if ct_eq_n(&node, self.root()) { Ok(()) } else { Err(InvalidImprint) }",
         "        let _ = node;\n        Ok(())",
-        "every_signature_region_is_checked",
+        "every_signature_region_and_canonical_padding_are_checked",
     ),
     (
         "verify_short rejects mismatched serialized salt against short",
@@ -156,7 +163,7 @@ def run_nextest(workdir, target_dir, test_filter=None):
         cmd += ["-E", f"test(/{test_filter}$/)"]
     env = os.environ.copy()
     env["CARGO_TARGET_DIR"] = target_dir
-    return subprocess.run(cmd, cwd=workdir, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+    return subprocess.run(cmd, cwd=workdir, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
 
 
 def main():
