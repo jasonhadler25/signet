@@ -20,7 +20,7 @@ src/
   randomness.rs         Lock-free atomic 32-byte state file (create, initialize) and in-memory draws
   test.rs               Unit tests, intermediate KATs, reference/edge vector checks, fuzzing, negative tests
 crates/
-  signet-verify/        Standalone #![no_std], zero-alloc, zero-ROM verifier (O(S) boxcar deconvolution + hexagon unranking)
+  signet-verify/        Standalone #![no_std], zero-alloc, zero-table verifier (O(S) boxcar deconvolution + hexagon unranking)
 wasm-test/              Freestanding wasm32-unknown-unknown verification harness (0 imports, Node 24)
 tests/
   integration.rs        Public API tests and live Python cross-verification

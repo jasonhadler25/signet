@@ -1,11 +1,11 @@
-//! Standalone `#![no_std]`, zero-allocation, zero-ROM verifier for **`BLINCS-128-A2`** signatures (`3,292` bytes).
+//! Standalone `#![no_std]`, zero-allocation, zero-table verifier for **`BLINCS-128-A2`** signatures (`3,292` bytes).
 //!
 //! **Pre-1.0 experimental software (unsupported):** wire formats, context strings, and APIs may
 //! change before 1.0, and no independent human cryptographic audit has been performed.
 //!
 //! This crate verifies [`ImprintRef`] signatures against an expected [`SignetId`] and bounded
 //! application [`Context`] using pure-Rust BLAKE3 (`blake3` with `default-features = false`,
-//! `features = ["pure"]`), zero ROM lookup tables (closed-form `U-PORS` hexagon unranking and
+//! `features = ["pure"]`), zero static lookup tables (closed-form `U-PORS` hexagon unranking and
 //! `O(S)` boxcar-deconvolution `S-WOTS+Z` Sperner unranking), zero `std`, zero `alloc`, and zero `unsafe`.
 //!
 //! Both one-shot slice verification ([`SignetId::verify`]) and incremental streaming verification
@@ -121,7 +121,7 @@ fn read_bits(d: &[u8; 32], bit_off: usize, width: usize) -> u64 {
     (u64::from_le_bytes(raw) >> shift) & ((1u64 << width) - 1)
 }
 
-/// Zero-ROM closed-form hexagon unranker mapping `idx in 0..376` to `(a, b, c)` in `{0..=23}^3` summing to `42`.
+/// Zero-table closed-form hexagon unranker mapping `idx in 0..376` to `(a, b, c)` in `{0..=23}^3` summing to `42`.
 fn hex_unrank(mut idx: u16) -> [u8; UPORS_N] {
     assert!(usize::from(idx) < UPORS_C);
     let w1 = usize::from(UPORS_STEPS);
@@ -142,7 +142,7 @@ fn hex_unrank(mut idx: u16) -> [u8; UPORS_N] {
     unreachable!()
 }
 
-/// Zero-ROM `O(S)` boxcar-deconvolution Sperner unranker (`L_468(24, 40)`, zero static tables, zero heap!).
+/// Zero-table `O(S)` boxcar-deconvolution Sperner unranker (`L_468(24, 40)`, zero static tables, zero heap!).
 fn sperner_unrank_zero_rom(mut rank: u128) -> [u8; WOTS_N] {
     let mut cur = [0u128; WOTS_SUM + 1];
     cur[0] = 1;

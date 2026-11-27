@@ -7,7 +7,7 @@
 //! Designed for post-quantum use with a 128-bit classical security target at up to 2³² imprints
 //! per signet (do not imprint more than 2³² things with one signet; see `SPEC.md` for bounds).
 //! Runs strictly on the calling thread (`blake3-servil-core`; no background worker threads) with
-//! a `12+7+7+7` `S-WOTS+Z` hypertree (`128 KiB` cached top tree) and zero-ROM single-tree
+//! a `12+7+7+7` `S-WOTS+Z` hypertree (`128 KiB` cached top tree) and zero-table single-tree
 //! `U-PORS` Octopus few-time signatures (`3,292`-byte imprints).
 //! Supported platforms: Linux (`x86_64`, `aarch64`) and macOS (`x86_64`, `aarch64`).
 //! Because a cryptographic key is a transferable bearer authority rather than a person's handwritten

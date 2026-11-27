@@ -26,7 +26,7 @@ Each signet (signing key) is sized for a budget of **2³² signatures**, tuned t
 **How to read the timings:**
 
 - All SLH-DSA and Signet numbers were measured **single-threaded (1 core vs. 1 core)** on the same Apple M6 (macOS arm64, Rust 1.100.0).
-- **Warm** means the `Signet` (and its `128 KiB` cached height-12 top tree) is already loaded. Because fixed tree construction dominates signing (`447,976` of `~450,365` mean compressions), `p99 / mean ≈ 1.013×`.
+- **Warm** means the `Signet` (and its `128 KiB` cached height-12 top tree) is already loaded. Because fixed tree construction dominates signing (`447,976` of `~450,305` mean compressions), `p99 / mean ≈ 1.013×`.
 - SLH-DSA ranges span the SHA2, BLAKE3, and SHAKE variants of [PQC Suite B](https://github.com/PQC-Suite-B/signatures), which builds on RustCrypto's `slh-dsa`.
 - Full methodology and cycle counts are in [`BENCHMARKS.md`](BENCHMARKS.md).
 
@@ -147,7 +147,7 @@ expected_publisher.verify_with(RELEASE_CTX, &file_imprint, |sink| {
 })?;
 ```
 
-**Standalone `#![no_std]` verification (`crates/signet-verify`):** verifiers that want zero `std`, zero heap allocator, zero ROM tables (in-place `O(S)` boxcar deconvolution for `S-WOTS+Z` and closed-form hexagon unranking for `U-PORS`), and zero-copy signature views (`ImprintRef<'_>`) can depend on `signet-verify`, which provides both one-shot `SignetId::verify` and incremental `SignetId::verifier` (`update` / `finalize`) on pure-Rust BLAKE3 and is tested on host and freestanding `wasm32-unknown-unknown` (**28.0 KiB `.wasm`**, zero imports).
+**Standalone `#![no_std]` verification (`crates/signet-verify`):** verifiers that want zero `std`, zero heap allocator, zero static lookup tables (in-place `O(S)` boxcar deconvolution for `S-WOTS+Z` and closed-form hexagon unranking for `U-PORS`), and zero-copy signature views (`ImprintRef<'_>`) can depend on `signet-verify`, which provides both one-shot `SignetId::verify` and incremental `SignetId::verifier` (`update` / `finalize`) on pure-Rust BLAKE3 and is tested on host and freestanding `wasm32-unknown-unknown` (**28.0 KiB `.wasm`**, zero imports).
 
 **Return types:**
 
@@ -185,17 +185,17 @@ Signet stores startup randomness in a single private 32-byte regular file on a l
 
 A BLINCS signet does **not** suddenly break at 4.3 billion imprints. Instead, every additional imprint slowly wears down the modeled security against brute-force forgery.
 
-**Estimated brute-force security for one modeled U-PORS cover event (exact without-replacement elementary DP with zero Octopus-cap credit; true cover security including the Octopus cap is ~6.8–8.3 bits higher) under the project's ideal-hash model:**
+**Estimated classical brute-force security for one modeled U-PORS cover event (certified capped-history 99% LCB accounting for Octopus sibling clustering in `blincs/tools/upors_cert.rs`, alongside exact zero-MC uncapped bounds) under the project's single-key ideal-hash model:**
 
-| Signatures made by one signet | Brute-force security *(elementary / with cap)* | Brute-force cost (ASIC electricity) | Brute-force time (800 EH/s, Bitcoin scale) | What that means in practice |
+| Signatures made by one signet | Brute-force security *(uncapped / certified capped 99% LCB)* | Brute-force cost (ASIC electricity) | Brute-force time (800 EH/s, Bitcoin scale) | What that means in practice |
 |---:|---:|---:|---:|---|
-| Up to **4.3 billion** (2³²) | **128-bit** *(128.6 / 135.4 b)* | ~$1.6 × 10²⁰ | ~13 billion years | Full strength (comparable to AES-128) |
-| **8.6 billion** (2×) | **121-bit** *(121.6 / 128.9 b)* | ~$1.2 × 10¹⁸ | ~100 million years | Elementary bound dips to 121.6 b; with cap still > 128 b |
-| **17.2 billion** (4×) | **113-bit** *(113.3 / ~121.1 b)* | ~$4.9 × 10¹⁵ | ~400,000 years | Still far beyond any practical attack |
-| **34 billion** (8×) | **103-bit** *(103.6 / ~111.7 b)* | ~$4.8 × 10¹² | ~400 years | Weakening, though still out of reach today |
-| **69 billion** (16×) | **92-bit** *(92.2 / ~100.5 b)* | ~$2.3 × 10⁹ | ~2.5 months | Weakening rapidly; stay well clear |
+| Up to **4.3 billion** (2³²) | **132-bit** *(129.6 / 132.1 b)* | ~$2.0 × 10²¹ | ~160 billion years | Full strength (>128-bit classical target) |
+| **8.6 billion** (2×) | **125-bit** *(122.4 / 125.5 b)* | ~$1.9 × 10¹⁹ | ~1.5 billion years | Dips modestly below 128 bits; stay within 2³² |
+| **17.2 billion** (4×) | **117-bit** *(113.8 / 117.7 b)* | ~$8.9 × 10¹⁶ | ~7.1 million years | Still far beyond any practical classical attack |
+| **34 billion** (8×) | **108-bit** *(103.8 / 108.6 b)* | ~$1.6 × 10¹⁴ | ~13,000 years | Weakening, though still out of reach today |
+| **69 billion** (16×) | **~98-bit** *(92.2 b uncapped)* | ~$1.5 × 10¹¹ | ~12 years | Weakening rapidly; stay well clear |
 
-These numbers are the cost of a brute-force attack for that single-key ideal-hash event (not a full multi-user or complete scheme proof; see [`SPEC.md`](SPEC.md#12-security-target-model-and-limits)). There is no known reason to think that either quantum computers or super-intelligent AIs could generate forgeries any more efficiently than brute force; if they could, it would reduce the security level.
+These numbers are the cost of a classical brute-force attack for that single-key ideal-hash event (not a full multi-user or QROM proof; see [`jasonhadler25/blincs/paper/blincs.pdf`](https://github.com/jasonhadler25/blincs/blob/main/paper/blincs.pdf) §§4–5, §7.3, and Daniel J. Bernstein's SHARCS 2009 physical cost analysis of quantum hash collisions). There is no known reason to think that either quantum computers or super-intelligent AIs could generate forgeries any more efficiently than brute force; if they could, it would reduce the security level.
 
 Signet does not count imprints across runs or across copies of a seed. When retiring a `Signet`, destroy its seed and stop signing, while keeping its `SignetId` in your accepted verifier set for as long as older imprints must still verify.
 
@@ -219,7 +219,7 @@ If your platform is not on this list, this software is not expected to work for 
 **Dependencies and code:**
 
 - **Host `signet` runtime dependencies:** `blake3-servil-core = "=0.11.0"` (single-threaded SIMD/SME2 BLAKE3, zero background worker threads), `constant_time_eq = "=0.4.2"` (`no_std`), and `getrandom = "=0.4.3"` (OS `getrandom(2)` / `getentropy`), all BLAKE3 + SHA-256 hashset-verified in `Cargo.lock`.
-- **Standalone `signet-verify` dependencies:** `blake3 = "=1.8.7"` (`default-features = false, features = ["pure"]`) and `constant_time_eq = "=0.4.2"` (`default-features = false`) — `#![no_std]`, zero `alloc`, zero ROM tables, `#![forbid(unsafe_code)]`.
+- **Standalone `signet-verify` dependencies:** `blake3 = "=1.8.7"` (`default-features = false, features = ["pure"]`) and `constant_time_eq = "=0.4.2"` (`default-features = false`) — `#![no_std]`, zero `alloc`, zero static lookup tables, `#![forbid(unsafe_code)]`.
 - **Rust code:** both crates are `#![forbid(unsafe_code)]` with zero explicit `Drop` implementations.
 
 **Other implementations of `BLINCS-128-A2`:**

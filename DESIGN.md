@@ -21,7 +21,7 @@ The design goals that follow:
 - **Short verifying key (32 bytes):** small enough to embed directly in a name or identifier a user already acquires (for example, a repository or branch name).
 - **Compact fixed-size signatures (3,292 bytes / 4,392 bytes Base64):** `2.39×` smaller (`4,564 B` saved) than `SLH-DSA-128s` (`7,856 B`), `5.19×` smaller than `SLH-DSA-128f` (`17,088 B`), and smaller than symmetric VOLE-in-the-head `FAEST-EM-128s` (`3,924 B`), regardless of message size.
 - **Zero XOF mode & 1-block hot-path hashing:** every hot-path tweak call (`CHAIN_SECRET`, `CHAIN`, `ONE_TIME_MSG`, `NODE`, `FEW_SELECT`, `FEW_CODE`, and `U-PORS` `ONE_TIME_KEY`) fits in a single 64-byte BLAKE3 compression block, and `FewCode` uses indexed 32-byte `Keyed` hashes instead of XOF mode.
-- **Constrained-hardware friendly (`≤ 5 s` warm `p99` modeled on `160 MHz` Cortex-M33 with `128 KiB` top tree):** caching the height-12 top Merkle heap (`8,192 × 16 B = 128 KiB`, built once in `31.97 ms` on 1 Apple M6 core) lets warm signing finish in **`4.15 ms`** on Apple M6 (`~4.27 s` modeled `p99` on a `160 MHz` Cortex-M33 — modeled, not measured on Cortex-M hardware) with virtually zero tail jitter (`p99 / mean ≈ 1.013×`), while verification executes constant work (`2,267` short-message compressions, **`39.1 µs`** on 1 Apple M6 core).
+- **Constrained-hardware friendly (`≤ 5 s` warm `p99` modeled on `160 MHz` Cortex-M33 with `128 KiB` top tree):** caching the height-12 top Merkle heap (`8,192 × 16 B = 128 KiB`, built once in `31.97 ms` on 1 Apple M6 core) lets warm signing finish in **`4.15 ms`** on Apple M6 (`~4.27 s` modeled `p99` on a `160 MHz` Cortex-M33 — modeled, not measured on Cortex-M hardware) with virtually zero tail jitter (`p99 / mean ≈ 1.013×`), while short-message verification executes **`2,276` compressions** (`2,231 + m + b` at `m = 44, b = 1`, **`39.1 µs`** on 1 Apple M6 core).
 - **Suite-separated key schedule, framed application `Context`, and fail-closed verification:** every algorithm key-derivation context binds `BLINCS-128-A2`, every imprint binds a typed `Context` (`0..=255` bytes, framed as `u8(len(ctx)) || ctx`) into `K_msg`, `R`, and `D_seed`, and `verify`/`verify_with` return `Result<(), InvalidImprint>` / `Result<(), VerifyError<E>>`.
 - **Strictly single-threaded execution:** runs entirely on the calling thread via `blake3-servil-core = "=0.11.0"` — zero background thread pools, zero cross-thread shared state, and linear scaling across caller-managed threads.
 - **Minimize unnecessary reliance on collision resistance:** unsalted hashes belong where independent parties must derive the same name without coordinating (content addressing, Git object IDs, hashsets); salted hashes belong where one party vouches for content (signatures).
@@ -32,18 +32,17 @@ The design goals that follow:
 
 The sizing target is one full `u32` of signatures per signing key: **$2^{32} = 4{,}294{,}967{,}296$** (10 signatures every second nonstop for **13.6 years**). Dropping the budget from FIPS 205's $2^{64}$ to $2^{32}$ cuts hypertree height nearly in half (`h = 33` vs. `63`), and combining `12+7+7+7` `S-WOTS+Z` with single-tree `U-PORS` Octopus cuts signatures to **`3,292 B`** (`2.39×` smaller than `SLH-DSA-128s`).
 
-Under our exact without-replacement hypergeometric elementary DP bound (**zero Octopus-cap credit** — verified directly by `python3 tools/optimize.py --check`, using exact lattice-cover probabilities `q(1) = 1/376`, `q(2) = 0.170004`, `q(3) = 0.336239` on $\mathcal{L}_{42}(3, 24)$), single-query `U-PORS` security starts above 128 bits even **without** counting the Octopus sibling cap, while the importance-sampled cap credit adds another `+6.8` to `+8.3` bits:
+Conditioning honest signatures on the Octopus cap `sibs(S) <= 44` (`|F| = 256,172,225,164,499,838,464`, exact `p_cap = 7.6637e-4`) breaks negative association and creates `16.01×` sibling clustering. Using our exact 320-bit Kronecker-transform + all-37-strata certified upper bound (`jasonhadler25/blincs/tools/upors_cert.rs`, zero negative-association or factorization assumptions), raw-query `U-PORS` security is certified across $2^{30}..2^{35}$:
 
-| Signatures signed by one key | Elementary exact without-replacement bound (zero cap credit) | True security (with Octopus cap `m_max = 44`) |
-|---:|---:|---:|
-| $2^{31}$ (2.15B) | **134.58 bits** | ~140.8 bits |
-| **$2^{32}$ (budget, 4.29B)** | **128.58 bits** | **135.37 bits** |
-| **$2^{33}$ ($2\times$, 8.59B)** | **121.56 bits** | **128.91 bits** *(still $> 128$ b)* |
-| $2^{34}$ ($4\times$, 17.2B) | **113.29 bits** | ~121.1 bits |
-| $2^{35}$ ($8\times$, 34.4B) | **103.55 bits** | ~111.7 bits |
-| $2^{36}$ ($16\times$, 68.7B) | **92.16 bits** | ~100.5 bits |
+| Signatures signed by one key (`h = 33`) | Exact zero-MC uncapped (`Unc+Unc`) | Certified true `BLINCS-128-A2` (`Cap+Cap`, 99% LCB) | True net cap gain |
+|---:|---:|---:|---:|
+| $2^{31}$ (2.15B) | `135.83` bits | **`137.85` bits** | `+2.06 b` |
+| **$2^{32}$ (budget, 4.29B)** | **`129.63` bits** | **`132.13` bits** | **`+2.54 b`** |
+| **$2^{33}$ ($2\times$, 8.59B)** | `122.36` bits | `125.48` bits | `+3.16 b` |
+| $2^{34}$ ($4\times$, 17.2B) | `113.83` bits | `117.72` bits | `+3.93 b` |
+| $2^{35}$ ($8\times$, 34.4B) | `103.81` bits | `108.63` bits | `+4.85 b` |
 
-*(These values are $-\log_2 P(q)$ for the single-key `U-PORS` cover event under ideal hashes, not a full multi-user or quantum proof of BLINCS; see `SPEC.md#12-security-target-model-and-limits`.)*
+*(These values are certified classical single-user $-\log_2 \mathbb{E}[P_{\mathrm{raw}}(R_{\mathrm{occ}})]$ bounds under ideal hashes; see `jasonhadler25/blincs/paper/blincs.pdf` §§4–5 and §7.3 for the full ROM+PRF EUF-CMA proof, physical CRQC collision-cost analysis citing Bernstein SHARCS 2009, equal-budget `q = 2^{64}` scientific comparison baselines `BLINCS-128-64` / `BLINCS-128-64s`, and open QROM/multi-user problems.)*
 
 ---
 
@@ -55,12 +54,12 @@ Three simple, complementary mechanisms deliver the `4,564 B` reduction below `SL
    - Constant-sum Sperner unranking on the exact middle slice $\mathcal{L}_{468}(24, 40)$ has kernel-checked cardinality $|\mathcal{L}_{468}(24, 40)| = 1{,}973{,}221{,}677{,}906{,}098{,}493{,}567{,}206{,}234{,}001{,}571{,}000 > 2^{120}$ (whereas $w = 39$ falls strictly below $2^{120}$, proving $w = 40$ is the exact integer minimum).
    - Every valid codeword sums to `468` (eliminating checksum chains and making verification strictly constant work: `468` steps/layer).
    - Deterministic `u16` counter grinding requiring `z = 8` leading zero bits (`H[0] == 0`) reduces the Sperner domain from $2^{128}$ to $2^{120}$ (saving 2 full chains = `128 B` across 4 layers) with `u16` overflow probability $(255/256)^{65536} \approx 2^{-370}$ (avoiding `z = 10`'s `2^{-92}` `u16` hazard) at only ~256 hashes/layer (`< 0.3%` of signing work).
-   - Standalone `#![no_std]` `signet-verify` unranks $\mathcal{L}_{468}(24, 40)$ via exact `O(S)` boxcar deconvolution with **0 bytes of ROM tables**.
+   - Standalone `#![no_std]` `signet-verify` unranks $\mathcal{L}_{468}(24, 40)$ via exact `O(S)` boxcar deconvolution with **0 bytes of static lookup tables**.
 
 2. **Single height-10 `U-PORS` Octopus (`1,188 B` total):**
    - Replaces `FORS`'s 15–20 separate trees with ONE height-10 tree (`1,024` leaves) whose `k = 10` opened leaves share internal Merkle siblings via bottom-up Octopus merging capped at `m_max = 44` siblings (`4 + (30 + 44) × 16 = 1,188 B`, with canonical constant-time all-zero trailing padding when `sibs < 44`).
-   - Each leaf carries `3` Winternitz chains (`w = 24`, `23` steps/chain, exact `64 B` = 1-block BLAKE3 leaf hash) on the full upper slice $\mathcal{L}_{42}(3, 24)$ (`C = 376` codewords, `27` verify steps/leaf, 0-ROM closed-form hexagon unranking).
-   - Choosing `m_max = 44` yields mean ~1,365 `FewSelect` trials (`p99 ≈ 6,287`, `u32` overflow probability $2^{-4.54 \times 10^6}$), keeping joint signing `p99 / mean ≈ 1.013×`.
+   - Each leaf carries `3` Winternitz chains (`w = 24`, `23` steps/chain, exact `64 B` = 1-block BLAKE3 leaf hash) on the full upper slice $\mathcal{L}_{42}(3, 24)$ (`C = 376` codewords, `27` verify steps/leaf, zero-table closed-form hexagon unranking).
+   - Choosing `m_max = 44` yields exact `p_cap = 7.6637e-4` (mean `~1,305` `FewSelect` trials, `p99 ≈ 6,009`, `u32` overflow probability $< 2^{-4.7 \times 10^6}$), keeping joint signing `p99 / mean ≈ 1.013×`.
 
 3. **Cached `128 KiB` height-12 top tree (`12+7+7+7` hypertree, `d = 4, h = 33`):**
    - Moving 12 of the 33 hypertree bits into a `128 KiB` top tree cached in `Signet` cuts the hypertree from `7` layers down to `4` layers (`3` lower height-7 trees of `128` leaves each).
@@ -74,10 +73,10 @@ Three simple, complementary mechanisms deliver the `4,564 B` reduction below `SL
 
 1. **BLAKE3 (`Keyed` + `DeriveKey`, zero XOF) as the sole primitive:** single-core SIMD/SME2 batching and multi-GB/s streaming content hashing.
 2. **Reduced $2^{32}$ lifetime budget** (vs. FIPS 205's $2^{64}$): cuts hypertree height nearly in half (`h = 33` vs. `63`).
-3. **`12+7+7+7` `S-WOTS+Z` + `U-PORS` Octopus (`3,292 B`):** `2.39×` smaller than `SLH-DSA-128s`, zero cap-credit needed for `> 128` bits (`128.58 b` elementary / `135.37 b` true at $2^{32}$), `p99 / mean ≈ 1.013×`, `2,267` constant short-message verify compressions.
+3. **`12+7+7+7` `S-WOTS+Z` + `U-PORS` Octopus (`3,292 B`):** `2.39×` smaller than `SLH-DSA-128s`, certified `132.13 b` (`99%` LCB) capped-history `U-PORS` security at $2^{32}$ (`129.63 b` zero-MC uncapped), `p99 / mean ≈ 1.013×`, `2,276` short-message verify compressions (`m = 44, b = 1`).
 4. **Indexed 32-byte `FewCode` extraction & `root`-bound `D_seed`:** eliminates XOF mode completely and binds `root` directly into `D_seed` so verification binds the full `SignetId`.
 5. **Single-pass salted content hash (`Keyed(Keyed(K_content, e || u8(len(ctx)) || ctx), M)`):** hashes arbitrarily large messages in one salted pass (`5.57–6.99 GB/s` slice, `3.41–3.94 GB/s` streaming on 1 Apple M6 core) with zero `Drop` implementations (§5).
-6. **Strictly single-threaded execution via `blake3-servil-core = "=0.11.0"` (plus standalone `#![no_std]` `signet-verify`):** zero worker threads, zero global pool; standalone `signet-verify` links cleanly as a `28.0 KiB`, `0`-import freestanding `wasm32-unknown-unknown` binary with zero ROM tables.
+6. **Strictly single-threaded execution via `blake3-servil-core = "=0.11.0"` (plus standalone `#![no_std]` `signet-verify`):** zero worker threads, zero global pool; standalone `signet-verify` links cleanly as a `28.0 KiB`, `0`-import freestanding `wasm32-unknown-unknown` binary with zero static lookup tables.
 7. **Lock-free atomic state file + `getrandom` + `Signet::generate`:** zero `flock`, zero blocking/deadlocks, single private `0600` exact-32-byte file rotated via sibling temp file + POSIX atomic `rename` with forward secrecy on disk (§6).
 
 ### Declined (and why)

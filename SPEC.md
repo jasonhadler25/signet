@@ -1,6 +1,6 @@
 # BLINCS Specification (`BLINCS-128-A2`, draft)
 
-> **Pre-1.0 — Experimental & Unsupported.** This specification is under active development (draft `0.3.0`); wire formats, parameters, and context strings may still change incompatibly before 1.0. Written primarily by an AI assistant at the direction of this repository's owner; **no independent human cryptographic review or security audit has been performed**. Do not rely on BLINCS to protect production assets.
+> **Pre-1.0 — Experimental & Unsupported.** This specification is under active development (draft `0.4.0`); wire formats, parameters, and context strings may still change incompatibly before 1.0. Written primarily by an AI assistant at the direction of this repository's owner; **no independent human cryptographic review or security audit has been performed**. Do not rely on BLINCS to protect production assets.
 
 *Builds on BLAKE3 (O'Connor, Aumasson, Neves, Wilcox-O'Hearn) and SPHINCS / SPHINCS+ / FIPS 205 SLH-DSA (Bernstein, Hopwood, Hülsing, Kölbl, Lange, Niederhagen, Papachristodoulou, Rijneveld, Schneider, Schwabe, Wilcox-O'Hearn, and the NIST SLH-DSA team). Thanks to [Project 11](https://research.projecteleven.com/) — especially **Conor Deegan**, **Alessandro Baiocchi**, **Matteo Vena**, and **Matteo Vicari** — for direct review feedback, benchmarks, and constrained-device design insights.*
 
@@ -8,16 +8,16 @@
 
 ## 1. Overview
 
-**BLINCS** is a stateless hash-based signature algorithm based on BLAKE3 and SPHINCS. This specification defines the **`BLINCS-128-A2`** suite, which compresses a 128-bit stateless BLAKE3 signature down to **`3,292` bytes** (`4,392` bytes Base64) with zero ROM lookup tables and exact 32-lane SIMD alignment:
+**BLINCS** is a stateless hash-based signature algorithm based on BLAKE3 and SPHINCS. This specification defines the **`BLINCS-128-A2`** suite, which compresses a 128-bit stateless BLAKE3 signature down to **`3,292` bytes** (`4,392` bytes Base64) with zero static lookup tables and exact 32-lane SIMD alignment:
 
-- **One-time signature (`S-WOTS+Z`):** Single OTS type across all 4 hypertree layers — `n = 24` equal-length hash chains of `39` steps (`w = 40`), mapped onto the middle constant-sum Sperner slice (`sum = 468`, exact constant `468` verification steps/layer) with a deterministic `u16` counter enforcing `z = 8` leading zero bits (`2^{-370}` counter overflow probability). Zero checksum chains, zero ROM lookup tables (`O(S)` boxcar deconvolution unranking).
-- **Few-time signature (`U-PORS` — Upper-Layer Constant-Sum Lattice Octopus):** A single height-`10` binary Merkle tree (`1,024` leaves), where each leaf is a 3-chain hash-chain key (`n = 3` equal-length chains of `23` steps, `w = 24`, fitting in **one single 64-byte BLAKE3 compression**), encoded by the full upper constant-sum slice `a + b + c = 42` (`C = 376` codewords, exact constant `27` verification steps/leaf, zero-ROM closed-form hexagon unranking). Opening `k = 10` distinct leaves with Octopus path merging and a verifier-enforced sibling cap `sibs <= 44` (`u32` counter, `p_cap ≈ 0.000733`, mean `1,365` trials) compresses the entire few-time section to **`1,188` bytes**.
+- **One-time signature (`S-WOTS+Z`):** Single OTS type across all 4 hypertree layers — `n = 24` equal-length hash chains of `39` steps (`w = 40`), mapped onto the middle constant-sum Sperner slice (`sum = 468`, exact constant `468` verification steps/layer) with a deterministic `u16` counter enforcing `z = 8` leading zero bits (`2^{-370}` counter overflow probability). Zero checksum chains, zero static lookup tables (`O(S)` boxcar deconvolution unranking).
+- **Few-time signature (`U-PORS` — Upper-Layer Constant-Sum Lattice Octopus):** A single height-`10` binary Merkle tree (`1,024` leaves), where each leaf is a 3-chain hash-chain key (`n = 3` equal-length chains of `23` steps, `w = 24`, fitting in **one single 64-byte BLAKE3 compression**), encoded by the full upper constant-sum slice `a + b + c = 42` (`C = 376` codewords, exact constant `27` verification steps/leaf, zero static lookup tables via closed-form hexagon unranking). Opening `k = 10` distinct leaves with Octopus path merging and a verifier-enforced sibling cap `sibs <= 44` (`u32` counter, exact `p_cap = 7.6637e-4`, mean `1,304.8` trials) compresses the entire few-time section to **`1,188` bytes**.
 - **Hypertree (`12 + 7 + 7 + 7 = 33`):** `4`-layer binary Merkle hypertree (`h = 33`): a `128 KiB` cached top height-`12` tree (`4,096` leaves) above `3` uniform height-`7` lower trees (`128` leaves each).
-- **Exact 32-lane SIMD alignment & constant verification work:** Top tree `4,096 = 128 × 32`, every lower tree `128 = 4 × 32` (`3,072 = 96 × 32` chains), `U-PORS` tree `1,024 = 32 × 32` (`3,072 = 96 × 32` chains). All `9,216` lower-hypertree chains and `3,072` `U-PORS` chains merge into a single `12,288`-chain lockstep SIMD wave on signing. Verification executes an **exact constant `2,263` BLAKE3 compressions** (zero message-dependent variance).
+- **Exact 32-lane SIMD alignment & constant chain verification work:** Top tree `4,096 = 128 × 32`, every lower tree `128 = 4 × 32` (`3,072 = 96 × 32` chains), `U-PORS` tree `1,024 = 32 × 32` (`3,072 = 96 × 32` chains). All `9,216` lower-hypertree chains and `3,072` `U-PORS` chains merge into a single `12,288`-chain lockstep SIMD wave on signing. Short-message (`|M| <= 64`, `|ctx| <= 31`) verification with prederived verifier keys executes `2,231 + m + b` BLAKE3 compressions (`m <= 44` consumed Octopus siblings, `b >= 1` `FEW_CODE` blocks — i.e., `2,276` compressions at `m = 44, b = 1`, with exact constant chain work: `468` steps/hypertree layer and `27` steps/opened `U-PORS` leaf).
 - **Single-pass salted content hashing:** Every imprint binds a caller-chosen bounded application context (`0..=255` bytes) and hashes an arbitrary-length message in one streaming pass under a fresh per-imprint salt drawn before reading the message.
 - **Terminology:** This specification uses **`Signet`** (private signing capability), **`SignetId`** (32-byte verifying identifier), and **`Imprint`** (`3,292`-byte signature). These correspond directly to conventional `(SK, VK, \sigma)` notation; the companion paper (`paper/blincs.pdf`) states all theorems in standard cryptographic notation alongside this mapping.
 
-An `Imprint` is **`3,292` bytes** (`4,392` bytes Base64), a `SignetId` is **`32` bytes**, and a `Signet` derives from a **`32`-byte seed**. The design target is **128-bit classical security** at up to **$2^{32}$ imprints** per signet (4,294,967,296), with an elementary exact without-replacement `U-PORS` `ITSR` exponent of **`128.58` bits** at $q = 2^{32}$ **with zero cap credit** (`~135.4` true bits with Octopus cap credit, and **`~128.9` true bits** / `121.56` raw bits even at $2\times$ overuse $q = 2^{33}$). Do not imprint more than $2^{32}$ things with one signet.
+An `Imprint` is **`3,292` bytes** (`4,392` bytes Base64), a `SignetId` is **`32` bytes**, and a `Signet` derives from a **`32`-byte seed**. The design target is **128-bit classical single-user security** at up to **$2^{32}$ imprints** per signet (4,294,967,296), with certified capped-history `U-PORS` raw-query security of **`132.13` bits** (`99%` LCB, accounting for Octopus sibling clustering via `blincs/tools/upors_cert.rs`, vs. `129.63` bits exact zero-MC uncapped) at $q = 2^{32}$ and `125.48` bits at $2\times$ overuse ($q = 2^{33}$). Do not imprint more than $2^{32}$ things with one signet.
 
 ### Notation
 
@@ -181,7 +181,7 @@ R      = Keyed(K_R, short || framed_ctx)[..16]
 D_seed = Keyed(K_pub, tweak(MESSAGE, 0, 0, 0, 0, 0) || R || root || short || framed_ctx)
 ```
 
-Even if the salt source fails or repeats `draw` (and hence `e`) across two distinct messages `M_1 != M_2` while `seed` remains secret, `h_msg` still differs (under 256-bit BLAKE3 collision resistance), so `R` and `D_seed` remain fresh and unpredictable — preserving hedged index selection without a second pass over `M`.
+Even if the salt source fails or repeats `draw` (and hence `e`) across two distinct `(ctx, M)` pairs while `seed` remains secret, either `ctx_1 == ctx_2` with `M_1 != M_2` and a 256-bit keyed-BLAKE3 collision occurs on `h_msg`, or the inputs `short || framed_ctx` fed into `Keyed(K_R, ·)` are strictly distinct — so under a PRF assumption on `Keyed(K_R, ·)` the randomizer `R` remains computationally pseudorandom (up to 128-bit truncation collision probability) without a second pass over `M`. If `(draw, ctx, M)` repeats identically, `e`, `h_msg`, and `R` repeat deterministically.
 
 Treat any 32-byte digest `B` as an LSB-first little-endian 256-bit bitstream, where `read_bits(B, off, width)` returns `(nat_le(B) >> off) & ((1 << width) - 1)`.
 
@@ -198,15 +198,16 @@ H_sel = Keyed(K_pub, tweak(FEW_SELECT, 0x80, 0, 0, 0, 0) || D_seed || u32_le(ctr
 3. Compute the exact Octopus sibling count `sibs = count_octopus_sibs(leaves)` in a binary tree of height `10` (§10.2). If `sibs > 44`, `ctr_ft` is **invalid**.
 4. Extract the `33`-bit hypertree leaf address `leaf_addr = read_bits(H_sel, 220, 33)` (bits `220..253`; bits `253..256` are unused).
 
-A deterministic signer chooses the **smallest** `ctr_ft` starting at `0` that is valid (`p_cap ≈ 0.0007325`, mean `1,365` trials, `p99 ≈ 6,287` trials; `u32` exhaustion probability $< 2^{-4.5 \times 10^6}$). A verifier checks only the single `ctr_ft` encoded in the imprint and MUST reject if it is invalid.
+A deterministic signer chooses the **smallest** `ctr_ft in 0..=2^32 - 1` that is valid (exact cap mass `|F| / C(1024, 10) = 7.6637e-4`, mean `~1,305` trials, `p99 ≈ 6,009` trials; `u32` exhaustion probability $< 2^{-4.7 \times 10^6}$). If `ctr_ft` exhausts `u32` (`2^32` trials without a valid selection), the signer MUST fail closed (abort/error without wrapping). A verifier checks only the single `ctr_ft` encoded in the imprint and MUST reject if it is invalid.
 
 ### 8.2 Unbiased `U-PORS` Codeword Extraction (`FEW_CODE`)
 
-Given a valid `ctr_ft`, draw `10` unbiased indices `c_0, ..., c_9 in 0..376`:
+Given a valid `ctr_ft`, draw `10` unbiased indices `c_0, ..., c_9 in 0..376` using `block_idx in 0..=65535` (`u16`):
 
 ```text
 block_idx = 0, got = 0
 while got < 10:
+    if block_idx > 65535: fail closed (reject / abort)
     B = Keyed(K_pub, tweak(FEW_CODE, 0x80, 0, 0, block_idx, 0) || D_seed || u32_le(ctr_ft))
     for j in 0..28:                       # 28 * 9 = 252 <= 256 bits
         v = read_bits(B, 9 * j, 9)        # uniform in 0..512
@@ -217,7 +218,7 @@ while got < 10:
     block_idx += 1
 ```
 
-Each `9`-bit value is accepted with probability `376 / 512 = 73.44%` with **zero modulo bias**; `block_idx = 0` suffices for `99.9996%` of all imprints (1 compression), and `block_idx = 1` succeeds with probability `1 - 2^{-76}`.
+Each `9`-bit value is accepted with probability `376 / 512 = 73.44%` with **zero modulo bias**; in the ideal-output model `Pr[Bin(28j, 376/512) < 10]` is `~5.9e-6` after `j = 1` block (`99.9994%` finish in 1 block) and `~2^{-61}` after `j = 2` blocks (`< 2^{-10^6}` for `u16` exhaustion). Both signer and verifier MUST fail closed (abort / reject) if `block_idx` would exceed `65535` (`u16::MAX`), never wrapping `block_idx` or substituting default codewords.
 
 ---
 
@@ -238,7 +239,7 @@ Both `U-PORS` (`layer = 0x80`, `height = 10`, `n_chains = 3`, `steps = 23`) and 
 
 ## 10. Few-Time Signatures (`U-PORS`)
 
-### 10.1 Zero-ROM Closed-Form Hexagon Unranking (`hex_unrank`)
+### 10.1 Zero-Table Closed-Form Hexagon Unranking (`hex_unrank`)
 
 The `U-PORS` codeword set is the full upper constant-sum slice $\mathcal{L}_{42}(3, 24) = \{(a, b, c) \in \{0,\dots,23\}^3 : a + b + c = 42\}$ sorted lexicographically (`C = 376` codewords). Because every codeword sums to `42`, $\mathcal{L}_{42}(3, 24)$ is a strict antichain in $\{0,\dots,23\}^3$ and every leaf requires an **exact constant `69 - 42 = 27` verification chain steps**.
 
@@ -284,7 +285,7 @@ Given a 16-byte child root `node` to sign at hypertree position `(layer, tree, l
    ```text
    H_l = Keyed(K_pub, tweak(ONE_TIME_MSG, layer, tree, leaf, 0, 0) || node || u32_le(ctr_l))
    ```
-   satisfies **`H_l[0] == 0`**. (Verifier computes `H_l` for the encoded `ctr_l` and MUST reject if `H_l[0] != 0`.)
+   satisfies **`H_l[0] == 0`** (if all `65,536` values fail, the signer MUST fail closed without wrapping; exhaustion probability $(255/256)^{65536} \approx 2^{-370}$). Verifier computes `H_l` for the encoded `ctr_l` and MUST reject if `H_l[0] != 0`.
 2. **120-bit rank:** `rank = u128_le(H_l[1..16] || 0x00)` (an integer in `0..2^120`).
 3. **Middle-slice Sperner unranking (`n = 24, w = 40, S = 468`):**
    Let $N(k, s)$ denote the number of tuples $(d_0,\dots,d_{k-1}) \in \{0,\dots,39\}^k$ with $\sum_j d_j = s$, defined by $N(0, 0) = 1$, $N(0, s > 0) = 0$, and $N(k, s) = \sum_{d=0}^{\min(39, s)} N(k-1, s-d)$.

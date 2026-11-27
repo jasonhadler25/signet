@@ -1,7 +1,7 @@
 use crate::params::{UPORS_C, UPORS_N, UPORS_STEPS, UPORS_SUM, WOTS_N, WOTS_STEPS, WOTS_SUM, WOTS_W};
 use std::sync::LazyLock;
 
-/// Zero-ROM closed-form hexagon unranker mapping `idx in 0..376` bijectively to `(a, b, c)`
+/// Zero-table closed-form hexagon unranker mapping `idx in 0..376` bijectively to `(a, b, c)`
 /// in `{0..=23}^3` with `a + b + c = 42` (`U-PORS` full upper slice `L_42(3, 24)`).
 #[inline]
 pub(crate) fn hex_unrank(mut idx: u16) -> [u8; UPORS_N] {

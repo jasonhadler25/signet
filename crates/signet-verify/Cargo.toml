@@ -2,7 +2,7 @@
 name = "signet-verify"
 version = "0.1.0"
 edition = "2024"
-description = "Standalone #![no_std], zero-alloc, zero-ROM verifier for BLINCS (BLINCS-128-A2) signatures."
+description = "Standalone #![no_std], zero-alloc, zero-table verifier for BLINCS (BLINCS-128-A2) signatures."
 repository = "https://github.com/jasonhadler25/signet"
 license = "MIT OR Apache-2.0 OR TGPPL-1.0" # OR BOSL-1.0, see LICENSE-BOSL.txt
 

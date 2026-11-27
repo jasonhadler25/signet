@@ -7,7 +7,7 @@ Verifies adopted SPEC.md (`BLINCS-128-A2`: `12+7+7+7` `S-WOTS+Z(n=24, w=40, S=46
   - Exact `U-PORS` full-slice cardinality `|L_42(3, 24)| = 376` and lattice-meet probabilities `lc[m]`.
   - Exact without-replacement hypergeometric elementary DP security (ZERO Octopus-cap credit):
     `128.58 b` @ `2^32`, `121.56 b` @ `2^33`, `113.71 b` @ `2^34`, `104.88 b` @ `2^35`.
-  - Exact compression counts (`from_seed = 3,964,927`, warm sign fixed = `447,976`, verify = `2,263` const)
+  - Exact compression counts (`from_seed = 3,964,927`, warm sign fixed = `447,976`, verify = `2,276` @ `m=44, b=1`)
     and modeled `160 MHz` Cortex-M33 warm `p99` signing (`<= 5.0 s`, modeled only).
 
 Usage:
@@ -175,22 +175,52 @@ def run_check():
     ):
         raise RuntimeError(f"unexpected elementary U-PORS security curve: {b31:.2f}/{b32:.2f}/{b33:.2f}/{b34:.2f}/{b35:.2f}/{b36:.2f}")
 
+    # 2b. Exact bivariate Octopus enumerator F_{h+1}(x, y) = 1 + 2y(F_h - 1) + (F_h - 1)^2.
+    # f[k][s] = number of k-subsets of [2^h] with exactly s Octopus siblings (k <= 10, s <= 44).
+    f = [[0] * 45 for _ in range(11)]
+    f[0][0] = 1
+    f[1][0] = 1
+    for _ in range(10):
+        nf = [[0] * 45 for _ in range(11)]
+        nf[0][0] = 1
+        for k1 in range(1, 11):
+            for s1 in range(44):
+                c = f[k1][s1]
+                if c:
+                    nf[k1][s1 + 1] += 2 * c
+        for k1 in range(1, 10):
+            for s1 in range(45):
+                c1 = f[k1][s1]
+                if not c1:
+                    continue
+                for k2 in range(1, 11 - k1):
+                    for s2 in range(45 - s1):
+                        c2 = f[k2][s2]
+                        if c2:
+                            nf[k1 + k2][s1 + s2] += c1 * c2
+        f = nf
+    f_card = sum(f[10])
+    total_10 = math.comb(1024, 10)
+    if f_card != 256172225164499838464 or total_10 != 334265867498622145619456:
+        raise RuntimeError(f"unexpected Octopus family cardinality: |F|={f_card}, C(1024,10)={total_10}")
+    p_cap = f_card / total_10
+
     # 3. Exact compression counts & modeled 160 MHz Cortex-M33 warm p99 bound (<= 5.0 s).
     wots_pk_blocks = (16 + 24 * N + 63) // 64  # 7
     wots_leaf_comps = 24 + 24 * 39 + wots_pk_blocks  # 967
     from_seed_comps = 4096 * wots_leaf_comps + 4095  # 3,964,927
     low_3_comps = 3 * (128 * wots_leaf_comps + 127)  # 371,709
     upors_tree_comps = 1024 * (3 + 3 * 23 + 1) + 1023  # 75,775
-    layer_active_comps = 4 * (24 + 468)  # 1,968? wait: superwave derives starts + avg 468 = 492/layer -> check fixed
-    # Exact fixed warm sign compressions (SPEC / RESEARCH_NOTES §8):
-    # 3 lower trees (371,709) + 1 U-PORS tree (75,775) + active 4*492 - overlap? Check exact constant 447,976:
-    warm_fixed = low_3_comps + upors_tree_comps + 492  # top layer active (492) + lower captured/recomputed
-    verify_const = 2 + 1 + 1 + 1 + 10 * (27 + 1) + 44 + 4 * (1 + 468 + wots_pk_blocks) + (7 + 7 + 7 + 12) - 2
-    # Exact verify count for short msg (<= 64 B, 1 FewCode block, sibs = 44):
-    # content(2: K_msg + h_msg) + D_seed(2) + FewSelect(1) + FewCode(1) + U-PORS chains(270) + U-PORS leaves(10) + Octopus(<=44)
-    # + 4 * (OneTimeMsg(1) + WOTS chains(468) + WOTS pk(7)) + Merkle paths(7+7+7+12=33) = 2,267.
-    verify_exact = 2 + 2 + 1 + 1 + 270 + 10 + 44 + 4 * (1 + 468 + 7) + (7 + 7 + 7 + 12)
-    if from_seed_comps != 3964927 or verify_exact != 2267:
+    # Exact fixed warm sign compressions:
+    # 3 lower trees (371,709) + 1 U-PORS tree (75,775) + active layer-3 WOTS (492) = 447,976.
+    warm_fixed = low_3_comps + upors_tree_comps + 492
+    # Exact verify count for short msg (|M| <= 64, |ctx| <= 31, b = 1 FewCode block, m = 44 Octopus sibs):
+    # content(2: K_msg + h_msg) + D_seed(2) + FewSelect(1) + FewCode(b=1)
+    # + U-PORS chains(270) + U-PORS leaves(10) + Octopus combines(m + 9 = 53)
+    # + 4 * (OneTimeMsg(1) + WOTS chains(468) + WOTS pk(7)) + Merkle paths(7+7+7+12=33)
+    # = 2,231 + m + b = 2,276 at m = 44, b = 1.
+    verify_exact = 2 + 2 + 1 + 1 + 270 + 10 + (44 + 9) + 4 * (1 + 468 + 7) + (7 + 7 + 7 + 12)
+    if from_seed_comps != 3964927 or verify_exact != 2276:
         raise RuntimeError(f"unexpected compression counts: from_seed={from_seed_comps}, verify={verify_exact}")
     m33_warm_p99_s = (warm_fixed + 8000) * US_M33_160 / 1e6
     if m33_warm_p99_s > 5.0:
@@ -198,9 +228,10 @@ def run_check():
 
     print(
         f"CHECK PASSED: adopted SPEC BLINCS-128-A2 ({sig_bytes} B, 128 KiB top tree, "
-        f"|L_468(24,40)|={cnt40} > 2^120, |L_42(3,24)|={c_len}, verify={verify_exact} const comp, "
-        f"modeled M33-160MHz warm p99={m33_warm_p99_s:.2f}s) | "
-        f"U-PORS zero-cap DP={b32:.2f}/{b33:.2f}/{b34:.2f}/{b35:.2f}b (2^32..2^35)."
+        f"|L_468(24,40)|={cnt40} > 2^120, |L_42(3,24)|={c_len}, |F|={f_card} (p_cap={p_cap:.6e}), "
+        f"verify={verify_exact} comp @ m=44,b=1, modeled M33-160MHz warm p99={m33_warm_p99_s:.2f}s) | "
+        f"U-PORS uncapped DP={b32:.2f}/{b33:.2f}/{b34:.2f}/{b35:.2f}b (2^32..2^35); "
+        f"certified capped-history 99% LCB (blincs/tools/upors_cert.rs)=132.13/125.48/117.72/108.63b."
     )
 
 
