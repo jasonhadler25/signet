@@ -464,6 +464,7 @@ fn hex_and_sperner_unranking_and_fast_select_parser_are_exact() {
     let d_lb52 = pack_leaves(&leaves_lb52);
     assert_eq!(select_ancestor_lower_bound(&d_lb52), 52);
     assert!(parse_select_fast(&d_lb52).is_some());
+    assert!((8..=STACK_PACKED_CAP).contains(&CORE_PACKED_WIDTH));
     for a in 0..=STACK_PACKED_CAP {
         #[cfg(target_arch = "aarch64")]
         let expected = if (7..CORE_PACKED_WIDTH).contains(&a) { CORE_PACKED_WIDTH } else { a };
