@@ -26,27 +26,36 @@ def load_known():
         if not line or line.startswith("#"):
             continue
         parts = line.split("\t")
-        assert len(parts) == 3, f"bad known.txt line: {raw!r}"
+        if len(parts) != 3:
+            raise ValueError(f"bad known.txt line: {raw!r}")
         key = (parts[0], parts[1])
+        if key in entries:
+            raise ValueError(f"duplicate known.txt entry: {key!r}")
         entries[key] = parts[2]
     return entries
 
 
 def parse_mutants_file(path):
     if not os.path.exists(path):
-        return []
+        raise FileNotFoundError(f"missing cargo-mutants output file: {path}")
     out = []
     for raw in open(path):
         line = raw.strip()
         if not line:
             continue
         m = LINE_RE.match(line)
-        assert m, f"unexpected mutant line: {line!r}"
+        if not m:
+            raise ValueError(f"unexpected mutant line: {line!r}")
         out.append((m.group(1), m.group(2), line))
     return out
 
 
 def verify_dir(out_dir):
+    for required in ("outcomes.json", "missed.txt", "timeout.txt"):
+        req_path = os.path.join(out_dir, required)
+        if not os.path.isfile(req_path):
+            print(f"FAIL: missing required cargo-mutants artifact: {req_path}", file=sys.stderr)
+            return 1
     known = load_known()
     missed = parse_mutants_file(os.path.join(out_dir, "missed.txt"))
     timeouts = parse_mutants_file(os.path.join(out_dir, "timeout.txt"))

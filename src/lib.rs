@@ -67,6 +67,7 @@ pub use params::{IMPRINT_LEN, MAX_CONTEXT_LEN, SEED_LEN, SIGNET_ID_LEN, SUITE_NA
 pub use randomness::Randomness;
 
 use content::{content_from_slice, content_with};
+use engine::Dispatch;
 use few_time::{extract_upors_codewords, upors_verify, verify_upors_selection};
 use one_time::{build_top_tree, sign_superwave, verify_layer};
 use params::{
@@ -306,13 +307,17 @@ impl fmt::Debug for SignetId {
 }
 
 impl SignetId {
+    fn from_parts(bytes: [u8; SIGNET_ID_LEN], public_key: PublicKey) -> Self {
+        let content_key = derive_key(CTX_CONTENT, &bytes);
+        Self { bytes, public_key, content_key }
+    }
+
     /// Construct a signet identifier from its 32-byte wire encoding (`public_seed || top_root`).
     #[must_use]
     pub fn from_bytes(bytes: &[u8; SIGNET_ID_LEN]) -> Self {
         ensure_init();
         let public_key = PublicKey::from_seed(bytes[..N].try_into().unwrap());
-        let content_key = derive_key(CTX_CONTENT, bytes);
-        Self { bytes: *bytes, public_key, content_key }
+        Self::from_parts(*bytes, public_key)
     }
 
     /// The 32-byte wire encoding of this signet identifier.
@@ -342,7 +347,12 @@ impl SignetId {
     /// `produce`. Verify against an expected [`SignetId`] obtained from a pinned or authenticated
     /// channel.
     #[must_use = "imprint verification result must be checked"]
-    pub fn verify_with<E>(&self, ctx: Context<'_>, imprint: &Imprint, produce: impl FnOnce(&mut Sink) -> Result<(), E>) -> Result<(), VerifyError<E>> {
+    pub fn verify_with<E>(
+        &self,
+        ctx: Context<'_>,
+        imprint: &Imprint,
+        produce: impl for<'s> FnOnce(&mut Sink<'s>) -> Result<(), E>,
+    ) -> Result<(), VerifyError<E>> {
         let Some(short) = content_with(&self.content_key, imprint.salt(), ctx, produce).map_err(VerifyError::Source)? else {
             return Err(VerifyError::Invalid);
         };
@@ -355,13 +365,13 @@ impl SignetId {
             return Err(InvalidImprint);
         }
         let d_seed = compute_message_digest(&self.public_key, imprint.randomizer(), self.root(), short, ctx);
-        let public = self.public_key.engine(false);
+        let public = self.public_key.engine(Dispatch::OnCore);
         let upors_slice = imprint.upors();
         let ctr_ft = u32::from_le_bytes(upors_slice[..UPORS_CTR_LEN].try_into().unwrap());
         let sel = verify_upors_selection(&public, &d_seed, ctr_ft).ok_or(InvalidImprint)?;
-        let codewords = extract_upors_codewords(&public, &sel.h_sel).ok_or(InvalidImprint)?;
+        let codewords = extract_upors_codewords(&public, sel.h_sel()).ok_or(InvalidImprint)?;
         let mut node = upors_verify(&public, &sel, &codewords, upors_slice).ok_or(InvalidImprint)?;
-        let coords = sel.leaf_addr.split_layers();
+        let coords = sel.leaf_addr().split_layers();
         for layer in Layer::ALL {
             let (tree, leaf) = coords[layer.index()];
             node = verify_layer(&public, layer, tree, leaf, &node, imprint.layer(layer)).ok_or(InvalidImprint)?;
@@ -403,7 +413,7 @@ impl Signet {
     }
 
     /// Derive a signet from a persisted 32-byte `seed`, building and caching the `256 KiB`
-    /// height-12 top hypertree on the calling thread.
+    /// height-13 top hypertree on the calling thread.
     ///
     /// Performs no entropy check on `seed`. For creating new signets, use [`Signet::generate`].
     #[must_use]
@@ -420,7 +430,7 @@ impl Signet {
         let mut id_bytes = [0u8; SIGNET_ID_LEN];
         id_bytes[..N].copy_from_slice(&public_seed);
         id_bytes[N..].copy_from_slice(&top_tree[1]);
-        Self { seed: *seed, secret_key, salt_key, randomizer_key, id: SignetId::from_bytes(&id_bytes), top_tree }
+        Self { seed: *seed, secret_key, salt_key, randomizer_key, id: SignetId::from_parts(id_bytes, public_key), top_tree }
     }
 
     /// The 32-byte seed from which this signet was derived.
@@ -454,7 +464,7 @@ impl Signet {
         &self,
         draw: &[u8; 32],
         ctx: Context<'_>,
-        produce: impl FnOnce(&mut Sink) -> Result<(), E>,
+        produce: impl for<'s> FnOnce(&mut Sink<'s>) -> Result<(), E>,
     ) -> Result<Imprint, E> {
         ensure_init();
         let salt = first_n(&keyed(&self.salt_key, draw));
@@ -477,10 +487,17 @@ impl Signet {
     ///
     /// Signet chooses the fresh salt and initializes keyed BLAKE3 before invoking `produce`; if
     /// `produce` returns `Err(e)`, imprinting aborts and returns `Err(e)`. For any `std::io::Read`
-    /// source, call `std::io::copy(&mut reader, sink)` inside `produce`. Self-verifies the
+    /// source, call `std::io::copy(&mut reader, sink)` inside `produce`. Exceeding `u64::MAX`
+    /// streamed bytes causes [`std::io::Write::write`] to fail with `InvalidData` (and panics
+    /// before emitting an imprint if ignored through [`Sink::update`]). Self-verifies the
     /// finished imprint against `short` before returning. Do not imprint more than 2⁴⁸ things with
     /// one signet.
-    pub fn imprint_with<E>(&self, randomness: &Randomness, ctx: Context<'_>, produce: impl FnOnce(&mut Sink) -> Result<(), E>) -> Result<Imprint, E> {
+    pub fn imprint_with<E>(
+        &self,
+        randomness: &Randomness,
+        ctx: Context<'_>,
+        produce: impl for<'s> FnOnce(&mut Sink<'s>) -> Result<(), E>,
+    ) -> Result<Imprint, E> {
         let draw = randomness.draw();
         self.imprint_with_draw_stream(&draw, ctx, produce)
     }

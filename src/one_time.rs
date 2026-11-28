@@ -1,5 +1,5 @@
 use crate::coding::decode_wots_c;
-use crate::engine::{Batch, Block, HashEngine, Packed};
+use crate::engine::{Batch, Block, Dispatch, HashEngine, Packed};
 use crate::few_time::{extract_upors_codewords, grind_upors_selection};
 use crate::params::{
     IMPRINT_LEN, LAYERS, LOW_HEIGHT, LOW_LAYERS, LOW_LEAVES, Layer, N, PublicKey, SecretKey, TOP_HEIGHT, TOP_LEAVES, TweakKind, UPORS_CTR_LEN, UPORS_HEIGHT,
@@ -26,7 +26,7 @@ const _: () = {
 /// Build the `256 KiB` cached height-13 top Merkle heap (`2 * 8,192` 16-byte nodes, 1-indexed)
 /// using `2,048`-leaf SIMD tiling via [`HashEngine`] (zero `Drop`).
 pub(crate) fn build_top_tree(secret: &SecretKey, public: &PublicKey) -> Box<[[u8; N]]> {
-    let bulk = public.engine(true);
+    let bulk = public.engine(Dispatch::Bulk);
     let tile_chains = TOP_TILE_LEAVES * WOTS_N;
     let mut b32 = Packed::<32>::new(tile_chains);
     let mut b_pk = Batch::new(WOTS_PK_IN_LEN, TOP_TILE_LEAVES);
@@ -39,7 +39,7 @@ pub(crate) fn build_top_tree(secret: &SecretKey, public: &PublicKey) -> Box<[[u8
     let mut leaf_base = 0usize;
     while leaf_base < TOP_LEAVES {
         let leaf_end = leaf_base + TOP_TILE_LEAVES;
-        secret.derive_chain_starts_16(layer_u8, 0, u32::try_from(leaf_base * WOTS_N).unwrap(), true, &mut scratch, &mut chains16);
+        secret.derive_chain_starts_16(layer_u8, 0, u32::try_from(leaf_base * WOTS_N).unwrap(), Dispatch::Bulk, &mut scratch, &mut chains16);
 
         let mut slot = 0usize;
         for l in leaf_base..leaf_end {
@@ -49,7 +49,7 @@ pub(crate) fn build_top_tree(secret: &SecretKey, public: &PublicKey) -> Box<[[u8
                 slot += 1;
             }
         }
-        bulk.advance_chains_fixed(&mut b32, tile_chains, WOTS_STEPS, &mut scratch, &mut chains16);
+        bulk.advance_chains_fixed(&mut b32, WOTS_STEPS, &mut scratch, &mut chains16);
 
         for rel in 0..TOP_TILE_LEAVES {
             let l = leaf_base + rel;
@@ -60,7 +60,7 @@ pub(crate) fn build_top_tree(secret: &SecretKey, public: &PublicKey) -> Box<[[u8
                 m[16 + c * N..16 + (c + 1) * N].copy_from_slice(&chains16[cbase + c]);
             }
         }
-        bulk.hash_batch_n(&b_pk, TOP_TILE_LEAVES, &mut scratch, &mut nodes[TOP_LEAVES + leaf_base..TOP_LEAVES + leaf_end]);
+        bulk.hash_batch_n(&b_pk, &mut scratch, &mut nodes[TOP_LEAVES + leaf_base..TOP_LEAVES + leaf_end]);
         leaf_base = leaf_end;
     }
 
@@ -78,7 +78,7 @@ pub(crate) fn build_top_tree(secret: &SecretKey, public: &PublicKey) -> Box<[[u8
                 &nodes[level_start + 2 * j + 1],
             );
         }
-        bulk.hash_packed_48_bulk(&b48, parents, &mut scratch, &mut nodes[parent_start..parent_start + parents]);
+        bulk.hash_packed_48_bulk(&b48, &mut scratch, &mut nodes[parent_start..parent_start + parents]);
         level_start = parent_start;
         count = parents;
     }
@@ -114,8 +114,8 @@ pub(crate) fn verify_wots_msg(engine: &HashEngine, layer: Layer, tree: u64, leaf
 /// hypertree chains + `6,144` `U-PORS` chains) and variable-length on-core waves for the `27`
 /// active `U-PORS` and `126` active `WOTS+C` chains, keeping stack usage tiny (< 16 KiB) with zero `Drop`.
 pub(crate) fn sign_superwave(secret: &SecretKey, public: &PublicKey, e: &[u8; N], r: &[u8; N], d_seed: &[u8; 32], top_tree: &[[u8; N]]) -> [u8; IMPRINT_LEN] {
-    let bulk = public.engine(true);
-    let core = public.engine(false);
+    let bulk = public.engine(Dispatch::Bulk);
+    let core = public.engine(Dispatch::OnCore);
 
     let mut b32 = Packed::<32>::new(SUPER_CHAINS);
     let mut b48 = Packed::<48>::new(UPORS_MERKLE_PARENTS);
@@ -127,14 +127,14 @@ pub(crate) fn sign_superwave(secret: &SecretKey, public: &PublicKey, e: &[u8; N]
     let mut low_nodes = vec![[0u8; N]; LOW_LAYERS * 2 * LOW_LEAVES];
 
     let sel = grind_upors_selection(&bulk, d_seed, &mut scratch);
-    let codewords = extract_upors_codewords(&core, &sel.h_sel).expect("FewCode block_idx overflow");
-    let splits = sel.leaf_addr.split_layers();
+    let codewords = extract_upors_codewords(&core, sel.h_sel()).expect("FewCode block_idx overflow");
+    let splits = sel.leaf_addr().split_layers();
 
     let mut sig = [0u8; IMPRINT_LEN];
     sig[..N].copy_from_slice(e);
     sig[N..2 * N].copy_from_slice(r);
     let upors_base = 2 * N;
-    sig[upors_base..upors_base + UPORS_CTR_LEN].copy_from_slice(&sel.ctr.to_le_bytes());
+    sig[upors_base..upors_base + UPORS_CTR_LEN].copy_from_slice(&sel.ctr().to_le_bytes());
     let upors_chains_off = upors_base + UPORS_CTR_LEN;
     let upors_octo_off = upors_chains_off + UPORS_K * UPORS_N * N;
 
@@ -142,10 +142,10 @@ pub(crate) fn sign_superwave(secret: &SecretKey, public: &PublicKey, e: &[u8; N]
     for layer in Layer::LOWER {
         let (tree, _) = splits[layer.index()];
         let off = layer.index() * LOW_LEAVES * WOTS_N;
-        secret.derive_chain_starts_16(layer.as_u8(), tree, 0, true, &mut scratch, &mut chains16[off..off + LOW_LEAVES * WOTS_N]);
+        secret.derive_chain_starts_16(layer.as_u8(), tree, 0, Dispatch::Bulk, &mut scratch, &mut chains16[off..off + LOW_LEAVES * WOTS_N]);
     }
-    let upors_tree = sel.leaf_addr.as_u64();
-    secret.derive_chain_starts_16(UPORS_LAYER_U8, upors_tree, 0, true, &mut scratch, &mut chains16[LOW_TOTAL_CHAINS..SUPER_CHAINS]);
+    let upors_tree = sel.leaf_addr().as_u64();
+    secret.derive_chain_starts_16(UPORS_LAYER_U8, upors_tree, 0, Dispatch::Bulk, &mut scratch, &mut chains16[LOW_TOTAL_CHAINS..SUPER_CHAINS]);
 
     // 2. Pack initial step-0 `[prefix12 || 0u32 || start16]` inputs across all 19,584 slots.
     let mut slot = 0usize;
@@ -169,14 +169,14 @@ pub(crate) fn sign_superwave(secret: &SecretKey, public: &PublicKey, e: &[u8; N]
     }
     assert_eq!(slot, SUPER_CHAINS);
 
-    // 3. Advance the 27 active U-PORS chains independently via `advance_chains_varlen`, decoupling
-    //    active-chain harvesting from the pure fixed-step bulk wave (ready for fused `BLAKE3` #584).
+    // 3. Advance the 27 active U-PORS chains independently via `advance_chains_varlen`.
     const UPORS_ACTIVE_TOTAL: usize = UPORS_K * UPORS_N;
     let mut upors_init32 = [[0u8; 32]; UPORS_ACTIVE_TOTAL];
     let mut upors_steps = [0u8; UPORS_ACTIVE_TOTAL];
     let mut upors_active = [[0u8; N]; UPORS_ACTIVE_TOTAL];
+    let leaves = sel.leaves();
     for t in 0..UPORS_K {
-        let base = LOW_TOTAL_CHAINS + usize::from(sel.leaves[t]) * UPORS_N;
+        let base = LOW_TOTAL_CHAINS + usize::from(leaves[t]) * UPORS_N;
         for c in 0..UPORS_N {
             let idx = t * UPORS_N + c;
             upors_init32[idx] = b32[base + c];
@@ -190,7 +190,7 @@ pub(crate) fn sign_superwave(secret: &SecretKey, public: &PublicKey, e: &[u8; N]
     }
 
     // 4. Advance all 19,584 bulk chains to their endpoints (13,440 lower × 59; 6,144 U-PORS × 23).
-    bulk.advance_chains_staged(&mut b32, LOW_TOTAL_CHAINS, SUPER_CHAINS, UPORS_STEPS, WOTS_STEPS, &mut scratch, &mut chains16);
+    bulk.advance_chains_staged(&mut b32, LOW_TOTAL_CHAINS, UPORS_STEPS, WOTS_STEPS, &mut scratch, &mut chains16);
 
     // 5. Hash all 2,048 U-PORS 64-byte leaves in one batch.
     for (l, blk) in b64.iter_mut().enumerate() {
@@ -218,7 +218,7 @@ pub(crate) fn sign_superwave(secret: &SecretKey, public: &PublicKey, e: &[u8; N]
         }
     }
     let mut low_leaf_out = [[0u8; N]; LOW_TOTAL_LEAVES];
-    bulk.hash_batch_n(&b_pk, LOW_TOTAL_LEAVES, &mut scratch, &mut low_leaf_out);
+    bulk.hash_batch_n(&b_pk, &mut scratch, &mut low_leaf_out);
     for layer in Layer::LOWER {
         let heap_base = layer.index() * 2 * LOW_LEAVES;
         let src_base = layer.index() * LOW_LEAVES;
@@ -226,7 +226,7 @@ pub(crate) fn sign_superwave(secret: &SecretKey, public: &PublicKey, e: &[u8; N]
     }
 
     // 7. Build U-PORS height-11 Merkle tree + extract Octopus siblings -> `upors_root`.
-    let mut cur_idx = sel.leaves;
+    let mut cur_idx = *leaves;
     let mut cur_len = UPORS_K;
     let mut sib_cursor = 0usize;
     let mut width = UPORS_LEAVES;
@@ -260,10 +260,10 @@ pub(crate) fn sign_superwave(secret: &SecretKey, public: &PublicKey, e: &[u8; N]
                 &upors_nodes[2 * p + 1],
             );
         }
-        bulk.hash_packed_48_bulk(&b48, parents, &mut scratch, &mut upors_nodes[..parents]);
+        bulk.hash_packed_48_bulk(&b48, &mut scratch, &mut upors_nodes[..parents]);
         width = parents;
     }
-    assert_eq!(sib_cursor, sel.sibs);
+    assert_eq!(sib_cursor, sel.sibs());
     sig[upors_octo_off + sib_cursor * N..upors_octo_off + UPORS_M_MAX * N].fill(0);
     let upors_root = upors_nodes[0];
 
@@ -290,7 +290,7 @@ pub(crate) fn sign_superwave(secret: &SecretKey, public: &PublicKey, e: &[u8; N]
                 pslot += 1;
             }
         }
-        bulk.hash_packed_48_bulk(&b48, pslot, &mut scratch, &mut low_parent_out[..pslot]);
+        bulk.hash_packed_48_bulk(&b48, &mut scratch, &mut low_parent_out[..pslot]);
         let mut rslot = 0usize;
         for layer in Layer::LOWER {
             let heap_base = layer.index() * 2 * LOW_LEAVES;
@@ -319,7 +319,7 @@ pub(crate) fn sign_superwave(secret: &SecretKey, public: &PublicKey, e: &[u8; N]
         let off = layer.sig_offset();
         sig[off..off + WOTS_CTR_LEN].copy_from_slice(&ctr.to_le_bytes()[..WOTS_CTR_LEN]);
 
-        secret.derive_chain_starts_16(layer.as_u8(), tree, u32::from(leaf) * u32::try_from(WOTS_N).unwrap(), false, &mut raw_scratch, &mut starts16);
+        secret.derive_chain_starts_16(layer.as_u8(), tree, u32::from(leaf) * u32::try_from(WOTS_N).unwrap(), Dispatch::OnCore, &mut raw_scratch, &mut starts16);
         for c in 0..WOTS_N {
             let idx = li * WOTS_N + c;
             pack_tagged(&mut active_init32[idx], tweak(TweakKind::Chain, layer.as_u8(), tree, leaf, u16::try_from(c).unwrap(), 0), &starts16[c]);
@@ -336,19 +336,16 @@ pub(crate) fn sign_superwave(secret: &SecretKey, public: &PublicKey, e: &[u8; N]
         }
         let auth_off = off + WOTS_CTR_LEN + WOTS_N * N;
         let (_, leaf) = splits[li];
-        if layer == Layer::TOP {
-            let mut cursor = TOP_LEAVES + usize::from(leaf);
-            for level in 0..TOP_HEIGHT {
-                sig[auth_off + level * N..auth_off + (level + 1) * N].copy_from_slice(&top_tree[cursor ^ 1]);
-                cursor >>= 1;
-            }
+        let (heap, base_leaves, height) = if layer == Layer::TOP {
+            (top_tree, TOP_LEAVES, TOP_HEIGHT)
         } else {
             let heap_base = li * 2 * LOW_LEAVES;
-            let mut cursor = LOW_LEAVES + usize::from(leaf);
-            for level in 0..LOW_HEIGHT {
-                sig[auth_off + level * N..auth_off + (level + 1) * N].copy_from_slice(&low_nodes[heap_base + (cursor ^ 1)]);
-                cursor >>= 1;
-            }
+            (&low_nodes[heap_base..heap_base + 2 * LOW_LEAVES], LOW_LEAVES, LOW_HEIGHT)
+        };
+        let mut cursor = base_leaves + usize::from(leaf);
+        for level in 0..height {
+            sig[auth_off + level * N..auth_off + (level + 1) * N].copy_from_slice(&heap[cursor ^ 1]);
+            cursor >>= 1;
         }
     }
     sig

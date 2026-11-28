@@ -156,7 +156,8 @@ def self_test():
     clean = "fn ok(x: u32) -> u32 { x + 1 }\n// debug_assert!(false); unsafe {}\n#[cfg(test)]\nfn t() { debug_assert!(true); println!(\"hi\"); }\n"
     c = measure_map({"src/a.rs": clean})
     for k in ZERO_TOLERANCE:
-        assert c[k] == 0, f"clean snippet tripped {k}: {c}"
+        if c[k] != 0:
+            raise RuntimeError(f"clean snippet tripped {k}: {c}")
 
     planted = {
         "unsafe_blocks": "fn f() { unsafe { } }",
@@ -167,7 +168,8 @@ def self_test():
     }
     for key, snippet in planted.items():
         got = measure_map({"src/planted.rs": snippet})
-        assert got[key] >= 1, f"planted {key} was NOT detected: {got}"
+        if got[key] < 1:
+            raise RuntimeError(f"planted {key} was NOT detected: {got}")
     print(f"counts.py self-test PASSED (all {len(planted)} planted violations caught).")
 
 

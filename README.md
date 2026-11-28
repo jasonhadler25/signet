@@ -177,7 +177,7 @@ Signet stores startup randomness in a single private 32-byte regular file on a l
 
 **If the state file, OS randomness, PID, and the clock all repeat together**, salts repeat. Signing secrets stay hidden. Content hashing degrades from salted (randomized target-collision) security to the 128-bit collision resistance of keyed BLAKE3.
 
-**Forks and live VM snapshots:** in multithreaded POSIX processes, call `exec()` before initializing Signet rather than calling `Randomness::initialize` directly after `fork()`. After restoring a live VM snapshot, ensure genuinely fresh unshared OS entropy before initializing so cloned images do not repeat `(run_key, count)`.
+**Forks and live VM snapshots:** never reuse an inherited live `Randomness` handle across `fork()` (even in a single-threaded process) or after restoring a live VM snapshot, because cloned processes would share `(run_key, count)`. Re-initialize via `Randomness::initialize` in each child (calling `exec()` first in multithreaded POSIX processes, and ensuring genuinely fresh unshared OS entropy after VM snapshot restore).
 
 ### 2. Per-signet signing budget
 
@@ -201,17 +201,17 @@ Signet does not count imprints across runs or across copies of a seed. When reti
 
 ### 3. Startup, streaming, and authenticated IDs
 
-**Startup and memory.** `Signet::from_seed` builds the `256 KiB` height-13 top Merkle heap (`16,383 × 16 B` nodes) in memory from the 32-byte seed in **~82.74 ms** on 1 Apple M6 core. Nothing is cached on disk, so the 32-byte seed is all you store. Warm signing allocates a transient local super-wave buffer (~1.5 MiB for all `19,584` lower-tree + `U-PORS` chains) that is freed on return; verification uses only stack buffers (~4 KiB for `verify`, plus the `Sink`'s BLAKE3 `Hasher` for `verify_with`) with zero heap allocation.
+**Startup and memory.** `Signet::from_seed` builds the `256 KiB` height-13 top Merkle heap (`16,383 × 16 B` nodes) in memory from the 32-byte seed in **~82.75 ms** on 1 Apple M6 core. Nothing is cached on disk, so the 32-byte seed is all you store. Warm signing allocates a transient local super-wave buffer (~1.5 MiB for all `19,584` lower-tree + `U-PORS` chains) that is freed on return; verification uses only stack buffers (~4 KiB for `verify`, plus the `Sink`'s BLAKE3 `Hasher` for `verify_with`) with zero heap allocation.
 
-**Streaming.** `imprint`/`verify` take message bytes, and `imprint_with`/`verify_with` push bytes into a `Sink` (implementing both `Sink::update` and `std::io::Write`, so `std::io::copy` works in one line). Either way, Signet hashes every byte in a single salted keyed-BLAKE3 pass on the calling thread, choosing the per-imprint salt before the producer runs. On 1 Apple M6 core, 100 MiB hashes at **~4.48 GB/s** signing and **~6.95 GB/s** verifying (in-memory slice), or **~2.99–3.93 GB/s** via `imprint_with`/`verify_with`.
+**Streaming.** `imprint`/`verify` take message bytes, and `imprint_with`/`verify_with` push bytes into a `Sink` (implementing both `Sink::update` and `std::io::Write`, so `std::io::copy` works in one line). Either way, Signet hashes every byte in a single salted keyed-BLAKE3 pass on the calling thread, choosing the per-imprint salt before the producer runs. On 1 Apple M6 core, 100 MiB hashes at **~4.47 GB/s** signing and **~6.95 GB/s** verifying (in-memory slice), or **~3.00–3.93 GB/s** via `imprint_with`/`verify_with`.
 
 **Authenticated IDs.** Verifiers need an **authenticated** `SignetId`. Receiving a `SignetId` does not authenticate the sender; a valid imprint proves only that it matches a given 32-byte ID and `Context`. Deliver IDs through a channel that ties them to the signer, such as pinned configuration or signed release metadata.
 
 ### 4. Supported platforms, dependencies, and caller obligations
 
-**Supported platforms:**
+**Supported platforms (and where tested):**
 
-- **Host signer & verifier (`signet`):** Linux (`x86_64`, `aarch64`) and macOS (`x86_64`, `aarch64`).
+- **Host signer & verifier (`signet`):** targets Linux (`x86_64`, `aarch64`) and macOS (`x86_64`, `aarch64`). Actively verified on Linux `x86_64` (GitHub Actions CI) and macOS `aarch64` (Apple M6 native development & benchmarks); Linux `aarch64` and macOS `x86_64` are supported by the codebase and `blake3-servil-core` but not yet run in automated CI.
 - **Standalone `#![no_std]` verifier (`crates/signet-verify`):** host targets above plus freestanding `wasm32-unknown-unknown` (tested with zero imports and zero allocator under Node 24).
 
 If your platform is not on this list, this software is not expected to work for that use.
@@ -243,11 +243,11 @@ Apple M6 (macOS arm64, Rust 1.100.0, `blake3-servil-core = "=0.11.0"`, strictly 
 
 | Operation (1 core) | Wall time | Throughput |
 |---|---:|---:|
-| Load key (`Signet::from_seed`, `256 KiB` height-13 top tree) | **82.74 ms** | **12 / s** |
-| Sign, 64 B (warm, 19,584-chain super-wave + self-verify) | **8.45 ms** | **118 / s** |
+| Load key (`Signet::from_seed`, `256 KiB` height-13 top tree) | **82.75 ms** | **12 / s** |
+| Sign, 64 B (warm, 19,584-chain super-wave + self-verify) | **8.48 ms** | **118 / s** |
 | Verify, 64 B (zero heap alloc, `7.76 IPC`) | **52.7 µs** | **18,975 / s** |
-| Sign / verify, 100 MiB (slice) | 23.41 ms / 15.08 ms | 4,479 / 6,951 MB/s |
-| Sign / verify, 100 MiB (`imprint_with` / `verify_with`) | 35.04 ms / 26.72 ms | 2,992 / 3,925 MB/s |
+| Sign / verify, 100 MiB (slice) | 23.48 ms / 15.08 ms | 4,465 / 6,952 MB/s |
+| Sign / verify, 100 MiB (`imprint_with` / `verify_with`) | 35.01 ms / 26.68 ms | 2,995 / 3,931 MB/s |
 | `Randomness::initialize` (lock-free atomic file) | 92.1 µs | — |
 
 Full cycle counts, IPC, QEMU Cortex-M33 instruction/stack measurements, and the 1-core OpenSSL / SLH-DSA-B comparison are in [`BENCHMARKS.md`](BENCHMARKS.md).

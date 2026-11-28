@@ -74,8 +74,12 @@ pub(crate) fn read_exact_seed(file: &mut impl Read) -> io::Result<[u8; SEED_FILE
     Ok(buf[..SEED_FILE_LEN].try_into().unwrap())
 }
 
-fn check_private_regular_file(path: &Path) -> io::Result<()> {
-    let meta = fs::symlink_metadata(path)?;
+fn open_private_regular_file(path: &Path) -> io::Result<File> {
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(io::Error::new(ErrorKind::InvalidInput, "Signet randomness state path must not be a symlink"));
+    }
+    let file = File::open(path)?;
+    let meta = file.metadata()?;
     if !meta.file_type().is_file() {
         return Err(io::Error::new(ErrorKind::InvalidInput, "Signet randomness state path must be a regular file"));
     }
@@ -83,10 +87,10 @@ fn check_private_regular_file(path: &Path) -> io::Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         if meta.permissions().mode() & 0o077 != 0 {
-            return Err(io::Error::new(ErrorKind::PermissionDenied, "Signet randomness state file must be private (mode 0600)"));
+            return Err(io::Error::new(ErrorKind::PermissionDenied, "Signet randomness state file must have no group or world permission bits"));
         }
     }
-    Ok(())
+    Ok(file)
 }
 
 fn parent_dir(path: &Path) -> io::Result<&Path> {
@@ -135,10 +139,12 @@ fn write_temp_seed(tmp: &Path, seed: &[u8; SEED_FILE_LEN], sync: bool) -> io::Re
 /// After `initialize` returns, drawing per-imprint randomness computes a keyed BLAKE3 hash over an
 /// in-memory counter (no disk writes, no clock reads, and no system calls).
 ///
-/// Provision the state file once with [`Randomness::create`] before starting signers. In a
-/// multithreaded POSIX process, call `exec()` before initializing Signet rather than calling
-/// `initialize` directly after `fork()`; after restoring a VM snapshot, ensure genuinely fresh
-/// unshared OS entropy before initializing.
+/// **Process cloning, `fork()`, and VM snapshots:** never reuse an inherited live `Randomness`
+/// handle after `fork()` (even in a single-threaded process) or after restoring a live VM
+/// snapshot, because cloned processes would share `(run_key, count)`. Re-initialize via
+/// [`Randomness::initialize`] in each child process (after `exec()` in multithreaded POSIX
+/// processes, and only with fresh unshared OS entropy after VM snapshot restore). Provision the
+/// state file once with [`Randomness::create`] inside a private directory owned by the signer user.
 pub struct Randomness {
     run_key: [u8; 32],
     keygen_key: [u8; 32],
@@ -156,12 +162,12 @@ impl Randomness {
     ///
     /// Fails with `AlreadyExists` if `path` already exists, never overwriting an existing state
     /// file or unrelated path. Stages the complete 32-byte file, syncs it, publishes atomically
-    /// via no-replace `hard_link`, and syncs the parent directory.
+    /// via no-replace `hard_link`, removes the staging link, and syncs the parent directory.
     pub fn create(path: impl AsRef<Path>) -> io::Result<()> {
         ensure_init();
         let path = path.as_ref();
         let pool = mix_pool(None, &read_os_randomness()?, std::process::id(), &read_monotonic_clock());
-        let (next_seed, _, _) = expand_pool(&pool);
+        let next_seed = derive_key(CTX_NEXT_SEED, &pool);
 
         let tmp = temp_sibling_path(path)?;
         write_temp_seed(&tmp, &next_seed, true)?;
@@ -169,23 +175,22 @@ impl Randomness {
         let _ = fs::remove_file(&tmp);
         link_res?;
 
-        if let Ok(pf) = File::open(parent_dir(path)?) {
-            let _ = pf.sync_all();
-        }
-        Ok(())
+        File::open(parent_dir(path)?)?.sync_all()
     }
 
     /// Read the existing 32-byte state file at `path`, mix it with OS randomness (`getrandom`),
     /// the process ID, and the monotonic clock, atomically rotate `path` to a fresh 32-byte
-    /// successor via sibling temp file + `rename` (no locks), and return the in-memory generator.
+    /// successor via sibling temp file + `rename` (no locks, last-writer-wins under concurrent
+    /// startups), and return the in-memory generator.
     ///
-    /// Rejects missing paths, symlinks, directories, group/world-accessible files (`mode & 0o077 != 0`),
-    /// and files whose length is not exactly 32 bytes.
+    /// Rejects missing paths, symlinks, non-regular files, files with group/world permission bits
+    /// (`mode & 0o077 != 0` on Unix), and files whose length is not exactly 32 bytes. Runtime
+    /// rotation prioritizes lock-free atomic replacement over `fsync`; on crash before writeback,
+    /// the prior 32-byte state file remains intact and is re-mixed with fresh OS entropy on restart.
     pub fn initialize(path: impl AsRef<Path>) -> io::Result<Self> {
         ensure_init();
         let path = path.as_ref();
-        check_private_regular_file(path)?;
-        let mut f = File::open(path)?;
+        let mut f = open_private_regular_file(path)?;
         let prior = read_exact_seed(&mut f)?;
         drop(f);
 

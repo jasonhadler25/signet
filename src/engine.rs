@@ -1,14 +1,28 @@
 //! Internal BLINCS hashing engine isolating all `blake3-servil-core` batch, chain, counter,
-//! and single-block primitives behind one narrow boundary.
-//!
-//! Built on `blake3-servil-core = "=0.11.0"` today, structured so future upstream features
-//! (`servil-software-factory/BLAKE3` #583–#586) drop in inside this file alone with zero
-//! changes to protocol, tree, or coding logic in `one_time.rs`, `few_time.rs`, or `lib.rs`.
+//! and single-block primitives behind one narrow boundary (ready for `BLAKE3` #583–#586).
 
 use crate::params::{N, first_n};
 pub(crate) use blake3_servil_core::throughput::{Batch, Block, Packed};
 use blake3_servil_core::throughput::{Prepared, TreeHasher, hash as throughput_hash};
 use blake3_servil_core::{BLOCK_LEN, Mode};
+
+/// Execution dispatch policy for `blake3-servil-core` batch operations.
+#[derive(Clone, Copy)]
+pub(crate) enum Dispatch {
+    /// Wide bulk signing/keygen waves (uses SME2 when available).
+    Bulk,
+    /// Small on-core verification and active-chain waves (`TreeHasher::on_this_core`).
+    OnCore,
+}
+
+/// Prepare a `TreeHasher` for `key` under `dispatch`.
+#[inline]
+pub(crate) fn tree_hasher(key: &[u8; 32], dispatch: Dispatch) -> TreeHasher {
+    match dispatch {
+        Dispatch::Bulk => TreeHasher::new(Mode::Keyed(key)),
+        Dispatch::OnCore => TreeHasher::new(Mode::Keyed(key)).on_this_core(),
+    }
+}
 
 /// Native on-core packed SIMD width (`11` = NEON `8+3` on AArch64; `8` = AVX2 on x86-64).
 #[cfg(target_arch = "aarch64")]
@@ -22,11 +36,7 @@ pub(crate) const STACK_PACKED_CAP: usize = 11;
 
 const _: () = assert!(STACK_PACKED_CAP >= CORE_PACKED_WIDTH && STACK_PACKED_CAP >= crate::params::UPORS_K);
 
-/// Pad on-core packed batches on AArch64 NEON to `11` when `active` is in `7..11`, working
-/// around the `0.11.0` `hash_packed` stack-expansion remainder cliff (`BLAKE3` #583).
-///
-/// Upgrade hook (`BLAKE3` #583): once `blake3-servil-core` pads NEON `7..=10` remainders
-/// internally, collapse this helper to `active`.
+/// Pad AArch64 NEON packed batches of `7..11` messages to `11` (`BLAKE3` #583).
 #[inline]
 pub(crate) const fn core_pad_width(active: usize) -> usize {
     #[cfg(target_arch = "aarch64")]
@@ -42,11 +52,17 @@ pub(crate) const fn core_pad_width(active: usize) -> usize {
     }
 }
 
-/// Sort active `(remaining_steps, chain_index)` entries longest-first so shorter chains
-/// backfill freed lanes immediately in [`HashEngine::advance_chains_varlen`].
+/// Sort active `(remaining_steps, chain_index)` entries longest-first for continuous-refill scheduling.
 #[inline]
 pub(crate) fn sort_chain_queue(queue: &mut [(u8, u8)]) {
     queue.sort_unstable_by_key(|x| core::cmp::Reverse(x.0));
+}
+
+#[inline]
+fn truncate_16(raw: &[[u8; 32]], out16: &mut [[u8; N]]) {
+    for (dst, src) in out16.iter_mut().zip(raw.iter()) {
+        *dst = first_n(src);
+    }
 }
 
 /// Prepared keyed hashing engine for public BLINCS tree, chain, and grinding operations.
@@ -56,17 +72,11 @@ pub(crate) struct HashEngine {
 }
 
 impl HashEngine {
-    /// Prepare an engine for `key`. Pass `use_sme2 = true` for bulk signing/keygen waves and
-    /// `use_sme2 = false` for verification and small active-chain waves (`TreeHasher::on_this_core`).
-    pub(crate) fn new(key: [u8; 32], use_sme2: bool) -> Self {
-        let hasher = if use_sme2 { TreeHasher::new(Mode::Keyed(&key)) } else { TreeHasher::new(Mode::Keyed(&key)).on_this_core() };
-        Self { key, hasher }
+    pub(crate) fn new(key: [u8; 32], dispatch: Dispatch) -> Self {
+        Self { key, hasher: tree_hasher(&key, dispatch) }
     }
 
-    /// Hash a single-block (`<= 64`-byte) message on the fast aligned `Block` path.
-    ///
-    /// Upgrade hook (`BLAKE3` #586): swap to `*self.hasher.hash(bytes).as_bytes()` once
-    /// `TreeHasher::hash` has an inline `<= 64 B` fast path.
+    /// Hash a single-block (`<= 64`-byte) message on the aligned `Block` path (`BLAKE3` #586).
     #[inline]
     pub(crate) fn hash_short(&self, bytes: &[u8]) -> [u8; 32] {
         assert!(bytes.len() <= BLOCK_LEN);
@@ -92,37 +102,30 @@ impl HashEngine {
         assert_eq!(blocks.len(), out16.len());
         let raw = &mut scratch[..blocks.len()];
         self.hasher.hash_many(&Batch::from_blocks(blocks, BLOCK_LEN), raw);
-        for (dst, src) in out16.iter_mut().zip(raw.iter()) {
-            *dst = first_n(src);
-        }
+        truncate_16(raw, out16);
     }
 
-    /// Hash the first `count` messages of a multi-block `Batch` and write truncated `16`-byte digests.
-    pub(crate) fn hash_batch_n(&self, batch: &Batch, count: usize, scratch: &mut [[u8; 32]], out16: &mut [[u8; N]]) {
-        assert_eq!(count, out16.len());
+    /// Hash the first `out16.len()` messages of a multi-block `Batch` into `16`-byte digests.
+    pub(crate) fn hash_batch_n(&self, batch: &Batch, scratch: &mut [[u8; 32]], out16: &mut [[u8; N]]) {
+        let count = out16.len();
         let raw = &mut scratch[..count];
         self.hasher.hash_many(&batch.part(0..count), raw);
-        for (dst, src) in out16.iter_mut().zip(raw.iter()) {
-            *dst = first_n(src);
-        }
+        truncate_16(raw, out16);
     }
 
-    /// Hash `count` packed `48`-byte Merkle node inputs from a heap `Packed<48>` buffer.
-    pub(crate) fn hash_packed_48_bulk(&self, nodes: &Packed<48>, count: usize, scratch: &mut [[u8; 32]], out16: &mut [[u8; N]]) {
-        assert_eq!(count, out16.len());
+    /// Hash `out16.len()` packed `48`-byte Merkle node inputs from a heap `Packed<48>` buffer.
+    pub(crate) fn hash_packed_48_bulk(&self, nodes: &Packed<48>, scratch: &mut [[u8; 32]], out16: &mut [[u8; N]]) {
+        let count = out16.len();
         if count == 1 {
             out16[0] = self.hash_short_n(&nodes[0]);
             return;
         }
         let raw = &mut scratch[..count];
         self.hasher.hash_many(&nodes.part(0..count), raw);
-        for (dst, src) in out16.iter_mut().zip(raw.iter()) {
-            *dst = first_n(src);
-        }
+        truncate_16(raw, out16);
     }
 
-    /// Hash `count` (`1..=STACK_PACKED_CAP`) packed `48`-byte Merkle node inputs on stack,
-    /// padding AArch64 NEON `7..11` batches via [`core_pad_width`] (`BLAKE3` #583).
+    /// Hash `count` (`1..=STACK_PACKED_CAP`) packed `48`-byte Merkle node inputs on stack (`BLAKE3` #583).
     pub(crate) fn hash_packed_48_stack(&self, buf: &[[u8; 48]; STACK_PACKED_CAP], count: usize, out16: &mut [[u8; N]]) {
         assert!((1..=STACK_PACKED_CAP).contains(&count) && count <= out16.len());
         if count == 1 {
@@ -132,19 +135,11 @@ impl HashEngine {
         let run = core_pad_width(count);
         let mut raw = [[0u8; 32]; STACK_PACKED_CAP];
         self.hasher.hash_many(&buf[..run], &mut raw[..run]);
-        for i in 0..count {
-            out16[i] = first_n(&raw[i]);
-        }
+        truncate_16(&raw[..count], &mut out16[..count]);
     }
 
-    /// Advance `count` independent `32`-byte chains (`[prefix12 || 0u32 || start16]`) by `steps`
-    /// fixed iterations (`steps >= 1`) with `16`-byte feedback, writing final `16`-byte endpoints.
-    ///
-    /// Upgrade hook (`BLAKE3` #584): replace body with a single `hash_chains_32_trunc16` call.
-    pub(crate) fn advance_chains_fixed(&self, b32: &mut Packed<32>, count: usize, steps: u8, scratch: &mut [[u8; 32]], out16: &mut [[u8; N]]) {
-        assert!(steps >= 1 && count == out16.len());
-        self.hasher.hash_many(&b32.part(0..count), &mut scratch[..count]);
-        for step in 1..steps {
+    fn feedback_steps(&self, b32: &mut Packed<32>, count: usize, steps: core::ops::Range<u8>, scratch: &mut [[u8; 32]]) {
+        for step in steps {
             let step_bytes = u32::from(step).to_le_bytes();
             for (m, o) in b32[..count].iter_mut().zip(scratch[..count].iter()) {
                 m[12..16].copy_from_slice(&step_bytes);
@@ -152,64 +147,37 @@ impl HashEngine {
             }
             self.hasher.hash_many(&b32.part(0..count), &mut scratch[..count]);
         }
-        for (dst, src) in out16.iter_mut().zip(scratch[..count].iter()) {
-            *dst = first_n(src);
-        }
     }
 
-    /// Advance a two-stage bulk wave (`0..long_count` for `long_steps`, `long_count..total_count`
-    /// for `short_steps`, all starting at step `0`) and write final `16`-byte endpoints.
-    ///
-    /// Keeps the lockstep `0..short_steps` + `short_steps..long_steps` schedule on `0.11.0`
-    /// (`59` SME2 calls instead of `82`).
-    ///
-    /// Upgrade hook (`BLAKE3` #584): replace body with two `hash_chains_32_trunc16` calls
-    /// (`0..long_count` × `long_steps` and `long_count..total_count` × `short_steps`).
-    #[allow(clippy::too_many_arguments)]
+    /// Advance `out16.len()` `32`-byte chains by `steps` fixed iterations (`BLAKE3` #584).
+    pub(crate) fn advance_chains_fixed(&self, b32: &mut Packed<32>, steps: u8, scratch: &mut [[u8; 32]], out16: &mut [[u8; N]]) {
+        let count = out16.len();
+        assert!(steps >= 1);
+        self.hasher.hash_many(&b32.part(0..count), &mut scratch[..count]);
+        self.feedback_steps(b32, count, 1..steps, scratch);
+        truncate_16(&scratch[..count], out16);
+    }
+
+    /// Advance a two-stage bulk wave (`0..long_count` × `long_steps`, `long_count..` × `short_steps`, `BLAKE3` #584).
     pub(crate) fn advance_chains_staged(
         &self,
         b32: &mut Packed<32>,
         long_count: usize,
-        total_count: usize,
         short_steps: u8,
         long_steps: u8,
         scratch: &mut [[u8; 32]],
         out16: &mut [[u8; N]],
     ) {
-        assert!(long_count <= total_count && short_steps >= 1 && short_steps < long_steps && total_count == out16.len());
+        let total_count = out16.len();
+        assert!(long_count <= total_count && short_steps >= 1 && short_steps < long_steps);
         self.hasher.hash_many(&b32.part(0..total_count), &mut scratch[..total_count]);
-        for step in 1..short_steps {
-            let step_bytes = u32::from(step).to_le_bytes();
-            for (m, o) in b32[..total_count].iter_mut().zip(scratch[..total_count].iter()) {
-                m[12..16].copy_from_slice(&step_bytes);
-                m[16..32].copy_from_slice(&o[..N]);
-            }
-            self.hasher.hash_many(&b32.part(0..total_count), &mut scratch[..total_count]);
-        }
-        for (dst, src) in out16[long_count..total_count].iter_mut().zip(scratch[long_count..total_count].iter()) {
-            *dst = first_n(src);
-        }
-        for step in short_steps..long_steps {
-            let step_bytes = u32::from(step).to_le_bytes();
-            for (m, o) in b32[..long_count].iter_mut().zip(scratch[..long_count].iter()) {
-                m[12..16].copy_from_slice(&step_bytes);
-                m[16..32].copy_from_slice(&o[..N]);
-            }
-            self.hasher.hash_many(&b32.part(0..long_count), &mut scratch[..long_count]);
-        }
-        for (dst, src) in out16[..long_count].iter_mut().zip(scratch[..long_count].iter()) {
-            *dst = first_n(src);
-        }
+        self.feedback_steps(b32, total_count, 1..short_steps, scratch);
+        truncate_16(&scratch[long_count..total_count], &mut out16[long_count..total_count]);
+        self.feedback_steps(b32, long_count, short_steps..long_steps, scratch);
+        truncate_16(&scratch[..long_count], &mut out16[..long_count]);
     }
 
-    /// Zero-allocation variable-length `32`-byte chain evaluator (`init32[i]` starts at its
-    /// embedded `u32` LE step word in bytes `12..16`, advances `steps[i]` times with `16`-byte
-    /// feedback, and writes its `16`-byte endpoint to `out16[i]`).
-    ///
-    /// Schedules chains longest-first across a continuous-refill [`CORE_PACKED_WIDTH`]-lane work
-    /// queue so finished lanes are backfilled immediately without shrinking batches.
-    ///
-    /// Upgrade hook (`BLAKE3` #584): replace body with `hash_chains_varlen_32_trunc16`.
+    /// Zero-allocation continuous-refill variable-length `32`-byte chain evaluator (`BLAKE3` #584).
     pub(crate) fn advance_chains_varlen<const MAX_N: usize>(&self, init32: &[[u8; 32]], steps: &[u8], out16: &mut [[u8; N]]) {
         let n = init32.len();
         assert!(n <= MAX_N && n == steps.len() && n == out16.len());
@@ -281,11 +249,7 @@ impl HashEngine {
         }
     }
 
-    /// Grind the smallest counter `ctr` in `0..limit` whose single-block digest of `tmpl`
-    /// (with `u32` LE counter at `counter_word * 4`) satisfies `accept`.
-    ///
-    /// Upgrade hook (`BLAKE3` #585): replace the `1,024`-batch `hash_counter_range` loop with
-    /// zero-word-trimmed / early-exit `find_counter_range`.
+    /// Grind the smallest counter in `0..limit` whose digest of `tmpl` satisfies `accept` (`BLAKE3` #585).
     pub(crate) fn grind_counter<T>(
         &self,
         tmpl: &[u8],

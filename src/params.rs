@@ -1,7 +1,7 @@
-use blake3_servil_core::throughput::TreeHasher;
+use crate::engine::{Dispatch, HashEngine, tree_hasher};
 use blake3_servil_core::{Mode, convenience, initialize};
 
-/// Permanent suite identifier for this BLINCS parameter set (`13+7+7+7+7+7` `S-WOTS+Z` + `U-PORS`, 2⁴⁸ budget).
+/// Permanent suite identifier for this BLINCS parameter set (`13+7+7+7+7+7` `WOTS+C` + `U-PORS`, 2⁴⁸ budget).
 pub const SUITE_NAME: &str = "BLINCS-48-X";
 /// Byte length of a [`crate::Signet`] secret seed (`32` bytes).
 pub const SEED_LEN: usize = 32;
@@ -122,10 +122,6 @@ pub(crate) fn read_bits(d: &[u8; 32], bit_off: usize, width: usize) -> u64 {
     (u64::from_le_bytes(raw) >> shift) & ((1u64 << width) - 1)
 }
 
-fn tree_hasher(key: &[u8; 32], use_sme2: bool) -> TreeHasher {
-    if use_sme2 { TreeHasher::new(Mode::Keyed(key)) } else { TreeHasher::new(Mode::Keyed(key)).on_this_core() }
-}
-
 /// Separate newtypes for secret (`K_sec`) vs. public (`K_pub`) tree keys prevent cross-role mixups.
 ///
 /// `SecretKey` exposes only narrow secret-domain `ChainSecret` batch derivations and never hands
@@ -138,16 +134,12 @@ impl SecretKey {
         Self(derive_key(CTX_SECRET_VALUES, seed))
     }
 
-    /// Derive `out16.len()` consecutive `16`-byte secret chain starts via register-only
-    /// `hash_counter_range` (word 3 = `b` = linear slot `leaf_idx * chains + chain_idx`).
-    ///
-    /// Upgrade hook (`BLAKE3` #585): swap directly to `hash_counter_range_trunc16` once available,
-    /// dropping `scratch`.
-    pub(crate) fn derive_chain_starts_16(&self, layer: u8, tree: u64, start_slot: u32, use_sme2: bool, scratch: &mut [[u8; 32]], out16: &mut [[u8; N]]) {
+    /// Derive `out16.len()` consecutive `16`-byte secret chain starts via `hash_counter_range` (`BLAKE3` #585).
+    pub(crate) fn derive_chain_starts_16(&self, layer: u8, tree: u64, start_slot: u32, dispatch: Dispatch, scratch: &mut [[u8; 32]], out16: &mut [[u8; N]]) {
         assert!(tree < (1u64 << 48));
         let tmpl = tweak(TweakKind::ChainSecret, layer, tree, 0, 0, 0);
         let raw = &mut scratch[..out16.len()];
-        tree_hasher(&self.0, use_sme2).hash_counter_range(&tmpl, 3, start_slot, raw);
+        tree_hasher(&self.0, dispatch).hash_counter_range(&tmpl, 3, start_slot, raw);
         for (dst, src) in out16.iter_mut().zip(raw.iter()) {
             *dst = first_n(src);
         }
@@ -162,8 +154,8 @@ impl PublicKey {
         Self(derive_key(CTX_PUBLIC_HASH, public_seed))
     }
 
-    pub(crate) fn engine(&self, use_sme2: bool) -> crate::engine::HashEngine {
-        crate::engine::HashEngine::new(self.0, use_sme2)
+    pub(crate) fn engine(&self, dispatch: Dispatch) -> HashEngine {
+        HashEngine::new(self.0, dispatch)
     }
 
     pub(crate) fn keyed(&self, data: &[u8]) -> [u8; 32] {
@@ -217,19 +209,6 @@ impl Layer {
     #[inline]
     pub(crate) const fn sig_offset(self) -> usize {
         2 * N + UPORS_LEN + self.index() * LOW_LAYER_LEN
-    }
-
-    #[cfg(test)]
-    #[inline]
-    pub(crate) const fn trees(self) -> u64 {
-        match self {
-            Self::L0 => 1u64 << 41,
-            Self::L1 => 1u64 << 34,
-            Self::L2 => 1u64 << 27,
-            Self::L3 => 1u64 << 20,
-            Self::L4 => 1u64 << 13,
-            Self::L5 => 1,
-        }
     }
 }
 

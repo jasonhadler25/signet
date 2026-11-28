@@ -73,15 +73,15 @@ CONTROLS = [
     (
         "Streaming Sink::update feeds bytes into Hasher",
         "src/content.rs",
-        "                self.hasher.update(bytes);",
-        "                let _ = bytes;",
+        "        let _ = self.0.push(bytes);",
+        "        let _ = bytes;",
         "streaming_imprint_with_and_verify_with_match_slices",
     ),
     (
         "Streaming Sink::write feeds bytes into Hasher",
         "src/content.rs",
-        "        self.hasher.update(buf);",
-        "        let _ = buf;",
+        "        if !self.0.push(buf) {",
+        "        let _ = buf;\n        if false {",
         "streaming_imprint_with_and_verify_with_match_slices",
     ),
     (

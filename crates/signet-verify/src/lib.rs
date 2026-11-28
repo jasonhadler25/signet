@@ -5,9 +5,11 @@
 //!
 //! This crate verifies [`ImprintRef`] signatures against an expected [`SignetId`] and bounded
 //! application [`Context`] using pure-Rust BLAKE3 (`blake3` with `default-features = false`,
-//! `features = ["pure"]`), zero static lookup tables (closed-form `U-PORS` hexagon unranking and
-//! direct 6-bit `WOTS+C` decoding — under 1 KiB of stack RAM on ARM Cortex-M33), zero `std`,
-//! zero `alloc`, and zero `unsafe`.
+//! `features = ["pure"]`), zero static coding lookup tables (closed-form `U-PORS` hexagon
+//! unranking and direct 6-bit `WOTS+C` decoding), zero `std`, zero `alloc`, and zero `unsafe`.
+//! (The `< 1 KiB` Cortex-M33 stack watermark in `DESIGN.md` / `BENCHMARKS.md` refers to a
+//! specialized single-block QEMU harness; this crate holds a full streaming `blake3::Hasher` and
+//! fixed stack scratch buffers with zero heap allocation.)
 //!
 //! Both one-shot slice verification ([`SignetId::verify`]) and incremental streaming verification
 //! ([`SignetId::verifier`] -> [`Verifier::update`] -> [`Verifier::finalize`]) are provided.
@@ -483,6 +485,7 @@ impl fmt::Debug for SignetId {
 }
 
 /// Streaming single-pass `#![no_std]` verifier returned by [`SignetId::verifier`].
+#[must_use = "imprint verification is not complete until finalize() succeeds"]
 pub struct Verifier<'a> {
     id: SignetId,
     ctx: Context<'a>,

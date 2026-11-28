@@ -58,7 +58,7 @@ fn report(label: &str, batches: &[clocks::Batch], bytes_per_call: u64) {
     let cyc_str = if s.have_counts {
         let cyc_per_call = (s.cycles + s.calls / 2) / s.calls;
         let ins_per_call = (s.instructions + s.calls / 2) / s.calls;
-        let ipc_hundredths = if s.cycles > 0 { (s.instructions * 100 + s.cycles / 2) / s.cycles } else { 0 };
+        let ipc_hundredths = (s.instructions * 100 + s.cycles / 2).checked_div(s.cycles).unwrap_or(0);
         format!(
             "{:>11} cyc  {:>11} ins  {}.{:02} IPC  {:>4} MHz ({}% E)",
             cyc_per_call,

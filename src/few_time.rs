@@ -8,11 +8,38 @@ use constant_time_eq::constant_time_eq;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct UporsSelection {
-    pub(crate) ctr: u32,
-    pub(crate) h_sel: [u8; 32],
-    pub(crate) leaf_addr: LeafAddr,
-    pub(crate) leaves: [u16; UPORS_K],
-    pub(crate) sibs: usize,
+    ctr: u32,
+    h_sel: [u8; 32],
+    leaf_addr: LeafAddr,
+    leaves: [u16; UPORS_K],
+    sibs: usize,
+}
+
+impl UporsSelection {
+    #[inline]
+    pub(crate) const fn ctr(&self) -> u32 {
+        self.ctr
+    }
+
+    #[inline]
+    pub(crate) const fn h_sel(&self) -> &[u8; 32] {
+        &self.h_sel
+    }
+
+    #[inline]
+    pub(crate) const fn leaf_addr(&self) -> LeafAddr {
+        self.leaf_addr
+    }
+
+    #[inline]
+    pub(crate) const fn leaves(&self) -> &[u16; UPORS_K] {
+        &self.leaves
+    }
+
+    #[inline]
+    pub(crate) const fn sibs(&self) -> usize {
+        self.sibs
+    }
 }
 
 /// Count exact Octopus authentication siblings for `sorted_leaves` in a height-11 binary tree.

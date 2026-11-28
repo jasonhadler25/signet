@@ -381,14 +381,14 @@ class Signet:
         randomizer = blake3.keyed_hash(self.randomizer_key, short + framed_ctx)[:N]
         d_seed = blake3.keyed_hash(public, tweak(KIND_MESSAGE) + randomizer + sid.root + short + framed_ctx)
 
-        ctr_ft = 0
-        while True:
+        for ctr_ft in range(1 << 32):
             d_sel = blake3.keyed_hash(public, tweak(KIND_FEW_SELECT, UPORS_LAYER) + d_seed + ctr_ft.to_bytes(4, "little"))
             parsed = parse_select_digest(d_sel)
             if parsed is not None:
                 leaf_addr, leaves, _ = parsed
                 break
-            ctr_ft += 1
+        else:
+            raise RuntimeError("u32 ctr_ft exhausted")
         codewords = extract_upors_codewords(public, d_sel)
 
         out = bytearray(salt + randomizer + ctr_ft.to_bytes(4, "little"))
@@ -426,13 +426,13 @@ class Signet:
             h_l = TOP_HEIGHT if layer == LAYERS - 1 else LOW_HEIGHT
             leaf = addr & ((1 << h_l) - 1)
             tree = addr >> h_l
-            ctr_l = 0
-            while True:
+            for ctr_l in range(1 << 24):
                 h_msg = blake3.keyed_hash(public, tweak(KIND_ONE_TIME_MSG, layer, tree, leaf) + node + ctr_l.to_bytes(4, "little"))
                 ds = decode_wots_c(h_msg)
                 if ds is not None:
                     break
-                ctr_l += 1
+            else:
+                raise RuntimeError("WOTS+C u24 counter exhausted")
             out += ctr_l.to_bytes(WOTS_CTR_LEN, "little")
             for c, d in enumerate(ds):
                 s = H(self.secret, tweak(KIND_CHAIN_SECRET, layer, tree, 0, 0, leaf * WOTS_N + c))

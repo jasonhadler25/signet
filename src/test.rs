@@ -2,7 +2,7 @@ include!("../tools/require_nextest.rs");
 
 use crate::coding::{decode_wots_c, hex_unrank};
 use crate::content::{content_from_slice, content_with, derive_msg_key};
-use crate::engine::{CORE_PACKED_WIDTH, Packed, STACK_PACKED_CAP, core_pad_width, sort_chain_queue};
+use crate::engine::{CORE_PACKED_WIDTH, Dispatch, Packed, STACK_PACKED_CAP, core_pad_width, sort_chain_queue};
 use crate::few_time::{
     count_octopus_sibs, extract_upors_codewords, parse_select_digest, parse_select_fast, select_ancestor_lower_bound, verify_upors_selection,
 };
@@ -146,11 +146,11 @@ fn reference_vector_and_intermediate_kats_match_python_byte_for_byte() {
 
     let ctr_ft = u32::from_le_bytes(ref_sig.as_bytes()[2 * N..2 * N + UPORS_CTR_LEN].try_into().unwrap());
     assert_eq!(ctr_ft, 5530);
-    let eng = pk.engine(false);
+    let eng = pk.engine(Dispatch::OnCore);
     let sel = verify_upors_selection(&eng, &d_seed, ctr_ft).unwrap();
-    assert_eq!(sel.leaf_addr.as_u64(), 0xbbce_641c_7560);
-    assert_eq!(sel.sibs, 45);
-    let cws = extract_upors_codewords(&eng, &sel.h_sel).unwrap();
+    assert_eq!(sel.leaf_addr().as_u64(), 0xbbce_641c_7560);
+    assert_eq!(sel.sibs(), 45);
+    let cws = extract_upors_codewords(&eng, sel.h_sel()).unwrap();
     for cw in &cws {
         assert_eq!(cw.iter().map(|&x| usize::from(x)).sum::<usize>(), UPORS_SUM);
     }
@@ -512,7 +512,7 @@ fn hex_and_sperner_unranking_and_fast_select_parser_are_exact() {
             }
         }
         if saw_376 && valid_before_376 < UPORS_K {
-            let cws = extract_upors_codewords(&pk.engine(false), &h_sel).unwrap();
+            let cws = extract_upors_codewords(&pk.engine(Dispatch::OnCore), &h_sel).unwrap();
             assert!(cws.iter().all(|cw| cw.iter().map(|&x| usize::from(x)).sum::<usize>() == UPORS_SUM));
             hit_376 = true;
             break;
@@ -570,7 +570,7 @@ fn every_signature_region_and_canonical_padding_are_checked() {
 
     // Explicit verify_wots_msg 2-zero-bit / sum check.
     let pk = PublicKey::from_seed(&[0x55u8; N]);
-    let pub_e = pk.engine(false);
+    let pub_e = pk.engine(Dispatch::OnCore);
     let mut rejected_ctr = 0usize;
     for ctr in 0u32..32 {
         if verify_wots_msg(&pub_e, Layer::L0, 0, 0, &[0x11u8; N], ctr).is_none() {
@@ -990,7 +990,7 @@ fn reentrant_producer_can_sign_and_verify_without_borrowing_panic() {
     let vk = sk.id();
     let inner_sig = sk.imprint_with_draw(&[9u8; 32], TEST_CTX, b"inner");
 
-    let produce = |prefix_len: usize, sink: &mut crate::Sink| -> io::Result<()> {
+    let produce = |prefix_len: usize, sink: &mut crate::Sink<'_>| -> io::Result<()> {
         if prefix_len > 0 {
             sink.update(&vec![0x41u8; prefix_len]);
         }
@@ -1025,12 +1025,13 @@ fn checked_constructors_reject_out_of_range_values() {
     assert_eq!(&max_t[2..8], &[0xff; 6]);
     assert!(catch_unwind(|| tweak(TweakKind::Node, 0, 1u64 << 48, 0, 0, 0)).is_err());
 
-    assert_eq!(Layer::L0.trees(), 1u64 << 41);
-    assert_eq!(Layer::L1.trees(), 1u64 << 34);
-    assert_eq!(Layer::L2.trees(), 1u64 << 27);
-    assert_eq!(Layer::L3.trees(), 1u64 << 20);
-    assert_eq!(Layer::L4.trees(), 1u64 << 13);
-    assert_eq!(Layer::L5.trees(), 1);
+    let max_splits = LeafAddr::from_word((1u64 << HYPER_BITS) - 1).split_layers();
+    let expected_max_trees = [(1u64 << 41) - 1, (1u64 << 34) - 1, (1u64 << 27) - 1, (1u64 << 20) - 1, (1u64 << 13) - 1, 0];
+    for (i, &(tree, leaf)) in max_splits.iter().enumerate() {
+        assert_eq!(tree, expected_max_trees[i]);
+        let max_leaf = if i == 5 { (1u16 << 13) - 1 } else { (1u16 << 7) - 1 };
+        assert_eq!(leaf, max_leaf);
+    }
 }
 
 #[test]
@@ -1210,8 +1211,8 @@ fn stateful_lifecycle_and_trait_contracts() {
 fn hash_engine_primitives_match_reference_and_boundaries() {
     ensure_init();
     let pk = PublicKey::from_seed(&[0x3cu8; N]);
-    let core = pk.engine(false);
-    let bulk = pk.engine(true);
+    let core = pk.engine(Dispatch::OnCore);
+    let bulk = pk.engine(Dispatch::Bulk);
 
     // 1. sort_chain_queue sorts strictly non-increasing by remaining steps.
     let mut q = [(3u8, 0u8), (19, 1), (0, 2), (7, 3), (19, 4), (1, 5)];
@@ -1243,7 +1244,7 @@ fn hash_engine_primitives_match_reference_and_boundaries() {
     for count in [1usize, 2, 6, 7, 9, STACK_PACKED_CAP] {
         let mut out_bulk = vec![[0u8; N]; count];
         let mut out_stack = vec![[0u8; N]; count];
-        bulk.hash_packed_48_bulk(&p48, count, &mut scratch, &mut out_bulk);
+        bulk.hash_packed_48_bulk(&p48, &mut scratch, &mut out_bulk);
         core.hash_packed_48_stack(&stack48, count, &mut out_stack);
         for i in 0..count {
             let want = pk.keyed(&stack48[i]);
@@ -1278,7 +1279,7 @@ fn hash_engine_primitives_match_reference_and_boundaries() {
     }
 
     let mut fixed_out = [[0u8; N]; TOTAL];
-    bulk.advance_chains_fixed(&mut p32, TOTAL, 4, &mut scratch, &mut fixed_out);
+    bulk.advance_chains_fixed(&mut p32, 4, &mut scratch, &mut fixed_out);
     for i in 0..TOTAL {
         assert_eq!(fixed_out[i], scalar_chain(init32[i], 4));
     }
@@ -1287,7 +1288,7 @@ fn hash_engine_primitives_match_reference_and_boundaries() {
         p32[i] = init32[i];
     }
     let mut staged_out = [[0u8; N]; TOTAL];
-    bulk.advance_chains_staged(&mut p32, 16, TOTAL, 3, 6, &mut scratch, &mut staged_out);
+    bulk.advance_chains_staged(&mut p32, 16, 3, 6, &mut scratch, &mut staged_out);
     for i in 0..TOTAL {
         let expected_steps = if i < 16 { 6 } else { 3 };
         assert_eq!(staged_out[i], scalar_chain(init32[i], expected_steps));

@@ -93,7 +93,7 @@ Our standalone zero-dependency verifier (`tools/upors_cert.rs`):
 
 7. **Zero-table Sperner DP unranking:** on Cortex-M33 QEMU, 6-layer `u128` boxcar deconvolution executes `6.50M` Thumb-2 instructions (`1,816×` more than packed `WOTS+C`) and consumes `22.22 KiB` stack (`23×` more than `988 B`), while desktop table-based unranking requires `115 KiB` of static ROM tables.
 8. **`52`-byte Round-0-skip `CHAIN` layout:** saved `6.1%` modeled Cortex-M33 cycles (`~655 -> 615`) but exited `blake3-servil-core`'s 32-byte packed SIMD path and regressed Apple M6 signing `+37%` and verification `+50%`. The standard `32`-byte `CHAIN` layout is jointly optimal.
-9. **`+96 B` parallel-verify root hints:** cut M6 verification from `62.7 µs` to `45.0 µs`, but pushed signatures above `4 KiB` (`4,086 B`). Declined to preserve sub-`4 KiB` (`3,990 B`) fixed wire length.
+9. **`+96 B` parallel-verify root hints:** cut early M6 verification from `62.7 µs` to `45.0 µs`, but pushed signatures above `4,000 B` (`4,086 B`) and added extra wire fields and verifier complexity (while continuous-refill chain scheduling in `src/engine.rs` already lowered M6 verification to `52.7 µs` at `3,990 B` with zero extra wire bytes). Declined to preserve the clean `3,990 B` fixed wire length.
 10. **Hybrid stateful/stateless (`SHRINCS` [ePrint 2025/2203](https://eprint.iacr.org/2025/2203)):** keeping BLINCS 100% pure stateless avoids read-only-filesystem hazards, dual-branch format complexity, and privacy/state trade-offs.
 11. **BLAKE3 XOF mode & library-internal multithreading:** avoided so verifiers across Rust `#![no_std]`, WASM, Python, TypeScript, and Lean 4 stay minimal and predictable, and libraries never spawn background threads.
 
