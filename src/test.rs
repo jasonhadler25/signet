@@ -2,10 +2,11 @@ include!("../tools/require_nextest.rs");
 
 use crate::coding::{decode_wots_c, hex_unrank};
 use crate::content::{content_from_slice, content_with, derive_msg_key};
+use crate::engine::{CORE_PACKED_WIDTH, Packed, STACK_PACKED_CAP, core_pad_width, sort_chain_queue};
 use crate::few_time::{
     count_octopus_sibs, extract_upors_codewords, parse_select_digest, parse_select_fast, select_ancestor_lower_bound, verify_upors_selection,
 };
-use crate::one_time::{neon_pad_width, verify_wots_msg};
+use crate::one_time::verify_wots_msg;
 use crate::params::{
     CTX_CONTENT, HYPER_BITS, IMPRINT_LEN, Layer, LeafAddr, MAX_CONTEXT_LEN, N, PublicKey, SUITE_NAME, TOP_LAYER_LEN, TweakKind, UPORS_C, UPORS_CTR_LEN,
     UPORS_HEIGHT, UPORS_K, UPORS_LEN, UPORS_M_MAX, UPORS_N, UPORS_SELECT_MAX_DRAWS, UPORS_STEPS, UPORS_SUM, WOTS_N, WOTS_STEPS, WOTS_SUM, derive_key,
@@ -145,10 +146,11 @@ fn reference_vector_and_intermediate_kats_match_python_byte_for_byte() {
 
     let ctr_ft = u32::from_le_bytes(ref_sig.as_bytes()[2 * N..2 * N + UPORS_CTR_LEN].try_into().unwrap());
     assert_eq!(ctr_ft, 5530);
-    let sel = verify_upors_selection(&pk.hasher(false), &d_seed, ctr_ft).unwrap();
+    let eng = pk.engine(false);
+    let sel = verify_upors_selection(&eng, &d_seed, ctr_ft).unwrap();
     assert_eq!(sel.leaf_addr.as_u64(), 0xbbce_641c_7560);
     assert_eq!(sel.sibs, 45);
-    let cws = extract_upors_codewords(&pk, &sel.h_sel).unwrap();
+    let cws = extract_upors_codewords(&eng, &sel.h_sel).unwrap();
     for cw in &cws {
         assert_eq!(cw.iter().map(|&x| usize::from(x)).sum::<usize>(), UPORS_SUM);
     }
@@ -462,13 +464,12 @@ fn hex_and_sperner_unranking_and_fast_select_parser_are_exact() {
     let d_lb52 = pack_leaves(&leaves_lb52);
     assert_eq!(select_ancestor_lower_bound(&d_lb52), 52);
     assert!(parse_select_fast(&d_lb52).is_some());
-    for a in 0..=WOTS_N {
-        let expected = match a {
-            16.. => 22,
-            8..11 => 11,
-            _ => a,
-        };
-        assert_eq!(neon_pad_width(a), expected);
+    for a in 0..=STACK_PACKED_CAP {
+        #[cfg(target_arch = "aarch64")]
+        let expected = if (7..CORE_PACKED_WIDTH).contains(&a) { CORE_PACKED_WIDTH } else { a };
+        #[cfg(not(target_arch = "aarch64"))]
+        let expected = a;
+        assert_eq!(core_pad_width(a), expected);
     }
 
     // Exact boundary tests for `parse_select_digest` & `parse_select_fast`:
@@ -510,7 +511,7 @@ fn hex_and_sperner_unranking_and_fast_select_parser_are_exact() {
             }
         }
         if saw_376 && valid_before_376 < UPORS_K {
-            let cws = extract_upors_codewords(&pk, &h_sel).unwrap();
+            let cws = extract_upors_codewords(&pk.engine(false), &h_sel).unwrap();
             assert!(cws.iter().all(|cw| cw.iter().map(|&x| usize::from(x)).sum::<usize>() == UPORS_SUM));
             hit_376 = true;
             break;
@@ -566,12 +567,12 @@ fn every_signature_region_and_canonical_padding_are_checked() {
         );
     }
 
-    // Explicit verify_wots_msg 12-zero-bit check (`lo.trailing_zeros() < 12` rejected).
+    // Explicit verify_wots_msg 2-zero-bit / sum check.
     let pk = PublicKey::from_seed(&[0x55u8; N]);
-    let pub_h = pk.hasher(false);
+    let pub_e = pk.engine(false);
     let mut rejected_ctr = 0usize;
     for ctr in 0u32..32 {
-        if verify_wots_msg(&pub_h, Layer::L0, 0, 0, &[0x11u8; N], ctr).is_none() {
+        if verify_wots_msg(&pub_e, Layer::L0, 0, 0, &[0x11u8; N], ctr).is_none() {
             rejected_ctr += 1;
         }
     }
@@ -1202,4 +1203,125 @@ fn stateful_lifecycle_and_trait_contracts() {
 
     let _ = fs::remove_dir_all(d1.parent().unwrap());
     let _ = fs::remove_dir_all(d2.parent().unwrap());
+}
+
+#[test]
+fn hash_engine_primitives_match_reference_and_boundaries() {
+    ensure_init();
+    let pk = PublicKey::from_seed(&[0x3cu8; N]);
+    let core = pk.engine(false);
+    let bulk = pk.engine(true);
+
+    // 1. sort_chain_queue sorts strictly non-increasing by remaining steps.
+    let mut q = [(3u8, 0u8), (19, 1), (0, 2), (7, 3), (19, 4), (1, 5)];
+    sort_chain_queue(&mut q);
+    assert!(q.windows(2).all(|w| w[0].0 >= w[1].0));
+    assert_eq!(q[0].0, 19);
+    assert_eq!(q[5].0, 0);
+
+    // 2. hash_short & hash_short_n match PublicKey::keyed across 0..=64 bytes.
+    for len in [0usize, 1, 16, 32, 36, 48, 52, 64] {
+        let data: Vec<u8> = (0..len).map(|i| u8::try_from((i * 29 + 7) & 0xff).unwrap()).collect();
+        let want = pk.keyed(&data);
+        assert_eq!(core.hash_short(&data), want);
+        assert_eq!(core.hash_short_n(&data), want[..N]);
+        assert_eq!(bulk.hash_short(&data), want);
+    }
+
+    // 3. hash_packed_48_bulk & hash_packed_48_stack match scalar keyed hash for counts 1..=STACK_PACKED_CAP.
+    let mut p48 = Packed::<48>::new(STACK_PACKED_CAP);
+    let mut stack48 = [[0u8; 48]; STACK_PACKED_CAP];
+    for i in 0..STACK_PACKED_CAP {
+        for j in 0..48 {
+            let b = u8::try_from((i * 41 + j * 13 + 3) & 0xff).unwrap();
+            p48[i][j] = b;
+            stack48[i][j] = b;
+        }
+    }
+    let mut scratch = [[0u8; 32]; 1024];
+    for count in [1usize, 2, 6, 7, 9, STACK_PACKED_CAP] {
+        let mut out_bulk = vec![[0u8; N]; count];
+        let mut out_stack = vec![[0u8; N]; count];
+        bulk.hash_packed_48_bulk(&p48, count, &mut scratch, &mut out_bulk);
+        core.hash_packed_48_stack(&stack48, count, &mut out_stack);
+        for i in 0..count {
+            let want = pk.keyed(&stack48[i]);
+            assert_eq!(out_bulk[i], want[..N]);
+            assert_eq!(out_stack[i], want[..N]);
+        }
+    }
+
+    // 4. advance_chains_fixed, advance_chains_staged, and advance_chains_varlen match scalar chain evaluation.
+    let scalar_chain = |init: [u8; 32], steps: u8| -> [u8; N] {
+        let mut cur = init;
+        let mut step = u32::from_le_bytes(init[12..16].try_into().unwrap());
+        for _ in 0..steps {
+            let h = pk.keyed(&cur);
+            step += 1;
+            cur[12..16].copy_from_slice(&step.to_le_bytes());
+            cur[16..32].copy_from_slice(&h[..N]);
+        }
+        cur[16..32].try_into().unwrap()
+    };
+
+    const TOTAL: usize = 27;
+    let mut p32 = Packed::<32>::new(TOTAL);
+    let mut init32 = [[0u8; 32]; TOTAL];
+    for i in 0..TOTAL {
+        let tw = tweak(TweakKind::Chain, 0, 7, u16::try_from(i).unwrap(), 0, 0);
+        p32[i][..16].copy_from_slice(&tw);
+        for j in 0..N {
+            p32[i][16 + j] = u8::try_from((i * 17 + j * 31 + 5) & 0xff).unwrap();
+        }
+        init32[i] = p32[i];
+    }
+
+    let mut fixed_out = [[0u8; N]; TOTAL];
+    bulk.advance_chains_fixed(&mut p32, TOTAL, 4, &mut scratch, &mut fixed_out);
+    for i in 0..TOTAL {
+        assert_eq!(fixed_out[i], scalar_chain(init32[i], 4));
+    }
+
+    for i in 0..TOTAL {
+        p32[i] = init32[i];
+    }
+    let mut staged_out = [[0u8; N]; TOTAL];
+    bulk.advance_chains_staged(&mut p32, 16, TOTAL, 3, 6, &mut scratch, &mut staged_out);
+    for i in 0..TOTAL {
+        let expected_steps = if i < 16 { 6 } else { 3 };
+        assert_eq!(staged_out[i], scalar_chain(init32[i], expected_steps));
+    }
+
+    // Variable-length chains: 0 chains, 1 chain, mixed zero/nonzero steps, > CORE_PACKED_WIDTH with backfill + swap-remove.
+    let mut empty_out: [[u8; N]; 0] = [];
+    core.advance_chains_varlen::<TOTAL>(&[], &[], &mut empty_out);
+
+    let mut one_init = [init32[0]];
+    one_init[0][12..16].copy_from_slice(&5u32.to_le_bytes());
+    let mut one_out = [[0u8; N]; 1];
+    core.advance_chains_varlen::<TOTAL>(&one_init, &[3], &mut one_out);
+    assert_eq!(one_out[0], scalar_chain(one_init[0], 3));
+
+    let var_steps: [u8; TOTAL] = core::array::from_fn(|i| u8::try_from((i * 5) % 11).unwrap());
+    let mut var_init = init32;
+    for (i, slot) in var_init.iter_mut().enumerate() {
+        let start = u32::try_from(i % 7).unwrap();
+        slot[12..16].copy_from_slice(&start.to_le_bytes());
+    }
+    let mut var_out = [[0u8; N]; TOTAL];
+    core.advance_chains_varlen::<TOTAL>(&var_init, &var_steps, &mut var_out);
+    for i in 0..TOTAL {
+        assert_eq!(var_out[i], scalar_chain(var_init[i], var_steps[i]));
+    }
+
+    // 5. grind_counter finds exact smallest counter across batch boundary and returns None when exhausted.
+    let mut tmpl = [0u8; 36];
+    tmpl[..16].copy_from_slice(&tweak(TweakKind::OneTimeMsg, 0, 1, 2, 0, 0));
+    let mut target_block = tmpl;
+    let target_ctr = 1029u32;
+    target_block[32..36].copy_from_slice(&target_ctr.to_le_bytes());
+    let target_digest = pk.keyed(&target_block);
+    let found = bulk.grind_counter(&tmpl, 8, 2048, &mut scratch, |d| (*d == target_digest).then_some(42u8));
+    assert_eq!(found, Some((target_ctr, target_digest, 42u8)));
+    assert_eq!(bulk.grind_counter::<u8>(&tmpl, 8, 1024, &mut scratch, |d| (*d == target_digest).then_some(1)), None);
 }

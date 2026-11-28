@@ -53,6 +53,7 @@
 
 mod coding;
 mod content;
+mod engine;
 mod few_time;
 mod one_time;
 mod params;
@@ -354,11 +355,11 @@ impl SignetId {
             return Err(InvalidImprint);
         }
         let d_seed = compute_message_digest(&self.public_key, imprint.randomizer(), self.root(), short, ctx);
-        let public = self.public_key.hasher(false);
+        let public = self.public_key.engine(false);
         let upors_slice = imprint.upors();
         let ctr_ft = u32::from_le_bytes(upors_slice[..UPORS_CTR_LEN].try_into().unwrap());
         let sel = verify_upors_selection(&public, &d_seed, ctr_ft).ok_or(InvalidImprint)?;
-        let codewords = extract_upors_codewords(&self.public_key, &sel.h_sel).ok_or(InvalidImprint)?;
+        let codewords = extract_upors_codewords(&public, &sel.h_sel).ok_or(InvalidImprint)?;
         let mut node = upors_verify(&public, &sel, &codewords, upors_slice).ok_or(InvalidImprint)?;
         let coords = sel.leaf_addr.split_layers();
         for layer in Layer::ALL {

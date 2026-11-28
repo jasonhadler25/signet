@@ -1,9 +1,9 @@
 use crate::coding::hex_unrank;
+use crate::engine::{Block, HashEngine, STACK_PACKED_CAP};
 use crate::params::{
-    HYPER_BITS, LeafAddr, N, PublicKey, TweakKind, UPORS_C, UPORS_CTR_LEN, UPORS_HEIGHT, UPORS_K, UPORS_LAYER_U8, UPORS_LEN, UPORS_M_MAX, UPORS_N,
-    UPORS_SELECT_MAX_DRAWS, UPORS_STEPS, first_n, pack_pair, pack_tagged, read_bits, tweak,
+    HYPER_BITS, LeafAddr, N, TweakKind, UPORS_C, UPORS_CTR_LEN, UPORS_HEIGHT, UPORS_K, UPORS_LAYER_U8, UPORS_LEN, UPORS_M_MAX, UPORS_N, UPORS_SELECT_MAX_DRAWS,
+    UPORS_STEPS, pack_pair, pack_tagged, read_bits, tweak,
 };
-use blake3_servil_core::throughput::{Batch, Block, TreeHasher};
 use constant_time_eq::constant_time_eq;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,42 +114,31 @@ pub(crate) fn parse_select_fast(d: &[u8; 32]) -> Option<(LeafAddr, [u16; UPORS_K
     parse_select_digest(d)
 }
 
-/// Grind `ctr_ft` via register-only SIMD `TreeHasher::hash_counter_range` (`BATCH = 1024`)
-/// reusing caller-provided scratch space (`scratch.len() >= 1024`).
-pub(crate) fn grind_upors_selection(pub_h: &TreeHasher, d_seed: &[u8; 32], scratch: &mut [[u8; 32]]) -> UporsSelection {
+/// Grind `ctr_ft` via [`HashEngine::grind_counter`] reusing caller-provided scratch space
+/// (`scratch.len() >= 1024`).
+pub(crate) fn grind_upors_selection(engine: &HashEngine, d_seed: &[u8; 32], scratch: &mut [[u8; 32]]) -> UporsSelection {
     let mut tmpl = [0u8; 52];
     tmpl[..16].copy_from_slice(&tweak(TweakKind::FewSelect, UPORS_LAYER_U8, 0, 0, 0, 0));
     tmpl[16..48].copy_from_slice(d_seed);
-
-    const BATCH: usize = 1024;
-    let out = &mut scratch[..BATCH];
-    let mut start = 0u32;
-    loop {
-        pub_h.hash_counter_range(&tmpl, 12, start, out);
-        for (i, digest) in out.iter().enumerate() {
-            if let Some((leaf_addr, leaves, sibs)) = parse_select_fast(digest) {
-                return UporsSelection { ctr: start + u32::try_from(i).unwrap(), h_sel: *digest, leaf_addr, leaves, sibs };
-            }
-        }
-        start = start.checked_add(u32::try_from(BATCH).unwrap()).expect("u32 ctr_ft exhausted");
-    }
+    let (ctr, h_sel, (leaf_addr, leaves, sibs)) = engine.grind_counter(&tmpl, 12, 1u64 << 32, scratch, parse_select_fast).expect("u32 ctr_ft exhausted");
+    UporsSelection { ctr, h_sel, leaf_addr, leaves, sibs }
 }
 
 /// Verify a single `ctr_ft` during verification (`1` compression).
 #[inline]
-pub(crate) fn verify_upors_selection(pub_h: &TreeHasher, d_seed: &[u8; 32], ctr: u32) -> Option<UporsSelection> {
+pub(crate) fn verify_upors_selection(engine: &HashEngine, d_seed: &[u8; 32], ctr: u32) -> Option<UporsSelection> {
     let mut msg = [0u8; 52];
     msg[..16].copy_from_slice(&tweak(TweakKind::FewSelect, UPORS_LAYER_U8, 0, 0, 0, 0));
     msg[16..48].copy_from_slice(d_seed);
     msg[48..52].copy_from_slice(&ctr.to_le_bytes());
-    let h = *pub_h.hash(&msg).as_bytes();
+    let h = engine.hash_short(&msg);
     let (leaf_addr, leaves, sibs) = parse_select_fast(&h)?;
     Some(UporsSelection { ctr, h_sel: h, leaf_addr, leaves, sibs })
 }
 
 /// Derive the 9 unbiased `U-PORS` codewords in `L_42(3, 24)` (`C = 376`) via indexed 32-byte
 /// `Keyed` hashes chained from `H_sel` (`TweakKind::FewCode`, `48 B` input, 28 9-bit draws/block, zero XOF).
-pub(crate) fn extract_upors_codewords(public: &PublicKey, h_sel: &[u8; 32]) -> Option<[[u8; UPORS_N]; UPORS_K]> {
+pub(crate) fn extract_upors_codewords(engine: &HashEngine, h_sel: &[u8; 32]) -> Option<[[u8; UPORS_N]; UPORS_K]> {
     let mut msg = [0u8; 48];
     msg[16..48].copy_from_slice(h_sel);
 
@@ -157,7 +146,7 @@ pub(crate) fn extract_upors_codewords(public: &PublicKey, h_sel: &[u8; 32]) -> O
     let mut got = 0usize;
     for block_idx in 0..=u16::MAX {
         msg[..16].copy_from_slice(&tweak(TweakKind::FewCode, UPORS_LAYER_U8, 0, 0, block_idx, 0));
-        let blk = public.keyed(&msg);
+        let blk = engine.hash_short(&msg);
         for j in 0..28usize {
             let v = u16::try_from(read_bits(&blk, j * 9, 9)).unwrap();
             if usize::from(v) < UPORS_C {
@@ -173,92 +162,50 @@ pub(crate) fn extract_upors_codewords(public: &PublicKey, h_sel: &[u8; 32]) -> O
 }
 
 /// Zero-allocation stack-batched `U-PORS` Octopus verifier (`243` chain + `9` leaf + `<= 53` node hashes).
-/// Writes completed chain endpoints directly into the 64-byte leaf `Block` array, pads NEON batches
-/// cleanly to multiples of 11 (AArch64 `8+3` packed kernel), routes single-lane tails to scalar
-/// `hash`, and strictly enforces canonical all-zero trailing Octopus padding in constant time.
-pub(crate) fn upors_verify(pub_h: &TreeHasher, sel: &UporsSelection, codewords: &[[u8; UPORS_N]; UPORS_K], sig: &[u8; UPORS_LEN]) -> Option<[u8; N]> {
+/// Advances all 27 variable-length chains via [`HashEngine::advance_chains_varlen`], hashes the 9
+/// 64-byte leaf blocks in one stack batch, climbs the Octopus via [`HashEngine::hash_packed_48_stack`],
+/// and strictly enforces canonical all-zero trailing Octopus padding in constant time.
+pub(crate) fn upors_verify(engine: &HashEngine, sel: &UporsSelection, codewords: &[[u8; UPORS_N]; UPORS_K], sig: &[u8; UPORS_LEN]) -> Option<[u8; N]> {
     let tree = sel.leaf_addr.as_u64();
     let chains_off = UPORS_CTR_LEN;
     let octo_off = UPORS_CTR_LEN + UPORS_K * UPORS_N * N;
 
-    // 1. Pre-initialize the 9 64-byte leaf blocks and advance all remaining chains directly into them.
+    // 1. Advance all 27 U-PORS chains via the continuous-refill variable-length engine.
     const TOTAL: usize = UPORS_K * UPORS_N;
-    let mut b64 = [Block::ZERO; UPORS_K];
-    for t in 0..UPORS_K {
-        b64[t].0[..16].copy_from_slice(&tweak(TweakKind::OneTimeKey, UPORS_LAYER_U8, tree, sel.leaves[t], 0, 0));
-    }
-
-    let mut order = [(0u8, 0u8); TOTAL];
-    let mut active = 0usize;
+    let mut init32 = [[0u8; 32]; TOTAL];
+    let mut steps = [0u8; TOTAL];
+    let mut endpoints = [[0u8; N]; TOTAL];
     for (t, cw) in codewords.iter().enumerate() {
         for (c, &d) in cw.iter().enumerate() {
             let idx = t * UPORS_N + c;
             let off = chains_off + idx * N;
-            let rem = UPORS_STEPS - d;
-            if rem == 0 {
-                b64[t].0[16 + c * N..16 + (c + 1) * N].copy_from_slice(&sig[off..off + N]);
-            } else {
-                order[active] = (rem, u8::try_from(idx).unwrap());
-                active += 1;
-            }
+            steps[idx] = UPORS_STEPS - d;
+            pack_tagged(
+                &mut init32[idx],
+                tweak(TweakKind::Chain, UPORS_LAYER_U8, tree, sel.leaves[t], u16::try_from(c).unwrap(), u32::from(d)),
+                &sig[off..off + N],
+            );
         }
     }
-    order[..active].sort_unstable_by_key(|x| core::cmp::Reverse(x.0));
+    engine.advance_chains_varlen::<TOTAL>(&init32, &steps, &mut endpoints);
 
-    let mut b32 = [[0u8; 32]; 33];
-    let mut out = [[0u8; 32]; 33];
-    let mut slot_step = [0u32; 33];
-    for (slot, &(_, idx_u8)) in order[..active].iter().enumerate() {
-        let idx = usize::from(idx_u8);
-        let t = idx / UPORS_N;
-        let c = idx % UPORS_N;
-        let d = u32::from(codewords[t][c]);
-        slot_step[slot] = d;
-        let off = chains_off + idx * N;
-        pack_tagged(&mut b32[slot], tweak(TweakKind::Chain, UPORS_LAYER_U8, tree, sel.leaves[t], u16::try_from(c).unwrap(), d), &sig[off..off + N]);
-    }
-    for step in 1..=UPORS_STEPS {
-        if active == 0 {
-            break;
-        }
-        if active == 1 {
-            out[0] = *pub_h.hash(&b32[0]).as_bytes();
-        } else {
-            let run = if (16..22).contains(&active) {
-                22
-            } else if (8..11).contains(&active) {
-                11
-            } else {
-                active
-            };
-            pub_h.hash_many(&b32[..run], &mut out[..run]);
-        }
-        while active > 0 && order[active - 1].0 == step {
-            active -= 1;
-            let idx = usize::from(order[active].1);
-            let t = idx / UPORS_N;
-            let c = idx % UPORS_N;
-            b64[t].0[16 + c * N..16 + (c + 1) * N].copy_from_slice(&out[active][..N]);
-        }
-        for slot in 0..active {
-            slot_step[slot] += 1;
-            let m = &mut b32[slot];
-            m[12..16].copy_from_slice(&slot_step[slot].to_le_bytes());
-            m[16..32].copy_from_slice(&out[slot][..N]);
+    // 2. Hash all 9 64-byte leaf hashes in ONE stack batch.
+    let mut b64 = [Block::ZERO; UPORS_K];
+    for t in 0..UPORS_K {
+        b64[t].0[..16].copy_from_slice(&tweak(TweakKind::OneTimeKey, UPORS_LAYER_U8, tree, sel.leaves[t], 0, 0));
+        for c in 0..UPORS_N {
+            b64[t].0[16 + c * N..16 + (c + 1) * N].copy_from_slice(&endpoints[t * UPORS_N + c]);
         }
     }
+    let mut leaf_scratch = [[0u8; 32]; UPORS_K];
+    let mut cur_val = [[0u8; N]; UPORS_K];
+    engine.hash_blocks_64_n(&b64, &mut leaf_scratch, &mut cur_val);
 
-    // 2. Hash all 9 64-byte leaf public keys in ONE stack batch!
-    let mut leaf_hashes = [[0u8; 32]; UPORS_K];
-    pub_h.hash_many(&Batch::from_blocks(&b64[..], 64), &mut leaf_hashes[..]);
-
-    // 3. Climb the Octopus bottom-up across levels 1..=11, batching each level on stack!
+    // 3. Climb the Octopus bottom-up across levels 1..=11, batching each level on stack.
     let mut cur_idx = sel.leaves;
-    let mut cur_val: [[u8; N]; UPORS_K] = core::array::from_fn(|t| first_n(&leaf_hashes[t]));
     let mut cur_len = UPORS_K;
     let mut sib_cursor = 0usize;
-    let mut b48 = [[0u8; 48]; UPORS_K];
-    let mut node_out = [[0u8; 32]; UPORS_K];
+    let mut b48 = [[0u8; 48]; STACK_PACKED_CAP];
 
     for level in 1..=UPORS_HEIGHT {
         let level_u16 = u16::try_from(level).unwrap();
@@ -287,14 +234,7 @@ pub(crate) fn upors_verify(pub_h: &TreeHasher, sel: &UporsSelection, codewords: 
                 i += 1;
             }
         }
-        if next_len == 1 {
-            cur_val[0] = first_n(pub_h.hash(&b48[0]).as_bytes());
-        } else {
-            pub_h.hash_many(&b48[..next_len], &mut node_out[..next_len]);
-            for j in 0..next_len {
-                cur_val[j] = first_n(&node_out[j]);
-            }
-        }
+        engine.hash_packed_48_stack(&b48, next_len, &mut cur_val);
         cur_len = next_len;
     }
     assert_eq!(sib_cursor, sel.sibs);

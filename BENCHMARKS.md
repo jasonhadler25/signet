@@ -18,15 +18,15 @@ Sources reproduced on the same Apple M6 host (single-threaded, 1 core vs. 1 core
 | SLH-DSA-SHA2-128s (OpenSSL 4.1) | 7,856 B | $2^{64}$ | 50.0 µs | 52.4 ms | — | — |
 | SLH-DSA-BLAKE3-128s (PQC Suite B, 1c) | 7,856 B | $2^{64}$ | 126.6 µs | 121.7 ms | 122.1 ms | 222.8 ms |
 | SLH-DSA-BLAKE3-128f (PQC Suite B, 1c) | 17,088 B | $2^{64}$ | 353.7 µs | 5.81 ms | 6.26 ms | 89.1 ms |
-| **Signet (`BLINCS-48-X`, `blake3-servil-core 0.11.0`)** | **3,990 B** | **$2^{48}$** | **62.7 µs** | **8.45 ms** | **8.61 ms** | **23.41 ms** |
+| **Signet (`BLINCS-48-X`, `blake3-servil-core 0.11.0`)** | **3,990 B** | **$2^{48}$** | **52.7 µs** | **8.48 ms** | **8.59 ms** | **23.48 ms** |
 
 Key takeaways on 1 Apple M6 core:
 
 - **Size:** `BLINCS-48-X` (**3,990 B**, **5,320 B** Base64) is **49.2% smaller** (`3,866 B` saved) than `SLH-DSA-128s` (`7,856 B`) and **4.28× smaller** than `SLH-DSA-128f` (`17,088 B`).
-- **Signing (64 B, 1 core, warm):** Signet (**8.45 ms**, `118 / s`, `p99 / mean ≈ 1.042×`) is **14.4× faster** than `SLH-DSA-BLAKE3-128s` (`121.7 ms`) and **6.2× faster** than hardware-accelerated OpenSSL `SLH-DSA-SHA2-128s` (`52.4 ms`).
-- **Verification (64 B, 1 core, zero heap alloc):** Signet (**62.7 µs**, `15,950 / s`, `7.44 IPC`, `3,761` compressions) is **2.0× faster** than `SLH-DSA-BLAKE3-128s` (`126.6 µs`) and **5.6× faster** than `SLH-DSA-BLAKE3-128f` (`353.7 µs`).
-- **Key load (`Signet::from_seed`):** **82.74 ms** (`12 / s`, builds the `256 KiB` cached height-13 top Merkle heap — no disk cache needed).
-- **Signing (100 MiB, 1 core):** Signet (**23.41 ms** slice / **35.04 ms** `imprint_with` streaming) hashes the message in a single salted BLAKE3 pass (**4,479 MB/s** signing, **6,951 MB/s** verifying on 1 core).
+- **Signing (64 B, 1 core, warm):** Signet (**8.48 ms**, `118 / s`, `p99 / mean ≈ 1.042×`) is **14.4× faster** than `SLH-DSA-BLAKE3-128s` (`121.7 ms`) and **6.2× faster** than hardware-accelerated OpenSSL `SLH-DSA-SHA2-128s` (`52.4 ms`).
+- **Verification (64 B, 1 core, zero heap alloc):** Signet (**52.7 µs**, `18,975 / s`, `7.76 IPC`, `3,761` compressions) is **2.4× faster** than `SLH-DSA-BLAKE3-128s` (`126.6 µs`) and **6.7× faster** than `SLH-DSA-BLAKE3-128f` (`353.7 µs`), matching hardware-accelerated OpenSSL `SLH-DSA-SHA2-128s` (`50.0 µs`).
+- **Key load (`Signet::from_seed`):** **82.75 ms** (`12 / s`, builds the `256 KiB` cached height-13 top Merkle heap — no disk cache needed).
+- **Signing (100 MiB, 1 core):** Signet (**23.48 ms** slice / **35.01 ms** `imprint_with` streaming) hashes the message in a single salted BLAKE3 pass (**4,465 MB/s** signing, **6,952 MB/s** verifying on 1 core).
 
 ## 2. Wall time, core cycles, and IPC (`bench/`, `clocks` crate)
 
@@ -34,23 +34,23 @@ Measured on a quiet Apple M6 (`bench/`, `blake3-servil-core = "=0.11.0"`, single
 
 | Operation (1 core) | Wall time | Core cycles | Instructions | IPC | Clock | Throughput |
 |---|---:|---:|---:|---:|---:|---:|
-| `Signet::from_seed` (`256 KiB` height-13 top tree) | **82.74 ms** | 368.41M | 458.78M | 1.25 | 4,455 MHz | **12 / s** |
-| `Signet::imprint` 64 B | **8.45 ms** | 36.94M | 50.27M | 1.36 | 4,372 MHz | **118 / s** |
-| `Signet::imprint_with` 64 B | **8.45 ms** | 36.92M | 50.17M | 1.36 | 4,372 MHz | **118 / s** |
-| `SignetId::verify` 64 B | **62.7 µs** | 288.1k | 2.14M | **7.44** | 4,597 MHz | **15,950 / s** |
-| `SignetId::verify_with` 64 B | **62.7 µs** | 288.2k | 2.14M | **7.43** | 4,597 MHz | **15,950 / s** |
-| `SignetId::verify` 1 KiB | 63.5 µs | — | — | 7.42 | — | — |
-| `SignetId::verify` 64 KiB | 73.4 µs | — | — | — | — | 893 MB/s |
-| `SignetId::verify` 256 KiB | 98.6 µs | — | — | — | — | 2,659 MB/s |
-| `Signet::imprint` 1 MiB | **8.61 ms** | — | — | — | — | 122 MB/s |
-| `SignetId::verify` 1 MiB | 196.3 µs | — | — | — | — | 5,340 MB/s |
-| `Signet::imprint` 16 MiB | **10.72 ms** | — | — | — | — | **1,565 MB/s** |
-| `SignetId::verify` 16 MiB | **2.31 ms** | — | — | — | — | **7,275 MB/s** |
-| `Signet::imprint` 100 MiB | **23.41 ms** | — | — | — | — | **4,479 MB/s** |
-| `Signet::imprint_with` 100 MiB (`Sink` / `io::copy`) | 35.04 ms | — | — | — | — | 2,992 MB/s |
-| `SignetId::verify` 100 MiB | **15.08 ms** | — | — | — | — | **6,951 MB/s** |
-| `SignetId::verify_with` 100 MiB (`Sink` / `io::copy`) | 26.72 ms | — | — | — | — | 3,925 MB/s |
-| `Randomness::initialize` (lock-free atomic file) | **92.1 µs** | 417.4k | — | 5.21 | 4,535 MHz | — |
+| `Signet::from_seed` (`256 KiB` height-13 top tree) | **82.75 ms** | 368.50M | 462.03M | 1.25 | 4,455 MHz | **12 / s** |
+| `Signet::imprint` 64 B | **8.48 ms** | 36.98M | 49.93M | 1.35 | 4,365 MHz | **118 / s** |
+| `Signet::imprint_with` 64 B | **8.48 ms** | 37.00M | 49.96M | 1.35 | 4,365 MHz | **118 / s** |
+| `SignetId::verify` 64 B | **52.7 µs** | 241.5k | 1.87M | **7.76** | 4,585 MHz | **18,975 / s** |
+| `SignetId::verify_with` 64 B | **52.7 µs** | 241.6k | 1.87M | **7.76** | 4,585 MHz | **18,975 / s** |
+| `SignetId::verify` 1 KiB | 52.8 µs | 241.9k | 1.88M | 7.76 | 4,585 MHz | — |
+| `SignetId::verify` 64 KiB | 62.8 µs | 283.8k | 1.92M | 6.77 | 4,519 MHz | 1,043 MB/s |
+| `SignetId::verify` 256 KiB | 87.8 µs | 396.2k | 2.28M | 5.76 | 4,514 MHz | 2,986 MB/s |
+| `Signet::imprint` 1 MiB | **8.59 ms** | 37.49M | 52.01M | 1.39 | 4,366 MHz | 122 MB/s |
+| `SignetId::verify` 1 MiB | 187.5 µs | 841.2k | 4.16M | 4.95 | 4,487 MHz | 5,592 MB/s |
+| `Signet::imprint` 16 MiB | **10.74 ms** | 46.85M | 86.99M | 1.86 | 4,365 MHz | **1,562 MB/s** |
+| `SignetId::verify` 16 MiB | **2.30 ms** | 10.07M | 39.09M | 3.88 | 4,376 MHz | **7,286 MB/s** |
+| `Signet::imprint` 100 MiB | **23.48 ms** | 102.66M | 282.30M | 2.75 | 4,374 MHz | **4,465 MB/s** |
+| `Signet::imprint_with` 100 MiB (`Sink` / `io::copy`) | 35.01 ms | 144.08M | 222.71M | 1.55 | 4,117 MHz | 2,995 MB/s |
+| `SignetId::verify` 100 MiB | **15.08 ms** | 66.06M | 234.51M | 3.55 | 4,382 MHz | **6,952 MB/s** |
+| `SignetId::verify_with` 100 MiB (`Sink` / `io::copy`) | 26.67 ms | 107.67M | 174.72M | 1.62 | 4,039 MHz | 3,931 MB/s |
+| `Randomness::initialize` (lock-free atomic file) | **93.7 µs** | 423.8k | 2.20M | 5.19 | 4,530 MHz | — |
 
 ## 3. Bare-metal QEMU ARM Cortex-M33 emulation (NOT silicon measurements)
 

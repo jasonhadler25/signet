@@ -138,12 +138,19 @@ impl SecretKey {
         Self(derive_key(CTX_SECRET_VALUES, seed))
     }
 
-    /// Derive `out.len()` consecutive secret chain starts via register-only `hash_counter_range`
-    /// (word 3 = `b` = linear slot `leaf_idx * chains + chain_idx`).
-    pub(crate) fn derive_chain_starts(&self, layer: u8, tree: u64, start_slot: u32, use_sme2: bool, out: &mut [[u8; 32]]) {
+    /// Derive `out16.len()` consecutive `16`-byte secret chain starts via register-only
+    /// `hash_counter_range` (word 3 = `b` = linear slot `leaf_idx * chains + chain_idx`).
+    ///
+    /// Upgrade hook (`BLAKE3` #585): swap directly to `hash_counter_range_trunc16` once available,
+    /// dropping `scratch`.
+    pub(crate) fn derive_chain_starts_16(&self, layer: u8, tree: u64, start_slot: u32, use_sme2: bool, scratch: &mut [[u8; 32]], out16: &mut [[u8; N]]) {
         assert!(tree < (1u64 << 48));
         let tmpl = tweak(TweakKind::ChainSecret, layer, tree, 0, 0, 0);
-        tree_hasher(&self.0, use_sme2).hash_counter_range(&tmpl, 3, start_slot, out);
+        let raw = &mut scratch[..out16.len()];
+        tree_hasher(&self.0, use_sme2).hash_counter_range(&tmpl, 3, start_slot, raw);
+        for (dst, src) in out16.iter_mut().zip(raw.iter()) {
+            *dst = first_n(src);
+        }
     }
 }
 
@@ -155,8 +162,8 @@ impl PublicKey {
         Self(derive_key(CTX_PUBLIC_HASH, public_seed))
     }
 
-    pub(crate) fn hasher(&self, use_sme2: bool) -> TreeHasher {
-        tree_hasher(&self.0, use_sme2)
+    pub(crate) fn engine(&self, use_sme2: bool) -> crate::engine::HashEngine {
+        crate::engine::HashEngine::new(self.0, use_sme2)
     }
 
     pub(crate) fn keyed(&self, data: &[u8]) -> [u8; 32] {

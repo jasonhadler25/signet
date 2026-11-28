@@ -2,7 +2,7 @@
 
 **Signet** (`signet` crate) is a Rust implementation of **BLINCS** (specifically the **`BLINCS-48-X`** suite), a post-quantum digital signature algorithm based on BLAKE3 and SPHINCS. BLINCS is hash-based: it relies only on BLAKE3 and this SPHINCS-family construction, with no elliptic curves or lattices.
 
-Each signet (signing key) is sized for a lifetime budget of **2⁴⁸ signatures** (281.5 trillion — one million signatures per second nonstop for 8.9 years), combining a `13+7×5` hypertree (`d = 6, h = 48`), zero-coding-table bit-packed constant-sum **`WOTS+C`** (`n = 21, w = 60, z = 2, S = 679`, `u24` LE counter), and a single height-11 chained **`U-PORS`** Octopus tree (`n = 3, w = 24, S = 42, C = 376, k = 9, m_max = 45`, `FEW_CODE` chained directly from `H_sel`) to produce **3,990-byte imprints** (**5,320 bytes** Base64 — **49.2% smaller** than `SLH-DSA-128s`), **32-byte signet IDs** (verifying keys), pure 32-byte keyed BLAKE3 everywhere (zero XOF mode), bounded length-framed application **contexts** (`0..=255 B`), and fail-closed verification (`Result<(), InvalidImprint>` / `Result<(), VerifyError>`). Running strictly on a single core (`blake3-servil-core = "=0.11.0"`, zero background worker threads), warm signing takes **~8.45 ms** (`from_seed` builds the `256 KiB` top tree in **~82.74 ms**) and verifying takes **~62.7 µs** (`7.44 IPC`, zero heap allocations) on an Apple M6. The standalone algorithm specification, exact-`BigInt` all-orbits certifier, Lean 4 formalization, and paper live in [`jasonhadler25/blincs`](https://github.com/jasonhadler25/blincs).
+Each signet (signing key) is sized for a lifetime budget of **2⁴⁸ signatures** (281.5 trillion — one million signatures per second nonstop for 8.9 years), combining a `13+7×5` hypertree (`d = 6, h = 48`), zero-coding-table bit-packed constant-sum **`WOTS+C`** (`n = 21, w = 60, z = 2, S = 679`, `u24` LE counter), and a single height-11 chained **`U-PORS`** Octopus tree (`n = 3, w = 24, S = 42, C = 376, k = 9, m_max = 45`, `FEW_CODE` chained directly from `H_sel`) to produce **3,990-byte imprints** (**5,320 bytes** Base64 — **49.2% smaller** than `SLH-DSA-128s`), **32-byte signet IDs** (verifying keys), pure 32-byte keyed BLAKE3 everywhere (zero XOF mode), bounded length-framed application **contexts** (`0..=255 B`), and fail-closed verification (`Result<(), InvalidImprint>` / `Result<(), VerifyError>`). Running strictly on a single core (`blake3-servil-core = "=0.11.0"`, zero background worker threads), warm signing takes **~8.48 ms** (`from_seed` builds the `256 KiB` top tree in **~82.75 ms**) and verifying takes **~52.7 µs** (`7.76 IPC`, zero heap allocations) on an Apple M6. The standalone algorithm specification, exact-`BigInt` all-orbits certifier, Lean 4 formalization, and paper live in [`jasonhadler25/blincs`](https://github.com/jasonhadler25/blincs).
 
 > **Pre-1.0: Experimental & Unsupported.**
 >
@@ -21,7 +21,7 @@ Each signet (signing key) is sized for a lifetime budget of **2⁴⁸ signatures
 | **ML-DSA-44** | 1,312 B | 2,420 B | 0.15 ms (OpenSSL 4.1) | 31.0 µs (OpenSSL 4.1) | No comparable per-key budget | Module lattices + hash | FIPS 204 (2024) |
 | **SLH-DSA-128s** | 32 B | 7,856 B | 52.4–274.5 ms (OpenSSL 4.1) / 121.7 ms (BLAKE3) | 50.0–278.0 µs / 126.6 µs | 2⁶⁴ | Hash function | FIPS 205 (2024) |
 | **SLH-DSA-128f** | 32 B | 17,088 B | 5.81 ms (BLAKE3, 1c) | 353.7 µs (BLAKE3) | 2⁶⁴ | Hash function | FIPS 205 (2024) |
-| **BLINCS-48-X (Signet)** | **32 B** | **3,990 B** | **8.45 ms** (warm); **82.74 ms** `from_seed` | **62.7 µs** | **2⁴⁸** (degrades gradually past it) | BLAKE3 + this SPHINCS-family construction | No standard; pre-1.0; no human audit |
+| **BLINCS-48-X (Signet)** | **32 B** | **3,990 B** | **8.48 ms** (warm); **82.75 ms** `from_seed` | **52.7 µs** | **2⁴⁸** (degrades gradually past it) | BLAKE3 + this SPHINCS-family construction | No standard; pre-1.0; no human audit |
 
 **How to read the timings:**
 
@@ -37,7 +37,7 @@ A `BLINCS-48-X` imprint is **5,320 bytes** in Base64.
 **Signet may fit when:**
 
 - you want stateless hash-based post-quantum signatures without curve or lattice assumptions;
-- you want sub-4 KiB **3,990-byte** signatures (`49.2%` smaller than `SLH-DSA-128s`, `4.28×` smaller than `SLH-DSA-128f`), **~8.45 ms** single-core warm signing, **~62.7 µs** zero-allocation verification (`27.1 KiB` freestanding zero-import WASM), built-in application context separation, and a `2^{48}` per-key lifetime budget;
+- you want sub-4 KiB **3,990-byte** signatures (`49.2%` smaller than `SLH-DSA-128s`, `4.28×` smaller than `SLH-DSA-128f`), **~8.48 ms** single-core warm signing, **~52.7 µs** zero-allocation verification (`27.1 KiB` freestanding zero-import WASM), built-in application context separation, and a `2^{48}` per-key lifetime budget;
 - your volume fits 2⁴⁸ signatures per signet;
 - you control both signer and verifier;
 - you are prototyping or experimenting while Signet / BLINCS is pre-1.0.
@@ -245,7 +245,7 @@ Apple M6 (macOS arm64, Rust 1.100.0, `blake3-servil-core = "=0.11.0"`, strictly 
 |---|---:|---:|
 | Load key (`Signet::from_seed`, `256 KiB` height-13 top tree) | **82.74 ms** | **12 / s** |
 | Sign, 64 B (warm, 19,584-chain super-wave + self-verify) | **8.45 ms** | **118 / s** |
-| Verify, 64 B (zero heap alloc, `7.44 IPC`) | **62.7 µs** | **15,950 / s** |
+| Verify, 64 B (zero heap alloc, `7.76 IPC`) | **52.7 µs** | **18,975 / s** |
 | Sign / verify, 100 MiB (slice) | 23.41 ms / 15.08 ms | 4,479 / 6,951 MB/s |
 | Sign / verify, 100 MiB (`imprint_with` / `verify_with`) | 35.04 ms / 26.72 ms | 2,992 / 3,925 MB/s |
 | `Randomness::initialize` (lock-free atomic file) | 92.1 µs | — |
